@@ -1,5 +1,16 @@
 import os
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
+if os.getenv("SUPPRESS_LITELLM_SERIALIZATION_WARNINGS", "1") == "1":
+    from art.utils.suppress_litellm_serialization_warnings import (
+        suppress_litellm_serialization_warnings,
+    )
+
+    suppress_litellm_serialization_warnings()
+
 # Create a dummy GuidedDecodingParams class and inject it into vllm.sampling_params for trl compatibility
 try:
     import vllm.sampling_params

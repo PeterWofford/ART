@@ -10,11 +10,9 @@ For detailed documentation and examples, see: https://art.openpipe.ai/fundamenta
 """
 
 import json
-import os
 from textwrap import dedent
 from typing import List
 
-from dotenv import load_dotenv
 from litellm import acompletion
 from litellm.types.utils import ModelResponse
 from openai.types.chat.chat_completion_message_param import ChatCompletionMessageParam
@@ -22,14 +20,6 @@ from pydantic import BaseModel, Field
 from rich import print
 
 import art
-from art.utils.suppress_litellm_serialization_warnings import (
-    suppress_litellm_serialization_warnings,
-)
-
-load_dotenv()
-
-if os.getenv("SUPPRESS_LITELLM_SERIALIZATION_WARNINGS", "1") == "1":
-    suppress_litellm_serialization_warnings()
 
 
 class TrajectoryScore(BaseModel):
