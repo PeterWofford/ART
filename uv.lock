@@ -5083,10 +5083,11 @@ wheels = [
 
 [[package]]
 name = "openpipe-art"
-version = "0.5.6"
+version = "0.5.7"
 source = { editable = "." }
 dependencies = [
     { name = "litellm" },
+    { name = "nest-asyncio" },
     { name = "openai" },
     { name = "polars" },
     { name = "tblib" },
@@ -5166,6 +5167,7 @@ requires-dist = [
     { name = "matplotlib", marker = "extra == 'plotting'", specifier = ">=3.10.1" },
     { name = "nbclient", marker = "extra == 'backend'", specifier = ">=0.10.1" },
     { name = "nbmake", marker = "extra == 'backend'", specifier = ">=1.5.5" },
+    { name = "nest-asyncio", specifier = ">=1.6.0" },
     { name = "openai", specifier = ">=2.14.0" },
     { name = "peft", marker = "extra == 'backend'", specifier = ">=0.14.0" },
     { name = "polars", specifier = ">=1.26.0" },
