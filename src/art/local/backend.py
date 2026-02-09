@@ -24,6 +24,7 @@ from art.utils.output_dirs import (
     get_output_dir_from_model_properties,
     get_step_checkpoint_dir,
 )
+from art.utils.record_provenance import record_provenance
 from art.utils.s3 import (
     ExcludableOption,
     pull_model_from_s3,
@@ -458,6 +459,11 @@ class LocalBackend(Backend):
             # await model.log(metrics=result.metrics, step=result.step)
         """
         groups_list = list(trajectory_groups)
+
+        # Record provenance in W&B
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            record_provenance(wandb_run, "local-rl")
 
         # Build config objects from explicit kwargs
         config = TrainConfig(learning_rate=learning_rate, beta=beta)

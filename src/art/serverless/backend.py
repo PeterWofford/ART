@@ -11,6 +11,7 @@ from .. import dev
 from ..backend import AnyTrainableModel, Backend
 from ..trajectories import TrajectoryGroup
 from ..types import ServerlessTrainResult, TrainConfig
+from ..utils.record_provenance import record_provenance
 
 if TYPE_CHECKING:
     import wandb
@@ -208,6 +209,11 @@ class ServerlessBackend(Backend):
             # await model.log(metrics=result.metrics, step=result.step)
         """
         groups_list = list(trajectory_groups)
+
+        # Record provenance in W&B
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            record_provenance(wandb_run, "serverless-rl")
 
         # Build config objects from explicit kwargs
         config = TrainConfig(learning_rate=learning_rate, beta=beta)

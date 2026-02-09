@@ -1,11 +1,11 @@
-import math
-import random
 from dataclasses import dataclass
 from itertools import takewhile
+import math
+import random
 from typing import Any, Generator, cast
 
-import torch
 from PIL import Image
+import torch
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -167,8 +167,7 @@ def tokenize_trajectory(
         ):
             last_assistant_index = i
         elif not isinstance(message, dict) and (
-            message.logprobs
-            or allow_training_without_logprobs  # ty:ignore[possibly-missing-attribute]
+            message.logprobs or allow_training_without_logprobs  # ty:ignore[possibly-missing-attribute]
         ):
             last_assistant_index = i
     # If there are no trainable assistant messages, return None
@@ -241,9 +240,7 @@ def tokenize_trajectory(
                 continue
             if not allow_training_without_logprobs:
                 continue
-        elif (
-            message.logprobs is None and not allow_training_without_logprobs
-        ):  # ty:ignore[possibly-missing-attribute]
+        elif message.logprobs is None and not allow_training_without_logprobs:  # ty:ignore[possibly-missing-attribute]
             continue
         start = token_ids.index(sentinal_token_id)
         end = start + 1
@@ -268,16 +265,12 @@ def tokenize_trajectory(
             assistant_mask[start:end] = [1] * len(content_token_ids)
         else:
             choice = message
-            assert (
-                choice.logprobs or allow_training_without_logprobs
-            ), (  # ty:ignore[possibly-missing-attribute]
+            assert choice.logprobs or allow_training_without_logprobs, (  # ty:ignore[possibly-missing-attribute]
                 "Chat completion choices must have logprobs"
             )
             if not choice.logprobs:  # ty:ignore[possibly-missing-attribute]
                 continue
-            token_logprobs = (
-                choice.logprobs.content or choice.logprobs.refusal or []
-            )  # ty:ignore[possibly-missing-attribute]
+            token_logprobs = choice.logprobs.content or choice.logprobs.refusal or []  # ty:ignore[possibly-missing-attribute]
             if (
                 bytes(token_logprobs[0].bytes or []).decode("utf-8")
                 == "<think>"
