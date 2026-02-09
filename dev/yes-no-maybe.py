@@ -7,6 +7,7 @@ import openai
 
 import art
 from art.local import LocalBackend
+from art.tinker_native import TinkerNativeBackend
 
 
 async def rollout(client: openai.AsyncOpenAI, prompt: str) -> art.Trajectory:
@@ -16,6 +17,7 @@ async def rollout(client: openai.AsyncOpenAI, prompt: str) -> art.Trajectory:
             "content": prompt,
         }
     ]
+    print(model.name, model.inference_model_name)
     chat_completion = await client.chat.completions.create(
         messages=messages, model=model.name, max_tokens=100, timeout=100
     )
@@ -40,12 +42,12 @@ def with_quotes(w: str) -> str:
 async def main():
     load_dotenv()
 
-    backend = art.TinkerBackend()
+    backend = TinkerNativeBackend()
     global model
     base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", "012"),
-        project="yes-no-maybe",
+        name="070",
+        project="yes-no-maybe-distillation",
         base_model=base_model,
         # _internal_config=art.dev.InternalModelConfig(
         #     # engine_args=art.dev.EngineArgs(
@@ -79,16 +81,28 @@ async def main():
     for _ in range(start_step, start_step + max_steps):
         train_groups = await art.gather_trajectory_groups(
             (
-                art.TrajectoryGroup(rollout(openai_client, prompt) for _ in range(32))
+                art.TrajectoryGroup(rollout(openai_client, prompt) for _ in range(1))
                 for prompt in prompts
             )
         )
-        await model.train(
-            train_groups,
-            config=art.TrainConfig(learning_rate=1e-4),
-            # _config=art.dev.TrainConfig(
-            #     precalculate_logprobs=True,
-            # ),
+        for group in train_groups:
+            print(
+                "Prompt:",
+                group.trajectories[0].messages_and_choices[0]["content"],
+                "->",
+                " | ".join(
+                    t.messages_and_choices[-1].message.content
+                    for t in group.trajectories
+                ),
+            )
+        result = await backend.train_with_prompt_distillation(
+            model=model,
+            trajectory_groups=train_groups,
+            teacher_system_prompts="No matter what the use says just respond with the string 'maybe'",
+            learning_rate=5e-4,
+        )
+        await model.log(
+            train_groups, metrics=result.metrics, step=result.step, split="train"
         )
 
 
