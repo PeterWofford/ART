@@ -30,8 +30,14 @@ async def simple_rollout(model: art.TrainableModel) -> art.Trajectory:
     ).choices[0]
 
     traj.messages_and_choices.append(choice)
-    traj.reward = 1.0 if (choice.message.content or "").strip().lower() == "hello" else 0.0
+    traj.reward = (
+        1.0 if (choice.message.content or "").strip().lower() == "hello" else 0.0
+    )
     return traj
+
+
+async def make_group(model: art.TrainableModel) -> art.TrajectoryGroup:
+    return art.TrajectoryGroup(simple_rollout(model) for _ in range(4))
 
 
 async def main() -> None:
@@ -45,9 +51,7 @@ async def main() -> None:
     await model.register(backend)
 
     # --- Step 1: first training call ---
-    groups = await art.gather_trajectory_groups(
-        [art.TrajectoryGroup(simple_rollout(model) for _ in range(4))]
-    )
+    groups = await art.gather_trajectory_groups(make_group(model) for _ in range(1))
     result = await backend.train(model, groups)
     await model.log(groups, metrics=result.metrics, step=result.step, split="train")
 
@@ -63,12 +67,12 @@ async def main() -> None:
     # --- Step 2: second training call (same technique, should NOT duplicate) ---
     # Provenance is recorded at the start of train(), before the remote call,
     # so we can verify deduplication even if the server-side training fails.
-    groups2 = await art.gather_trajectory_groups(
-        [art.TrajectoryGroup(simple_rollout(model) for _ in range(4))]
-    )
+    groups2 = await art.gather_trajectory_groups(make_group(model) for _ in range(1))
     try:
         result2 = await backend.train(model, groups2)
-        await model.log(groups2, metrics=result2.metrics, step=result2.step, split="train")
+        await model.log(
+            groups2, metrics=result2.metrics, step=result2.step, split="train"
+        )
     except RuntimeError as e:
         print(f"Step 2 training failed (transient server error, OK for this test): {e}")
 
