@@ -469,13 +469,13 @@ class UnslothService:
 
     async def train_sft(
         self,
-        batch_queue: Any,  # Queue[SFTBatch | None] - using Any for Manager().Queue() compat
+        batches: list[SFTBatch],
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        """Train using SFT, reading batches from a multiprocessing Queue.
+        """Train using SFT on pre-computed batches.
 
         Args:
-            batch_queue: Queue of SFTBatch objects. None signals end of batches.
+            batches: List of SFTBatch objects to train on.
             verbose: Whether to print detailed logs.
 
         Yields:
@@ -526,12 +526,9 @@ class UnslothService:
         if verbose:
             print("SFT training started")
 
-        # === Process batches from queue ===
+        # === Process batches ===
         batch_idx = 0
-        while True:
-            batch = batch_queue.get()  # Blocks until data available
-            if batch is None:  # Sentinel signals end
-                break
+        for batch in batches:
 
             batch_start_time = time.perf_counter()
             batch_loss = 0.0

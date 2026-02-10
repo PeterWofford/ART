@@ -309,7 +309,7 @@ class MegatronService:
     # SFT not supported for MegatronService
     async def train_sft(
         self,
-        batch_queue: Any,
+        batches: list[Any],
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
         raise NotImplementedError("SFT training is not supported for MegatronService")

@@ -1,4 +1,4 @@
-from typing import Any, AsyncIterator, Protocol, runtime_checkable
+from typing import AsyncIterator, Protocol, runtime_checkable
 
 from .. import dev, types
 from ..preprocessing.pack import DiskPackedTensors
@@ -32,13 +32,13 @@ class ModelService(Protocol):
 
     def train_sft(
         self,
-        batch_queue: Any,  # Queue[SFTBatch | None] - using Any for Manager().Queue() compat
+        batches: list[SFTBatch],
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
-        """Train using SFT, reading batches from a multiprocessing Queue.
+        """Train using SFT on pre-computed batches.
 
         Args:
-            batch_queue: Queue of SFTBatch objects. None signals end of batches.
+            batches: List of SFTBatch objects to train on.
             verbose: Whether to print detailed logs.
 
         Yields:

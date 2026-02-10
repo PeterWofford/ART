@@ -1,3 +1,8 @@
+---
+name: train-sft
+description: SFT training reference for the ART framework. Use when the user asks to create, write, or help with an SFT training script, fine-tune a model, train from a JSONL dataset, do distillation, or anything related to supervised fine-tuning.
+---
+
 # SFT Training Wizard
 
 You are guiding the user through setting up Supervised Fine-Tuning (SFT) for a language model using the ART framework. Act as an interactive wizard: ask questions, validate inputs, and generate a complete runnable script.
@@ -20,20 +25,31 @@ Once the user has selected or provided a file path, validate it silently — do 
 
 ```python
 import json, sys
+ROLES = {"system", "user", "assistant", "developer", "tool", "function"}
 errors = []
-for i, l in enumerate(open(sys.argv[1]), 1):
+for i, line in enumerate(open(sys.argv[1]), 1):
     try:
-        r = json.loads(l)
+        r = json.loads(line)
         msgs = r.get("input", r).get("messages", [])
-        assert msgs, f"no messages"
-        assert all(m.get("role") in ("system","user","assistant","developer","tool","function") for m in msgs), "invalid role"
-        if "messages" in r and "input" not in r:
+        assert isinstance(msgs, list) and msgs, "no messages"
+        for j, m in enumerate(msgs):
+            assert m.get("role") in ROLES, f"messages[{j}]: invalid role {m.get('role')!r}"
+            assert m.get("content") or m.get("function_call") or m.get("tool_calls"), f"messages[{j}]: no content"
+        if "input" not in r:
             assert msgs[-1]["role"] == "assistant", "last message must be from assistant"
+        tools = r.get("tools")
+        if tools is not None:
+            assert isinstance(tools, list), "tools must be a list"
     except Exception as e:
         errors.append(f"  Line {i}: {e}")
-if errors: print(f"{len(errors)} error(s):\n" + "\n".join(errors)); sys.exit(1)
-else: print(f"Valid! {i} rows")
+print(f"{len(errors)} error(s):\n" + "\n".join(errors) if errors else f"Valid! {i} rows")
+sys.exit(1 if errors else 0)
 ```
+
+The JSONL format supports these fields per row:
+- **`messages`** (required): List of chat messages
+- **`tools`** (optional): List of tool/function definitions for tool-call training
+- **`response_format`** (optional): Structured output schema (not used during training, but useful as metadata)
 
 Report the row count and validation result to the user. Do NOT read the whole dataset file. Do NOT name the dataset. If the format is wrong, help them fix it or convert their data.
 
@@ -81,7 +97,7 @@ Present the output values to the user, then ask using AskUserQuestion:
 If they choose "Customize", ask which parameters to change.
 
 ### For inline trajectories:
-- **Learning rate**: (default: `1e-5`)
+- **Learning rate**: (default: `5e-5`)
 - **Batch size**: (default: `1`)
 
 ## Step 5: Generate the Training Script
@@ -202,6 +218,7 @@ async def main():
                 {"role": "user", "content": "<USER_MESSAGE>"},
                 {"role": "assistant", "content": "<ASSISTANT_RESPONSE>"},
             ],
+            tools=<TOOLS_OR_NONE>,
             reward=0.0,
         ),
     ]
@@ -251,6 +268,7 @@ async def main():
                     {"role": "user", "content": prompt},
                     {"role": "assistant", "content": completion.choices[0].message.content},
                 ],
+                tools=<TOOLS_OR_NONE>,
                 reward=0.0,
             )
         )
@@ -282,9 +300,10 @@ if __name__ == "__main__":
 
 1. Write the script to a file (suggest `sft_train.py`)
 2. Ask the user if they want to run it now with `uv run python <script_path>`
-3. If yes, run with a **2-minute timeout**. After 2 minutes, check progress and decide whether to continue.
+3. If yes, run it **directly using the Bash tool** (do NOT delegate to a Task subagent) so training logs stream live to the user. Use a **2-minute timeout**. If it times out, check progress and decide whether to continue.
+4. **GPU memory errors**: If training fails with OOM, lower `gpu_memory_utilization` in the existing `_internal_config` (e.g. from `0.7` to `0.5`).
+5. **Stale GPU memory**: If available GPU memory looks too small, previous training runs may still be occupying memory. Before retrying, run `nvidia-smi` to check, and if needed kill leftover processes with `kill <pid>` to free memory.
 
 ## Important Notes
 
 - LocalBackend requires a GPU.
-- **GPU memory errors**: If training fails with OOM, lower `gpu_memory_utilization` in the existing `_internal_config` (e.g. from `0.7` to `0.5`).
