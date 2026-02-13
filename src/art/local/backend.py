@@ -387,6 +387,10 @@ class LocalBackend(Backend):
         # Core training parameters
         learning_rate: float = 5e-6,
         beta: float = 0.0,
+        # KL-penalized advantage adjustment
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_reference_step: int | None = None,
+        kl_ref_adapter_path: str | None = None,
         # RL algorithm settings
         ppo: bool = False,
         epsilon: float | None = None,
@@ -425,7 +429,16 @@ class LocalBackend(Backend):
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
-            beta: KL penalty coefficient. Defaults to 0.0.
+            beta: KL penalty coefficient added to the loss. Defaults to 0.0.
+            kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
+                Tokens diverging more from the reference get reduced advantages.
+                Defaults to 0.0 (disabled).
+            kl_penalty_reference_step: Checkpoint step of the training model to
+                use as the KL reference. If None, uses the base model (LoRA
+                disabled) as reference.
+            kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
+                checkpoint to use as the KL reference. Alternative to
+                kl_penalty_reference_step.
             ppo: Whether to use PPO clipping. Defaults to False.
             epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
@@ -472,11 +485,14 @@ class LocalBackend(Backend):
         groups_list = list(trajectory_groups)
 
         # Build config objects from explicit kwargs
-        config = TrainConfig(learning_rate=learning_rate, beta=beta)
+        config = TrainConfig(
+            learning_rate=learning_rate, beta=beta, kl_penalty_coef=kl_penalty_coef
+        )
         dev_config: dev.TrainConfig = {
             "advantage_balance": advantage_balance,
             "allow_training_without_logprobs": allow_training_without_logprobs,
             "importance_sampling_level": importance_sampling_level,
+            "kl_penalty_coef": kl_penalty_coef,
             "mask_prob_ratio": mask_prob_ratio,
             "plot_tensors": plot_tensors,
             "ppo": ppo,
@@ -499,6 +515,14 @@ class LocalBackend(Backend):
             dev_config["kimi_k2_tau"] = kimi_k2_tau
         if truncated_importance_sampling is not None:
             dev_config["truncated_importance_sampling"] = truncated_importance_sampling
+        if kl_ref_adapter_path is not None:
+            dev_config["kl_ref_adapter_path"] = kl_ref_adapter_path
+        elif kl_penalty_reference_step is not None:
+            ref_checkpoint_dir = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path),
+                kl_penalty_reference_step,
+            )
+            dev_config["kl_ref_adapter_path"] = ref_checkpoint_dir
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
