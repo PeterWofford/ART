@@ -519,7 +519,6 @@ class UnslothService:
         os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "0"
 
         peft_model.train()
-        optimizer.zero_grad()
         device = next(peft_model.parameters()).device
         max_grad_norm = 1.0
 
@@ -529,7 +528,6 @@ class UnslothService:
         # === Process batches ===
         batch_idx = 0
         for batch in batches:
-
             batch_start_time = time.perf_counter()
             batch_loss = 0.0
 
