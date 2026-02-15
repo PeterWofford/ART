@@ -62,7 +62,9 @@ async def main():
     await model.register(backend)
 
     kl_penalty_reference_step: int | None = (
-        int(os.environ["KL_REF_STEP"]) if os.environ.get("KL_REF_STEP") is not None else None
+        int(os.environ["KL_REF_STEP"])
+        if os.environ.get("KL_REF_STEP") is not None
+        else None
     )
     kl_ref_adapter_path: str | None = os.environ.get("KL_REF_ADAPTER_PATH") or None
 

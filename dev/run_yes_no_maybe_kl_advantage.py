@@ -10,8 +10,8 @@ import argparse
 import os
 import textwrap
 
-import sky
 from dotenv import load_dotenv
+import sky
 from sky import ClusterStatus
 
 load_dotenv()
@@ -29,8 +29,18 @@ parser.add_argument("--num-steps", type=int, default=20)
 parser.add_argument("--kl-penalty-coef", type=float, default=0.1)
 parser.add_argument("--accelerator", type=str, default="H200:1")
 parser.add_argument("--cluster-name", type=str, default=None)
-parser.add_argument("--kl-ref-step", type=int, default=None, help="Checkpoint step of training model to use as KL reference")
-parser.add_argument("--kl-ref-adapter-path", type=str, default=None, help="Path to LoRA adapter checkpoint to use as KL reference")
+parser.add_argument(
+    "--kl-ref-step",
+    type=int,
+    default=None,
+    help="Checkpoint step of training model to use as KL reference",
+)
+parser.add_argument(
+    "--kl-ref-adapter-path",
+    type=str,
+    default=None,
+    help="Path to LoRA adapter checkpoint to use as KL reference",
+)
 args = parser.parse_args()
 
 cluster_name = args.cluster_name or f"ynm-kl-{args.kl_penalty_coef}"

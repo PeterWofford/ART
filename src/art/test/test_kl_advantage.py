@@ -2,7 +2,7 @@
 
 import torch
 
-from art.loss import loss_fn, Loss
+from art.loss import Loss, loss_fn
 
 
 def _make_inputs(
@@ -39,7 +39,9 @@ def test_kl_advantage_no_effect_when_disabled():
     new_logprobs = torch.zeros(1, 8)
     ref_logprobs = torch.full((1, 8), -1.0)  # different from new_logprobs
 
-    loss_no_kl = loss_fn(inputs, new_logprobs, ref_logprobs, None, {"kl_penalty_coef": 0.0})
+    loss_no_kl = loss_fn(
+        inputs, new_logprobs, ref_logprobs, None, {"kl_penalty_coef": 0.0}
+    )
     loss_without_ref = loss_fn(inputs, new_logprobs, None, None, {})
 
     assert loss_no_kl.kl_policy_ref is None
@@ -84,7 +86,9 @@ def test_kl_advantage_direction():
     """Tokens with higher KL (more drift) should get reduced advantages."""
     # Create inputs where token 2 has high drift and token 5 has low drift
     seq_len = 8
-    inputs = _make_inputs(seq_len=seq_len, advantages=[0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0])
+    inputs = _make_inputs(
+        seq_len=seq_len, advantages=[0.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0]
+    )
     new_logprobs = torch.zeros(1, seq_len)
     ref_logprobs = torch.zeros(1, seq_len)
 
