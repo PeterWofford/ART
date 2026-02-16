@@ -14,7 +14,7 @@ load_dotenv()
 if not os.environ.get("OPENROUTER_API_KEY"):
     raise ValueError("OPENROUTER_API_KEY environment variable is required")
 
-TEACHER_MODEL = "qwen/qwen3-235b-a22b-2507"
+TEACHER_MODEL = "z-ai/glm-5"
 STUDENT_BASE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
 PROMPT = "Explain the concept of recursion in programming with a simple example."
 

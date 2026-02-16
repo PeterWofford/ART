@@ -72,7 +72,7 @@ To train on tool-call conversations, include a `tools` array and `tool_calls` in
 
 Each line must follow these rules:
 
-- **`messages`** (required) — a non-empty list of chat messages. Each message has a `role` (`system`, `user`, `assistant`, `developer`, `tool`, or `function`) and `content`. The last message **must** be from the `assistant` role.
+- **`messages`** (required) — a non-empty list of chat messages. Each message has a `role` (`system`, `user`, `assistant`, or `tool`) and `content`. The last message **must** be from the `assistant` role.
 - **`tools`** (optional) — a list of tool/function definitions, following the [OpenAI tool format](https://platform.openai.com/docs/api-reference/chat).
 
 Messages follow the [OpenAI chat format](https://platform.openai.com/docs/api-reference/chat), including support for `tool_calls` in assistant messages.
@@ -129,7 +129,7 @@ import art
 from art.local import LocalBackend
 # from art.serverless.backend import ServerlessBackend
 
-TEACHER_MODEL = "qwen/qwen3-235b-a22b-2507"
+TEACHER_MODEL = "z-ai/glm-5"
 
 async def main():
     # Get completion from teacher model
@@ -197,6 +197,7 @@ async def main():
     )
 
     # Phase 2: RL training picks up from the SFT checkpoint
+    from my_project import rollout, scenarios
     for step in range(await model.get_step(), 50):
         train_groups = await art.gather_trajectory_groups(
             [
