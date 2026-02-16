@@ -128,31 +128,34 @@ from openai import AsyncOpenAI
 import art
 from art.local import LocalBackend
 # from art.serverless.backend import ServerlessBackend
+from art.utils.sft import prepare_sft
 
 TEACHER_MODEL = "z-ai/glm-5"
 
 async def main():
-    # Get completion from teacher model
+    # Get completions from teacher model
     teacher_client = AsyncOpenAI(
         api_key="your-api-key",
         base_url="https://openrouter.ai/api/v1",
     )
-    completion = await teacher_client.chat.completions.create(
-        model=TEACHER_MODEL,
-        messages=[{"role": "user", "content": "Explain recursion with a simple example."}],
-    )
-    teacher_response = completion.choices[0].message.content
-
-    # Create trajectories from teacher completion
-    trajectories = [
-        art.Trajectory(
-            messages_and_choices=[
-                {"role": "user", "content": "Explain recursion with a simple example."},
-                {"role": "assistant", "content": teacher_response},
-            ],
-            reward=0.0,
-        )
+    prompts = [
+        "Explain recursion with a simple example.",
+        "What are the pros and cons of microservices?",
+        "How does a hash table work?",
     ]
+
+    trajectories = []
+    for prompt in prompts:
+        completion = await teacher_client.chat.completions.create(
+            model=TEACHER_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        trajectories.append(art.Trajectory(
+            messages_and_choices=[
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": completion.choices[0].message.content},
+            ],
+        ))
 
     # Train student model on teacher outputs
     backend = LocalBackend()
@@ -164,7 +167,9 @@ async def main():
     )
     await student.register(backend)
 
-    await student.train_sft(trajectories)
+    # prepare_sft computes a learning rate schedule with warmup and decay
+    trajectories, config = prepare_sft(trajectories, peak_lr=2e-4)
+    await student.train_sft(trajectories, config)
 
 asyncio.run(main())
 ```

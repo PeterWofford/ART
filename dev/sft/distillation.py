@@ -8,6 +8,7 @@ from openai import AsyncOpenAI
 
 import art
 from art.local import LocalBackend
+from art.utils.sft import prepare_sft
 
 load_dotenv()
 
@@ -43,7 +44,6 @@ async def main():
                 {"role": "user", "content": PROMPT},
                 {"role": "assistant", "content": teacher_response},
             ],
-            reward=0.0,
         )
     ]
 
@@ -57,11 +57,8 @@ async def main():
     await student.register(backend)
 
     print(f"Training student model ({STUDENT_BASE_MODEL})...")
-    await student.train_sft(
-        trajectories,
-        config=art.TrainSFTConfig(learning_rate=2e-4),
-        verbose=True,
-    )
+    trajectories, config = prepare_sft(trajectories, peak_lr=2e-4)
+    await student.train_sft(trajectories, config)
     print("Training complete!")
 
 

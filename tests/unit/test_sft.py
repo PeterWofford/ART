@@ -6,7 +6,7 @@ import tempfile
 
 import pytest
 
-from art.utils.sft import create_lr_schedule, iterate_file
+from art.utils.sft import create_lr_schedule, iterate_file, prepare_sft
 
 
 # Helper to create a temporary JSONL file
@@ -149,6 +149,90 @@ def test_lr_schedule_no_warmup():
     assert len(lrs) == 5
     assert lrs[0] == pytest.approx(1e-4)  # Start at peak (no warmup)
     assert lrs[-1] == pytest.approx(0)  # End at min_lr
+
+
+def _make_trajectories(n: int):
+    """Create n dummy trajectories."""
+    from art.trajectories import Trajectory
+
+    return [
+        Trajectory(
+            messages_and_choices=[
+                {"role": "user", "content": f"Message {i}"},
+                {"role": "assistant", "content": f"Response {i}"},
+            ],
+        )
+        for i in range(n)
+    ]
+
+
+def test_prepare_sft_single_epoch():
+    """Test prepare_sft with one epoch."""
+    trajs = _make_trajectories(10)
+    expanded, config = prepare_sft(trajs, epochs=1, batch_size=2, peak_lr=1e-4)
+
+    assert len(expanded) == 10
+    assert config.batch_size == 2
+    # LR schedule should have ceil(10/2)=5 entries
+    lr = config.learning_rate
+    assert isinstance(lr, list)
+    assert len(lr) == 5
+
+
+def test_prepare_sft_multiple_epochs():
+    """Test prepare_sft expands trajectories across epochs."""
+    trajs = _make_trajectories(6)
+    expanded, config = prepare_sft(trajs, epochs=3, batch_size=2, peak_lr=1e-4)
+
+    assert len(expanded) == 18  # 6 * 3
+    lr = config.learning_rate
+    assert isinstance(lr, list)
+    assert len(lr) == 9  # ceil(18/2)
+
+
+def test_prepare_sft_shuffles_per_epoch():
+    """Test that each epoch is shuffled differently."""
+    trajs = _make_trajectories(20)
+    expanded, _ = prepare_sft(trajs, epochs=2, batch_size=1, peak_lr=1e-4, shuffle=True)
+
+    epoch1 = expanded[:20]
+    epoch2 = expanded[20:]
+    # Epochs should have the same items but in different order
+    epoch1_msgs = sorted(str(m.messages_and_choices) for m in epoch1)
+    epoch2_msgs = sorted(str(m.messages_and_choices) for m in epoch2)
+    assert epoch1_msgs == epoch2_msgs
+    # With 20 items, very unlikely to be in the same order
+    assert [m.messages_and_choices for m in epoch1] != [
+        m.messages_and_choices for m in epoch2
+    ]
+
+
+def test_prepare_sft_no_shuffle():
+    """Test prepare_sft with shuffle=False preserves order."""
+    trajs = _make_trajectories(5)
+    expanded, _ = prepare_sft(
+        trajs, epochs=2, batch_size=1, peak_lr=1e-4, shuffle=False
+    )
+
+    assert len(expanded) == 10
+    # Both epochs should be in original order
+    for i in range(5):
+        assert expanded[i].messages_and_choices == expanded[i + 5].messages_and_choices
+
+
+def test_prepare_sft_deterministic():
+    """Test that prepare_sft is deterministic with same seed."""
+    trajs = _make_trajectories(10)
+    expanded1, config1 = prepare_sft(
+        trajs, epochs=2, batch_size=2, peak_lr=1e-4, seed=42
+    )
+    expanded2, config2 = prepare_sft(
+        trajs, epochs=2, batch_size=2, peak_lr=1e-4, seed=42
+    )
+
+    assert config1.learning_rate == config2.learning_rate
+    for t1, t2 in zip(expanded1, expanded2):
+        assert t1.messages_and_choices == t2.messages_and_choices
 
 
 if __name__ == "__main__":
