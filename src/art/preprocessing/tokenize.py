@@ -1,13 +1,11 @@
-# ruff: noqa: I001
-# Import order is intentional - unsloth MUST be imported before transformers
-import math
-import random
 from dataclasses import dataclass
 from itertools import takewhile
+import math
+import random
 from typing import Any, Generator, cast
 
-import torch
 from PIL import Image
+import torch
 from transformers.image_processing_utils import BaseImageProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
@@ -25,6 +23,7 @@ class TokenizedResult:
     logprobs: list[float]
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
+    trajectory: Trajectory
     weight: float = 0.0
     prompt_id: int = 0
     prompt_length: int = 0
@@ -40,6 +39,7 @@ class TokenizedResult:
             logprobs=self.logprobs[self.prompt_length :],
             pixel_values=None,
             image_grid_thw=None,
+            trajectory=self.trajectory,
             weight=self.weight,
             prompt_id=self.prompt_id,
             prompt_length=0,
@@ -103,6 +103,7 @@ def tokenize_trajectory_groups(
                     history,
                     advantage,
                     allow_training_without_logprobs,
+                    trajectory,
                 ):
                     trajectory_results.append(result)
             weight = 1 / (
@@ -151,6 +152,7 @@ def tokenize_trajectory(
     history: History,
     advantage: float,
     allow_training_without_logprobs: bool,
+    trajectory: Trajectory,
 ) -> TokenizedResult | None:
     """
     Tokenizes a trajectory and returns a TokenizedResult.
@@ -253,7 +255,9 @@ def tokenize_trajectory(
                     "via tokenizer.encode(content). This path ignores tool calls."
                 )
             content = message.get("content")
-            assert isinstance(content, str)
+            assert isinstance(content, str), (
+                "Trajectories must have a 'content' field of type str"
+            )
             content_token_ids = tokenizer.encode(
                 content,
                 add_special_tokens=False,
@@ -349,6 +353,7 @@ def tokenize_trajectory(
         logprobs=logprobs,
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
+        trajectory=trajectory,
     )
 
 

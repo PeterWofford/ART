@@ -1,5 +1,6 @@
 """Utilities for supervised fine-tuning (SFT)."""
 
+import itertools
 import json
 import math
 import random
@@ -199,6 +200,7 @@ async def train_sft_from_file(
     schedule_type: Literal["cosine", "linear", "constant"] = "linear",
     warmup_ratio: float = 0.1,
     initial_step: int = 0,
+    final_step: int | None = None,
     _config: "DevTrainSFTConfig | None" = None,
     verbose: bool = False,
     shuffle_buffer_size: int = 10000,
@@ -219,6 +221,8 @@ async def train_sft_from_file(
         schedule_type: Learning rate schedule ("cosine", "linear", "constant"). Default: "linear"
         warmup_ratio: Ratio of total steps for warmup (0.0 to 1.0). Default: 0.1
         initial_step: Starting step for resuming training. Default: 0
+        final_step: Ending step (exclusive). If None, trains to end of dataset.
+            Useful for breaking training into segments with benchmarks in between.
         _config: Experimental configuration. Use at your own risk.
         verbose: Whether to print verbose output. Default: False
         shuffle_buffer_size: Size of shuffle buffer. Default: 10000.
@@ -257,6 +261,9 @@ async def train_sft_from_file(
     total_batches = math.ceil(total_trajectories / batch_size)
     warmup_steps = int(total_batches * warmup_ratio)
 
+    if final_step is not None and final_step > total_batches:
+        final_step = total_batches
+
     # Create learning rate schedule
     full_schedule = create_lr_schedule(
         total_steps=total_batches,
@@ -264,19 +271,24 @@ async def train_sft_from_file(
         method=schedule_type,
         warmup_steps=warmup_steps,
     )
-    learning_rates = full_schedule[initial_step:]
+    learning_rates = full_schedule[initial_step:final_step]
 
     if verbose:
-        print(f"Training {total_trajectories - skip_trajectories} trajectories")
+        num_training_trajectories = len(learning_rates) * batch_size
+        print(f"Training {num_training_trajectories} trajectories")
         print(f"Batches: {len(learning_rates)}, batch_size: {batch_size}")
         print(f"Schedule: {schedule_type}, peak_lr: {peak_lr}")
 
-    # Stream trajectories from file
-    trajectories = iterate_file(
-        file_path=file_path,
-        epochs=epochs,
-        shuffle_buffer_size=shuffle_buffer_size,
-        initial_skip=skip_trajectories,
+    # Stream trajectories from file, capped to the number we need
+    max_trajectories = len(learning_rates) * batch_size
+    trajectories = itertools.islice(
+        iterate_file(
+            file_path=file_path,
+            epochs=epochs,
+            shuffle_buffer_size=shuffle_buffer_size,
+            initial_skip=skip_trajectories,
+        ),
+        max_trajectories,
     )
 
     config = TrainSFTConfig(
