@@ -110,7 +110,7 @@ Present the output values to the user, then ask:
 If they choose "Customize", ask which parameters to change.
 
 ### For inline trajectories and distillation:
-Use the same defaults computation as JSONL (replace `NUM_ROWS` with the number of trajectories). `prepare_sft` handles the LR schedule automatically.
+Use the same defaults computation as JSONL (replace `NUM_ROWS` with the number of trajectories). `create_sft_dataset_iterator` handles the LR schedule automatically. Set `chunk_size` to produce a reasonable number of metric reports (e.g., `chunk_size = max(1, NUM_ROWS // 20)` for ~20 reports).
 
 ## Step 6: Generate the Training Script
 
@@ -241,7 +241,7 @@ if __name__ == "__main__":
 import asyncio
 import art
 <BACKEND_IMPORT>
-from art.utils.sft import prepare_sft
+from art.utils.sft import create_sft_dataset_iterator
 
 async def main():
     <BACKEND_SETUP>
@@ -256,15 +256,16 @@ async def main():
         ),
     ]
 
-    trajectories, config = prepare_sft(
+    for chunk in create_sft_dataset_iterator(
         trajectories,
+        chunk_size=<CHUNK_SIZE>,
         epochs=<EPOCHS>,
         batch_size=<BATCH_SIZE>,
         peak_lr=<PEAK_LR>,
         schedule_type="<SCHEDULE_TYPE>",
         warmup_ratio=<WARMUP_RATIO>,
-    )
-    await model.train_sft(trajectories, config, verbose=True)
+    ):
+        await model.train_sft(chunk.trajectories, chunk.config, verbose=True)
 
     # ... post-training block + backend.close() ...
 
@@ -280,7 +281,7 @@ from dotenv import load_dotenv
 from openai import AsyncOpenAI
 import art
 <BACKEND_IMPORT>
-from art.utils.sft import prepare_sft
+from art.utils.sft import create_sft_dataset_iterator
 
 load_dotenv()
 
@@ -309,15 +310,16 @@ async def main():
 
     <BACKEND_SETUP>
 
-    trajectories, config = prepare_sft(
+    for chunk in create_sft_dataset_iterator(
         trajectories,
+        chunk_size=<CHUNK_SIZE>,
         epochs=<EPOCHS>,
         batch_size=<BATCH_SIZE>,
         peak_lr=<PEAK_LR>,
         schedule_type="<SCHEDULE_TYPE>",
         warmup_ratio=<WARMUP_RATIO>,
-    )
-    await model.train_sft(trajectories, config, verbose=True)
+    ):
+        await model.train_sft(chunk.trajectories, chunk.config, verbose=True)
 
     # ... post-training block + backend.close() ...
 

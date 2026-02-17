@@ -6,7 +6,12 @@ import tempfile
 
 import pytest
 
-from art.utils.sft import create_lr_schedule, iterate_file, prepare_sft
+from art.utils.sft import (
+    create_lr_schedule,
+    iterate_file,
+    prepare_sft,
+    create_sft_dataset_iterator,
+)
 
 
 # Helper to create a temporary JSONL file
@@ -233,6 +238,151 @@ def test_prepare_sft_deterministic():
     assert config1.learning_rate == config2.learning_rate
     for t1, t2 in zip(expanded1, expanded2):
         assert t1.messages_and_choices == t2.messages_and_choices
+
+
+def test_create_sft_dataset_iterator_lr_schedule_continuity():
+    """Test that concatenated chunk LRs match the full prepare_sft schedule."""
+    trajs = _make_trajectories(100)
+    _, full_config = prepare_sft(trajs, epochs=2, batch_size=2, peak_lr=2e-4, seed=42)
+
+    chunks = list(
+        create_sft_dataset_iterator(
+            trajs,
+            chunk_size=30,
+            epochs=2,
+            batch_size=2,
+            peak_lr=2e-4,
+            seed=42,
+            show_progress=False,
+        )
+    )
+
+    all_lrs = []
+    for chunk in chunks:
+        all_lrs.extend(chunk.config.learning_rate)
+
+    assert full_config.learning_rate == all_lrs
+
+
+def test_create_sft_dataset_iterator_step_tracking():
+    """Test that step, epoch, and epoch_step are correct on each chunk."""
+    trajs = _make_trajectories(20)
+    chunks = list(
+        create_sft_dataset_iterator(
+            trajs,
+            chunk_size=10,
+            epochs=2,
+            batch_size=2,
+            peak_lr=1e-4,
+            show_progress=False,
+        )
+    )
+
+    # 20 trajs, chunk_size=10 -> 2 chunks per epoch, 2 epochs -> 4 chunks
+    assert len(chunks) == 4
+
+    assert chunks[0].step == 0
+    assert chunks[0].epoch == 0
+    assert chunks[0].epoch_step == 0
+
+    assert chunks[1].step == 5  # 10 trajs / batch_size 2 = 5 batches
+    assert chunks[1].epoch == 0
+    assert chunks[1].epoch_step == 5
+
+    assert chunks[2].step == 10
+    assert chunks[2].epoch == 1
+    assert chunks[2].epoch_step == 0
+
+    assert chunks[3].step == 15
+    assert chunks[3].epoch == 1
+    assert chunks[3].epoch_step == 5
+
+
+def test_create_sft_dataset_iterator_initial_step():
+    """Test that initial_step skips completed chunks."""
+    trajs = _make_trajectories(100)
+    all_chunks = list(
+        create_sft_dataset_iterator(
+            trajs,
+            chunk_size=50,
+            epochs=1,
+            batch_size=2,
+            peak_lr=2e-4,
+            show_progress=False,
+        )
+    )
+
+    # Resume from step 25 (after first chunk of 50 trajs / batch_size 2 = 25 batches)
+    resumed_chunks = list(
+        create_sft_dataset_iterator(
+            trajs,
+            chunk_size=50,
+            epochs=1,
+            batch_size=2,
+            peak_lr=2e-4,
+            initial_step=25,
+            show_progress=False,
+        )
+    )
+
+    assert len(all_chunks) == 2
+    assert len(resumed_chunks) == 1
+    # Resumed chunk should have the same LRs as the second full chunk
+    assert resumed_chunks[0].config.learning_rate == all_chunks[1].config.learning_rate
+
+
+def test_create_sft_dataset_iterator_deterministic():
+    """Test that create_sft_dataset_iterator is deterministic with the same seed."""
+    trajs = _make_trajectories(50)
+
+    chunks1 = list(
+        create_sft_dataset_iterator(
+            trajs, chunk_size=20, epochs=2, batch_size=2, seed=42, show_progress=False
+        )
+    )
+    chunks2 = list(
+        create_sft_dataset_iterator(
+            trajs, chunk_size=20, epochs=2, batch_size=2, seed=42, show_progress=False
+        )
+    )
+
+    assert len(chunks1) == len(chunks2)
+    for c1, c2 in zip(chunks1, chunks2):
+        assert c1.config.learning_rate == c2.config.learning_rate
+        assert c1.step == c2.step
+        for t1, t2 in zip(c1.trajectories, c2.trajectories):
+            assert t1.messages_and_choices == t2.messages_and_choices
+
+
+def test_create_sft_dataset_iterator_empty_input():
+    """Test that empty trajectories yields no chunks."""
+    chunks = list(create_sft_dataset_iterator([], chunk_size=10, show_progress=False))
+    assert chunks == []
+
+
+def test_create_sft_dataset_iterator_single_chunk():
+    """Test that chunk_size >= dataset produces one chunk equivalent to prepare_sft."""
+    trajs = _make_trajectories(10)
+    expanded, full_config = prepare_sft(
+        trajs, epochs=1, batch_size=2, peak_lr=1e-4, seed=42
+    )
+
+    chunks = list(
+        create_sft_dataset_iterator(
+            trajs,
+            chunk_size=100,  # larger than dataset
+            epochs=1,
+            batch_size=2,
+            peak_lr=1e-4,
+            seed=42,
+            show_progress=False,
+        )
+    )
+
+    assert len(chunks) == 1
+    assert chunks[0].config.learning_rate == full_config.learning_rate
+    assert chunks[0].config.batch_size == full_config.batch_size
+    assert len(chunks[0].trajectories) == len(expanded)
 
 
 if __name__ == "__main__":

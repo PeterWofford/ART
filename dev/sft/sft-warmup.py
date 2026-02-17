@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 import art
 from art.local import LocalBackend
-from art.utils.sft import prepare_sft
+from art.utils.sft import create_sft_dataset_iterator
 
 # Simple SFT trajectories - teach model to respond "maybe"
 SFT_TRAJECTORIES = [
@@ -18,7 +18,7 @@ SFT_TRAJECTORIES = [
             {"role": "assistant", "content": "maybe"},
         ],
     ),
-] * 10
+] * 100
 
 
 async def rl_rollout(model: art.TrainableModel, prompt: str) -> art.Trajectory:
@@ -58,10 +58,10 @@ async def main():
     # Phase 1: SFT
     # ========================================================================
     print("\n[Phase 1] SFT training...")
-    sft_trajectories, sft_config = prepare_sft(
+    for chunk in create_sft_dataset_iterator(
         SFT_TRAJECTORIES, batch_size=1, peak_lr=1e-5
-    )
-    await model.train_sft(sft_trajectories, sft_config)
+    ):
+        await model.train_sft(chunk.trajectories, chunk.config)
     print("SFT phase 1 complete.")
 
     # ========================================================================
@@ -85,10 +85,10 @@ async def main():
     # Phase 3: SFT again
     # ========================================================================
     print("\n[Phase 3] SFT training again...")
-    sft_trajectories, sft_config = prepare_sft(
+    for chunk in create_sft_dataset_iterator(
         SFT_TRAJECTORIES, batch_size=1, peak_lr=1e-5
-    )
-    await model.train_sft(sft_trajectories, sft_config)
+    ):
+        await model.train_sft(chunk.trajectories, chunk.config)
     print("SFT phase 3 complete.")
 
     # ========================================================================

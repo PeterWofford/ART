@@ -120,7 +120,7 @@ asyncio.run(main())
 
 ## Distillation
 
-Distillation trains a smaller model on completions from a larger teacher model. Generate responses from the teacher, wrap them as trajectories, and pass them to `model.train_sft`:
+Distillation trains a smaller model on completions from a larger teacher model. Generate responses from the teacher, wrap them as trajectories, and fine-tune:
 
 ```python
 import asyncio
@@ -128,31 +128,40 @@ from openai import AsyncOpenAI
 import art
 from art.local import LocalBackend
 # from art.serverless.backend import ServerlessBackend
-from art.utils.sft import prepare_sft
+from art.utils.sft import create_sft_dataset_iterator
 
 TEACHER_MODEL = "z-ai/glm-5"
 
 async def main():
-    # Get completions from teacher model
     teacher_client = AsyncOpenAI(
         api_key="your-api-key",
         base_url="https://openrouter.ai/api/v1",
     )
-    prompts = [
-        "Explain recursion with a simple example.",
-        "What are the pros and cons of microservices?",
-        "How does a hash table work?",
+    # Small models often produce malformed JSON or miss fields.
+    # Distilling from a larger model teaches consistent structured extraction.
+    system_prompt = "Extract {name, role, company} as JSON from the text. Return only valid JSON."
+    inputs = [
+        "Hi, I'm Sarah Chen, VP of Engineering at Acme Corp.",
+        "David Park here — senior data scientist at Globex.",
+        "I'm Maria Lopez. I lead product at Initech.",
+        "Hey, this is James Wu from Umbrella Corp, working as a DevOps engineer.",
+        "My name is Aisha Patel and I'm a research lead at DeepMind.",
+        # ... more inputs
     ]
 
     trajectories = []
-    for prompt in prompts:
+    for text in inputs:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ]
         completion = await teacher_client.chat.completions.create(
             model=TEACHER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=messages,
         )
         trajectories.append(art.Trajectory(
             messages_and_choices=[
-                {"role": "user", "content": prompt},
+                *messages,
                 {"role": "assistant", "content": completion.choices[0].message.content},
             ],
         ))
@@ -167,9 +176,12 @@ async def main():
     )
     await student.register(backend)
 
-    # prepare_sft computes a learning rate schedule with warmup and decay
-    trajectories, config = prepare_sft(trajectories, peak_lr=2e-4)
-    await student.train_sft(trajectories, config)
+    # create_sft_dataset_iterator computes the LR schedule (warmup + decay) over
+    # the full dataset, then slices it correctly across chunks. Each
+    # chunk's train_sft call logs its own metrics, giving you granular
+    # loss curves instead of a single aggregated number.
+    for chunk in create_sft_dataset_iterator(trajectories, chunk_size=50, peak_lr=2e-4):
+        await student.train_sft(chunk.trajectories, chunk.config)
 
 asyncio.run(main())
 ```

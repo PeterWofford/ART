@@ -8,7 +8,7 @@ from openai import AsyncOpenAI
 
 import art
 from art.local import LocalBackend
-from art.utils.sft import prepare_sft
+from art.utils.sft import create_sft_dataset_iterator
 
 load_dotenv()
 
@@ -57,8 +57,8 @@ async def main():
     await student.register(backend)
 
     print(f"Training student model ({STUDENT_BASE_MODEL})...")
-    trajectories, config = prepare_sft(trajectories, peak_lr=2e-4)
-    await student.train_sft(trajectories, config)
+    for chunk in create_sft_dataset_iterator(trajectories, peak_lr=2e-4):
+        await student.train_sft(chunk.trajectories, chunk.config)
     print("Training complete!")
 
 
