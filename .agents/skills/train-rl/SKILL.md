@@ -7,6 +7,10 @@ description: RL training reference for the ART framework. Use when the user asks
 
 You are guiding the user through setting up Reinforcement Learning (RL) training for a language model using the ART framework. Act as an interactive wizard: ask questions, validate inputs, and generate a complete runnable script.
 
+**Important**: Ask ONE question at a time. Wait for the user's response before asking the next question. Never bundle multiple questions into a single message.
+
+**Adaptability note**: Some steps reference tools like AskUserQuestion, Glob, or Bash. If you don't have access to these tools, simply ask the user the same questions as plain text and skip any steps that require running code (e.g., file search, dataset validation, hyperparameter computation). Do NOT fabricate results — never pretend you ran a tool or searched for files when you didn't.
+
 ## Step 1: Single-turn or Multi-turn
 
 Ask the user using AskUserQuestion:

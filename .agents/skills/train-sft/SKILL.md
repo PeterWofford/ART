@@ -7,26 +7,34 @@ description: SFT training reference for the ART framework. Use when the user ask
 
 You are guiding the user through setting up Supervised Fine-Tuning (SFT) for a language model using the ART framework. Act as an interactive wizard: ask questions, validate inputs, and generate a complete runnable script.
 
-## Step 1: Determine Training Scenario and Backend
+**Important**: Ask ONE question at a time. Wait for the user's response before asking the next question. Never bundle multiple questions into a single message.
 
-Ask the user TWO questions using AskUserQuestion:
+**Adaptability note**: Some steps reference tools like AskUserQuestion, Glob, or Bash. If you don't have access to these tools, simply ask the user the same questions as plain text and skip any steps that require running code (e.g., file search, dataset validation, hyperparameter computation). Do NOT fabricate results — never pretend you ran a tool or searched for files when you didn't.
 
-**Question 1 — Training scenario:**
+## Step 1: Determine Training Scenario
+
+Ask the user ONE question at a time. Wait for their response before moving to the next question.
+
+**Training scenario:**
 1. **Train from a JSONL file** — They have a dataset file with chat-formatted examples
 2. **Train from inline trajectories** — They want to define a small number of examples directly in code
 3. **Distillation** — They want to train a smaller model using outputs from a larger teacher model
 
-**Question 2 — Backend:**
+## Step 2: Determine Backend
+
+**Backend:**
 1. **ServerlessBackend (Recommended)** — Train on remote managed GPUs. No local GPU needed, production-ready inference endpoint.
 2. **LocalBackend** — Train on your local GPU. Full control, fast iteration.
 
-## Step 2: Select and Validate Dataset (JSONL scenario)
+## Step 3: Select and Validate Dataset (JSONL scenario)
 
-**IMPORTANT**: Do NOT assume a dataset. Wait for the user to choose or provide one.
+**IMPORTANT**: Do NOT assume a dataset. Do NOT make up or hallucinate file paths. Never pretend you searched for files if you didn't actually run a search tool.
 
-Search for `.jsonl` files in the working directory using Glob (`**/*.jsonl`). If there are more than 5 results, show only the 5 most recently modified files. Present the found files as options using AskUserQuestion, showing the full file path as each option label. Always include "Provide my own file path" as the last option. If no `.jsonl` files are found, just ask the user to provide a path.
+If you have access to file system tools (Glob) and can actually execute them, search for `.jsonl` files using Glob (`**/*.jsonl`). Present real results as options. Always include "Provide my own file path" as the last option.
 
-Once the user has selected or provided a file path, validate it silently — do NOT ask for confirmation before running validation commands. Use this script to validate and count rows:
+Otherwise, ask the user: "What is the path to your JSONL training file?" — nothing more.
+
+Once the user has provided a file path, validate it if you can run code using the script below. If you cannot run code, skip validation and move on.
 
 ```python
 import json, sys
@@ -58,7 +66,7 @@ The JSONL format supports these fields per row:
 
 Report the row count and validation result to the user. Do NOT read the whole dataset file. Do NOT name the dataset. If the format is wrong, help them fix it or convert their data.
 
-## Step 3: Gather Base Parameters
+## Step 4: Gather Base Parameters
 
 Do NOT ask the user to review or confirm their answers after collecting them — just proceed to the next step.
 
@@ -77,9 +85,9 @@ For **distillation** also ask:
 For **inline trajectories** also ask:
 - **Training examples**: Help them construct message pairs (system/user/assistant turns)
 
-## Step 4: Gather Hyperparameters
+## Step 5: Gather Hyperparameters
 
-Only ask these AFTER the dataset has been validated and the row count is known. Use the row count to compute sensible defaults.
+This step only applies if you can run code AND know the row count from validation. If you cannot run code, skip this step entirely — do NOT make up or guess hyperparameter values. The `train_sft_from_file` function has sensible built-in defaults.
 
 Run this Python snippet via Bash to compute defaults (replace `NUM_ROWS` with the actual row count). Do NOT show any formulas or calculation steps to the user — only show the final values.
 
@@ -95,7 +103,7 @@ warmup_ratio = round(warmup_steps / total_steps, 4)
 print(f"epochs={epochs} batch_size={batch_size} lr=2e-4 schedule=linear warmup_ratio={warmup_ratio}")
 ```
 
-Present the output values to the user, then ask using AskUserQuestion:
+Present the output values to the user, then ask:
 - **Use defaults (Recommended)** — show all values in the description
 - **Customize** — adjust individual hyperparameters
 
@@ -104,7 +112,7 @@ If they choose "Customize", ask which parameters to change.
 ### For inline trajectories and distillation:
 Use the same defaults computation as JSONL (replace `NUM_ROWS` with the number of trajectories). `prepare_sft` handles the LR schedule automatically.
 
-## Step 5: Generate the Training Script
+## Step 6: Generate the Training Script
 
 Write a complete, runnable Python script. Use the patterns below. Every script MUST:
 - Call `await backend.close()` at the end so the process doesn't hang
@@ -196,6 +204,9 @@ await model.register(backend)
 Note: `_internal_config` with `gpu_memory_utilization` is only used with LocalBackend. Do NOT include it for ServerlessBackend.
 
 ### JSONL file training pattern:
+
+If hyperparameters were computed in Step 5, pass them explicitly. If Step 5 was skipped, omit them — `train_sft_from_file` has sensible defaults.
+
 ```python
 """SFT training script generated by /train-sft wizard."""
 import asyncio
@@ -209,11 +220,12 @@ async def main():
     await train_sft_from_file(
         model=model,
         file_path="<FILE_PATH>",
-        epochs=<EPOCHS>,
-        batch_size=<BATCH_SIZE>,
-        peak_lr=<PEAK_LR>,
-        schedule_type="<SCHEDULE_TYPE>",
-        warmup_ratio=<WARMUP_RATIO>,
+        # Only include these if hyperparameters were computed:
+        # epochs=<EPOCHS>,
+        # batch_size=<BATCH_SIZE>,
+        # peak_lr=<PEAK_LR>,
+        # schedule_type="<SCHEDULE_TYPE>",
+        # warmup_ratio=<WARMUP_RATIO>,
         verbose=True,
     )
 
@@ -313,7 +325,7 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-## Step 6: Write and Offer to Run
+## Step 7: Write and Offer to Run
 
 1. Write the script to a file (suggest `sft_train.py`)
 2. Ask the user if they want to run it now with `uv run python <script_path>`

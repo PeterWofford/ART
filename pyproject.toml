@@ -72,6 +72,9 @@ allow-direct-references = true
 [tool.hatch.build.targets.wheel]
 packages = ["src/art", "src/mp_actors"]
 
+[tool.hatch.build.targets.wheel.force-include]
+".agents/skills" = "art/skills"
+
 [tool.hatch.build]
 sources = ["src"]
 
