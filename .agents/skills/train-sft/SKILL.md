@@ -106,7 +106,7 @@ Present the output values to the user, then ask:
 If they choose "Customize", ask which parameters to change.
 
 ### For distillation:
-Use the same defaults computation as JSONL (replace `NUM_ROWS` with the number of trajectories). `create_sft_dataset_iterator` handles the LR schedule automatically. Set `chunk_size` to produce a reasonable number of metric reports (e.g., `chunk_size = max(1, NUM_ROWS // 20)` for ~20 reports).
+Use the same defaults computation as JSONL (replace `NUM_ROWS` with the number of trajectories). `create_sft_dataset_iterator` handles the LR schedule automatically.
 
 ## Step 6: Generate the Training Script
 
@@ -270,7 +270,6 @@ async def main():
 
     for chunk in create_sft_dataset_iterator(
         trajectories,
-        chunk_size=<CHUNK_SIZE>,
         epochs=<EPOCHS>,
         batch_size=<BATCH_SIZE>,
         peak_lr=<PEAK_LR>,

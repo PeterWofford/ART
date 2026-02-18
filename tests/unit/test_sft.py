@@ -8,9 +8,9 @@ import pytest
 
 from art.utils.sft import (
     create_lr_schedule,
+    create_sft_dataset_iterator,
     iterate_file,
     prepare_sft,
-    create_sft_dataset_iterator,
 )
 
 
@@ -248,7 +248,7 @@ def test_create_sft_dataset_iterator_lr_schedule_continuity():
     chunks = list(
         create_sft_dataset_iterator(
             trajs,
-            chunk_size=30,
+            chunk_size=15,  # 15 batches * 2 batch_size = 30 trajectories per chunk
             epochs=2,
             batch_size=2,
             peak_lr=2e-4,
@@ -257,9 +257,13 @@ def test_create_sft_dataset_iterator_lr_schedule_continuity():
         )
     )
 
-    all_lrs = []
+    all_lrs: list[float] = []
     for chunk in chunks:
-        all_lrs.extend(chunk.config.learning_rate)
+        lr = chunk.config.learning_rate
+        if isinstance(lr, list):
+            all_lrs.extend(lr)
+        else:
+            all_lrs.append(lr)
 
     assert full_config.learning_rate == all_lrs
 
@@ -270,7 +274,7 @@ def test_create_sft_dataset_iterator_step_tracking():
     chunks = list(
         create_sft_dataset_iterator(
             trajs,
-            chunk_size=10,
+            chunk_size=5,  # 5 batches * 2 batch_size = 10 trajectories per chunk
             epochs=2,
             batch_size=2,
             peak_lr=1e-4,
@@ -278,7 +282,7 @@ def test_create_sft_dataset_iterator_step_tracking():
         )
     )
 
-    # 20 trajs, chunk_size=10 -> 2 chunks per epoch, 2 epochs -> 4 chunks
+    # 20 trajs, chunk_size=5 batches -> 10 trajs/chunk -> 2 chunks per epoch, 2 epochs -> 4 chunks
     assert len(chunks) == 4
 
     assert chunks[0].step == 0
@@ -304,7 +308,7 @@ def test_create_sft_dataset_iterator_initial_step():
     all_chunks = list(
         create_sft_dataset_iterator(
             trajs,
-            chunk_size=50,
+            chunk_size=25,  # 25 batches * 2 batch_size = 50 trajectories per chunk
             epochs=1,
             batch_size=2,
             peak_lr=2e-4,
@@ -312,11 +316,11 @@ def test_create_sft_dataset_iterator_initial_step():
         )
     )
 
-    # Resume from step 25 (after first chunk of 50 trajs / batch_size 2 = 25 batches)
+    # Resume from step 25 (after first chunk of 25 batches)
     resumed_chunks = list(
         create_sft_dataset_iterator(
             trajs,
-            chunk_size=50,
+            chunk_size=25,
             epochs=1,
             batch_size=2,
             peak_lr=2e-4,
@@ -337,12 +341,12 @@ def test_create_sft_dataset_iterator_deterministic():
 
     chunks1 = list(
         create_sft_dataset_iterator(
-            trajs, chunk_size=20, epochs=2, batch_size=2, seed=42, show_progress=False
+            trajs, chunk_size=10, epochs=2, batch_size=2, seed=42, show_progress=False
         )
     )
     chunks2 = list(
         create_sft_dataset_iterator(
-            trajs, chunk_size=20, epochs=2, batch_size=2, seed=42, show_progress=False
+            trajs, chunk_size=10, epochs=2, batch_size=2, seed=42, show_progress=False
         )
     )
 

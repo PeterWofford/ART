@@ -221,7 +221,8 @@ def create_sft_dataset_iterator(
 
     Args:
         trajectories: List of trajectories to train on.
-        chunk_size: Number of trajectories per chunk. Default: 50
+        chunk_size: Number of batches to process per train_sft call. Default: 50.
+                    This is an internal optimization parameter and does not affect training.
         epochs: Number of times to repeat the dataset. Default: 1
         batch_size: Number of trajectories per batch. Default: 2
         peak_lr: Peak learning rate. Default: 2e-4
@@ -249,6 +250,9 @@ def create_sft_dataset_iterator(
 
     from art.types import TrainSFTConfig as SFTConfig
 
+    if chunk_size < 1:
+        raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
+
     dataset_size = len(trajectories)
     if dataset_size == 0:
         return
@@ -265,7 +269,13 @@ def create_sft_dataset_iterator(
         warmup_steps=warmup_steps,
     )
 
-    # Build per-epoch shuffled data and chunk it
+    # chunk_size is in batches; compute trajectory count per chunk
+    items_per_chunk = batch_size * chunk_size
+    chunks_per_epoch = math.ceil(dataset_size / items_per_chunk)
+
+    # Convert initial_step (batch-based) to initial_chunk for skipping
+    initial_chunk = initial_step // chunk_size
+
     pbar = (
         tqdm(
             initial=initial_step, total=total_batches, desc="SFT Training", unit="step"
@@ -274,24 +284,28 @@ def create_sft_dataset_iterator(
         else None
     )
 
-    global_batch_step = 0
     for epoch in range(epochs):
         epoch_trajs = list(trajectories)
         if shuffle:
             random.Random(seed + epoch).shuffle(epoch_trajs)
 
-        for chunk_start in range(0, dataset_size, chunk_size):
-            chunk_trajs = epoch_trajs[chunk_start : chunk_start + chunk_size]
-            chunk_batches = math.ceil(len(chunk_trajs) / batch_size)
-            epoch_batch_step = chunk_start // batch_size
+        for chunk_idx in range(chunks_per_epoch):
+            global_chunk_idx = epoch * chunks_per_epoch + chunk_idx
 
             # Skip chunks before initial_step
-            if global_batch_step + chunk_batches <= initial_step:
-                global_batch_step += chunk_batches
+            if global_chunk_idx < initial_chunk:
                 continue
 
+            chunk_start = chunk_idx * items_per_chunk
+            chunk_end = min(chunk_start + items_per_chunk, dataset_size)
+            chunk_trajs = epoch_trajs[chunk_start:chunk_end]
+
+            num_batches_in_chunk = math.ceil(len(chunk_trajs) / batch_size)
+            global_batch_step = epoch * batches_per_epoch + (chunk_start // batch_size)
+            epoch_batch_step = chunk_start // batch_size
+
             chunk_lrs = full_schedule[
-                global_batch_step : global_batch_step + chunk_batches
+                global_batch_step : global_batch_step + num_batches_in_chunk
             ]
 
             config = SFTConfig(
@@ -307,9 +321,8 @@ def create_sft_dataset_iterator(
                 epoch_step=epoch_batch_step,
             )
 
-            global_batch_step += chunk_batches
             if pbar:
-                pbar.update(chunk_batches)
+                pbar.update(num_batches_in_chunk)
 
     if pbar:
         pbar.close()

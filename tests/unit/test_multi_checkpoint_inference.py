@@ -6,9 +6,8 @@ checkpoints while validation runs on older ones.
 
 The key features tested are:
 1. Model.get_inference_name() with optional step parameter
-2. TinkerState.get_sampler_client() for step-based routing
-3. ServerlessBackend._model_inference_name() with step suffix
-4. UnslothService max_loras configuration
+2. ServerlessBackend._model_inference_name() with step suffix
+3. UnslothService max_loras configuration
 """
 
 import asyncio

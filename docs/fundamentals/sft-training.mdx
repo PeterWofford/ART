@@ -180,7 +180,7 @@ async def main():
     # the full dataset, then slices it correctly across chunks. Each
     # chunk's train_sft call logs its own metrics, giving you granular
     # loss curves instead of a single aggregated number.
-    for chunk in create_sft_dataset_iterator(trajectories, chunk_size=50, peak_lr=2e-4):
+    for chunk in create_sft_dataset_iterator(trajectories, peak_lr=2e-4):
         await student.train_sft(chunk.trajectories, chunk.config)
 
 asyncio.run(main())
