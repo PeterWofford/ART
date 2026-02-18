@@ -4,7 +4,7 @@ import itertools
 import json
 import math
 import random
-from typing import TYPE_CHECKING, Generator, List, Literal, NamedTuple, Tuple
+from typing import TYPE_CHECKING, Generator, List, Literal, NamedTuple
 
 if TYPE_CHECKING:
     from art.dev import TrainSFTConfig as DevTrainSFTConfig
@@ -132,72 +132,6 @@ def create_lr_schedule(
     return learning_rates
 
 
-def prepare_sft(
-    trajectories: "list[Trajectory]",
-    epochs: int = 1,
-    batch_size: int = 2,
-    peak_lr: float = 2e-4,
-    schedule_type: Literal["cosine", "linear", "constant"] = "linear",
-    warmup_ratio: float = 0.1,
-    shuffle: bool = True,
-    seed: int = 42,
-) -> "Tuple[list[Trajectory], TrainSFTConfig]":
-    """
-    Prepare trajectories and config for model.train_sft().
-
-    Repeats trajectories for the requested number of epochs (with per-epoch
-    shuffling), and computes a per-batch learning rate schedule.
-
-    Args:
-        trajectories: List of trajectories to train on.
-        epochs: Number of times to repeat the dataset. Default: 1
-        batch_size: Number of trajectories per batch. Default: 2
-        peak_lr: Peak learning rate. Default: 2e-4
-        schedule_type: LR schedule ("cosine", "linear", "constant"). Default: "linear"
-        warmup_ratio: Fraction of total steps used for warmup. Default: 0.1
-        shuffle: Whether to shuffle trajectories each epoch. Default: True
-        seed: Random seed. Each epoch uses seed + epoch_number. Default: 42
-
-    Returns:
-        A tuple of (expanded_trajectories, TrainSFTConfig) that can be passed
-        directly to model.train_sft().
-
-    Example:
-        trajectories, config = prepare_sft(
-            trajectories=my_trajectories,
-            epochs=3,
-            batch_size=2,
-            peak_lr=2e-4,
-        )
-        await model.train_sft(trajectories, config)
-    """
-    from art.types import TrainSFTConfig as SFTConfig
-
-    # Expand trajectories across epochs
-    expanded: list = []
-    for epoch in range(epochs):
-        epoch_trajs = list(trajectories)
-        if shuffle:
-            random.Random(seed + epoch).shuffle(epoch_trajs)
-        expanded.extend(epoch_trajs)
-
-    total_batches = math.ceil(len(expanded) / batch_size)
-    warmup_steps = int(total_batches * warmup_ratio)
-    learning_rates = create_lr_schedule(
-        total_steps=total_batches,
-        peak_lr=peak_lr,
-        method=schedule_type,
-        warmup_steps=warmup_steps,
-    )
-
-    config = SFTConfig(
-        learning_rate=learning_rates,
-        batch_size=batch_size,
-    )
-
-    return expanded, config
-
-
 def create_sft_dataset_iterator(
     trajectories: "list[Trajectory]",
     chunk_size: int = 10,
@@ -214,10 +148,10 @@ def create_sft_dataset_iterator(
     """
     Prepare trajectories in chunks for multiple model.train_sft() calls.
 
-    Same as prepare_sft, but yields SFTChunk objects so that each call to
-    model.train_sft() produces its own training metrics. The learning rate
-    schedule is computed over the entire dataset, then sliced so that
-    scheduling (warmup, decay) is correct across all chunks.
+    Yields SFTChunk objects so that each call to model.train_sft() produces
+    its own training metrics. The learning rate schedule is computed over the
+    entire dataset, then sliced so that scheduling (warmup, decay) is correct
+    across all chunks.
 
     Args:
         trajectories: List of trajectories to train on.
