@@ -200,7 +200,7 @@ def prepare_sft(
 
 def create_sft_dataset_iterator(
     trajectories: "list[Trajectory]",
-    chunk_size: int = 50,
+    chunk_size: int = 10,
     epochs: int = 1,
     batch_size: int = 2,
     peak_lr: float = 2e-4,
@@ -221,7 +221,7 @@ def create_sft_dataset_iterator(
 
     Args:
         trajectories: List of trajectories to train on.
-        chunk_size: Number of batches to process per train_sft call. Default: 50.
+        chunk_size: Number of batches to process per train_sft call. Default: 10.
                     This is an internal optimization parameter and does not affect training.
         epochs: Number of times to repeat the dataset. Default: 1
         batch_size: Number of trajectories per batch. Default: 2
@@ -239,7 +239,7 @@ def create_sft_dataset_iterator(
     Example:
         for chunk in create_sft_dataset_iterator(
             trajectories=my_trajectories,
-            chunk_size=50,
+            chunk_size=10,
             epochs=3,
             batch_size=2,
             peak_lr=2e-4,
