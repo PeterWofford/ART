@@ -9,8 +9,8 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Literal, Protocol, cast
 from datasets import Dataset
 import peft
 import torch
+from transformers import GenerationMixin, PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-from transformers.utils.dummy_pt_objects import GenerationMixin, PreTrainedModel
 from trl import GRPOConfig, GRPOTrainer
 from vllm import AsyncEngineArgs
 from vllm.lora.request import LoRARequest
@@ -25,6 +25,7 @@ from ..preprocessing.pack import (
     packed_tensors_from_dir,
 )
 from ..preprocessing.tokenize import SFTBatch
+from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
@@ -149,6 +150,7 @@ def save_checkpoint(
     checkpoint_dir = get_step_checkpoint_dir(output_dir, next_step)
     os.makedirs(checkpoint_dir, exist_ok=True)
     trainer.save_model(checkpoint_dir)
+    convert_checkpoint_if_needed(checkpoint_dir)
     return checkpoint_dir
 
 
@@ -280,6 +282,7 @@ class UnslothService:
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
             os.makedirs(os.path.dirname(lora_path), exist_ok=True)
             self._state.trainer.save_model(lora_path)
+            convert_checkpoint_if_needed(lora_path)
             self._latest_step = 0
         else:
             # Extract step from checkpoint path
