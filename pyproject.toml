@@ -33,7 +33,7 @@ backend = [
     "transformers==5.1.0",
     "duckdb>=1.0.0",
     "pyarrow>=15.0.0",
-    "trl>=0.20.0",
+    "trl==0.20.0",
     "nbclient>=0.10.1",
     "pytest>=8.4.1",
     "nbmake>=1.5.5",
@@ -125,10 +125,9 @@ required-version = ">=0.6.15"
 override-dependencies = [
     "transformer-engine>=2.11.0",
     "numpy<2",
-    # Override unsloth's overly strict constraints — v5.x and trl 0.27.x
-    # are confirmed working per unsloth February-2026 release notes
+    # Override unsloth's overly strict constraint on transformers — v5.x
+    # is confirmed working per unsloth February-2026 release notes
     "transformers==5.1.0",
-    "trl>=0.20.0",
 ]
 exclude-dependencies = ["pynvml"]
 no-build-isolation-package = ["apex", "transformer-engine-torch", "nv-grouped-gemm"]
