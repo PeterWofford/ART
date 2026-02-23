@@ -7,5 +7,5 @@
 # Torchtune pinned to known-good commit
  torchtune @ git+https://github.com/pytorch/torchtune.git@2344509cf83bd886538fe3e8263e5145d1afb5c2
 
-# Unsloth Zoo pinned to known-good commit
- unsloth-zoo @ git+https://github.com/bradhilton/unsloth-zoo@f536ee6
+# Unsloth Zoo: using PyPI version (2026.2.1) instead of VCS fork,
+# since unsloth 2026.2.1 requires the matching unsloth-zoo version.
