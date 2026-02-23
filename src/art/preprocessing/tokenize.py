@@ -195,6 +195,7 @@ def tokenize_trajectory(
             cast(list[dict], messages),
             tools=tools,
             continue_final_message=True,
+            return_dict=False,
         ),
     )
     sentinal_token_id = max(
@@ -230,6 +231,7 @@ def tokenize_trajectory(
             cast(list[dict], token_template_messages),
             tools=tools,
             continue_final_message=True,
+            return_dict=False,
         ),
     )
     assistant_mask: list[int] = [0] * len(token_ids)
@@ -406,6 +408,7 @@ def tokenize_sft_batch(
                 tools=cast(Any, tools),
                 tokenize=True,
                 add_generation_prompt=False,
+                return_dict=False,
             ),
         )
 
