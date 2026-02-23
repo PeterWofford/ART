@@ -190,7 +190,6 @@ class PeftArgs(TypedDict, total=False):
 
 class TrainerArgs(TypedDict, total=False):
     output_dir: str | None
-    overwrite_output_dir: bool
     do_train: bool
     do_eval: bool
     do_predict: bool
@@ -219,7 +218,6 @@ class TrainerArgs(TypedDict, total=False):
     log_level: str
     log_level_replica: str
     log_on_each_node: bool
-    logging_dir: str | None
     logging_strategy: "IntervalStrategy | str"
     logging_first_step: bool
     logging_steps: float
@@ -236,25 +234,21 @@ class TrainerArgs(TypedDict, total=False):
     use_mps_device: bool
     seed: int
     data_seed: int | None
-    jit_mode_eval: bool
     use_ipex: bool
     bf16: bool
     fp16: bool
     fp16_opt_level: str
-    half_precision_backend: str
     bf16_full_eval: bool
     fp16_full_eval: bool
     tf32: bool | None
     local_rank: int
     ddp_backend: str | None
-    tpu_num_cores: int | None
     tpu_metrics_debug: bool
     debug: str | list[DebugOption]
     dataloader_drop_last: bool
     eval_steps: float | None
     dataloader_num_workers: int
     dataloader_prefetch_factor: int | None
-    past_index: int
     run_name: str | None
     disable_tqdm: bool | None
     remove_unused_columns: bool | None
@@ -295,15 +289,8 @@ class TrainerArgs(TypedDict, total=False):
     include_inputs_for_metrics: bool
     include_for_metrics: list[str]
     eval_do_concat_batches: bool
-    fp16_backend: str
-    push_to_hub_model_id: str | None
-    push_to_hub_organization: str | None
-    push_to_hub_token: str | None
-    mp_parameters: str
     auto_find_batch_size: bool
     full_determinism: bool
-    torchdynamo: str | None
-    ray_scope: str | None
     ddp_timeout: int
     torch_compile: bool
     torch_compile_backend: str | None
