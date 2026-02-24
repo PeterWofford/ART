@@ -39,16 +39,22 @@ async def main():
     load_dotenv()
 
     backend = MegatronBackend()
-    base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    engine_args: art.dev.EngineArgs = {
+        "gpu_memory_utilization": 0.8,
+        "tensor_parallel_size": torch.cuda.device_count(),
+        "language_model_only": os.environ.get("VLLM_LANGUAGE_MODEL_ONLY", "1")
+        == "1",
+        "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "1") == "1",
+        "max_model_len": int(os.environ.get("VLLM_MAX_MODEL_LEN", "32768")),
+    }
+    # base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+    base_model = "Qwen/Qwen3.5-35B-A3B"
     model = art.TrainableModel(
         name=os.environ.get("MODEL_NAME", "megatron-001"),
         project="yes-no-maybe-megatron",
         base_model=base_model,
         _internal_config=art.dev.InternalModelConfig(
-            engine_args=art.dev.EngineArgs(
-                gpu_memory_utilization=0.8,
-                tensor_parallel_size=torch.cuda.device_count(),
-            ),
+            engine_args=engine_args,
         ),
     )
     await model.register(backend)

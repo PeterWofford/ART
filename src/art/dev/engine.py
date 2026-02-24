@@ -60,6 +60,7 @@ class EngineArgs(TypedDict, total=False):
     limit_mm_per_prompt: dict[str, int] | None
     mm_processor_kwargs: dict[str, Any] | None
     disable_mm_preprocessor_cache: bool
+    language_model_only: bool
     enable_lora: bool
     enable_lora_bias: bool
     max_loras: int

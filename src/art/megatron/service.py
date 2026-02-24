@@ -1,8 +1,9 @@
 import asyncio
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import datetime
 from functools import cached_property
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -78,6 +79,91 @@ class MegatronService:
             bias="none",
         )
 
+    def _load_base_model_config(self) -> dict[str, Any]:
+        from huggingface_hub import hf_hub_download
+
+        config_path = hf_hub_download(self.base_model, "config.json")
+        with open(config_path) as f:
+            return json.load(f)
+
+    def _create_qwen_moe_identity_lora(
+        self, lora_path: str, config_dict: dict[str, Any]
+    ) -> None:
+        text_config = config_dict.get("text_config")
+        if not isinstance(text_config, dict):
+            text_config = config_dict
+
+        hidden_size = int(text_config["hidden_size"])
+        num_hidden_layers = int(text_config["num_hidden_layers"])
+        num_attention_heads = int(text_config["num_attention_heads"])
+        num_key_value_heads = int(
+            text_config.get("num_key_value_heads")
+            or text_config.get("num_query_groups")
+            or num_attention_heads
+        )
+        kv_channels = int(
+            text_config.get("kv_channels") or (hidden_size // num_attention_heads)
+        )
+        num_experts = int(text_config["num_experts"])
+        expert_intermediate_size_raw = (
+            text_config.get("moe_intermediate_size")
+            or text_config.get("intermediate_size")
+            or text_config.get("ffn_hidden_size")
+        )
+        if expert_intermediate_size_raw is None:
+            raise ValueError(
+                "Unable to infer MoE intermediate size from base model config."
+            )
+        expert_intermediate_size = int(expert_intermediate_size_raw)
+
+        q_out_features = kv_channels * num_attention_heads
+        kv_out_features = kv_channels * num_key_value_heads
+        rank = int(self._default_lora_adapter_config().r)
+        dtype = torch.bfloat16
+
+        def _init_a(*shape: int) -> torch.Tensor:
+            tensor = torch.empty(shape, dtype=dtype)
+            torch.nn.init.kaiming_uniform_(tensor, a=math.sqrt(5))
+            return tensor
+
+        tensors: dict[str, torch.Tensor] = {}
+        for layer_idx in range(num_hidden_layers):
+            layer_prefix = f"base_model.model.model.layers.{layer_idx}"
+
+            for proj_name, out_features in (
+                ("q_proj", q_out_features),
+                ("k_proj", kv_out_features),
+                ("v_proj", kv_out_features),
+                ("o_proj", hidden_size),
+            ):
+                proj_prefix = f"{layer_prefix}.self_attn.{proj_name}"
+                tensors[f"{proj_prefix}.lora_A.weight"] = _init_a(rank, hidden_size)
+                tensors[f"{proj_prefix}.lora_B.weight"] = torch.zeros(
+                    out_features, rank, dtype=dtype
+                )
+
+            experts_prefix = f"{layer_prefix}.mlp.experts"
+            for expert_idx in range(num_experts):
+                expert_prefix = f"{experts_prefix}.{expert_idx}"
+
+                for proj_name in ("gate_proj", "up_proj"):
+                    proj_prefix = f"{expert_prefix}.{proj_name}"
+                    tensors[f"{proj_prefix}.lora_A.weight"] = _init_a(rank, hidden_size)
+                    tensors[f"{proj_prefix}.lora_B.weight"] = torch.zeros(
+                        expert_intermediate_size, rank, dtype=dtype
+                    )
+
+                down_prefix = f"{expert_prefix}.down_proj"
+                tensors[f"{down_prefix}.lora_A.weight"] = _init_a(
+                    rank, expert_intermediate_size
+                )
+                tensors[f"{down_prefix}.lora_B.weight"] = torch.zeros(
+                    hidden_size, rank, dtype=dtype
+                )
+
+        os.makedirs(lora_path, exist_ok=True)
+        save_file(tensors, os.path.join(lora_path, "adapter_model.safetensors"))
+
     def _adapter_has_weights(self, lora_path: str) -> bool:
         adapter_path = os.path.join(lora_path, "adapter_model.safetensors")
         if not os.path.exists(adapter_path):
@@ -93,6 +179,11 @@ class MegatronService:
         return False
 
     def _create_identity_lora(self, lora_path: str) -> None:
+        config_dict = self._load_base_model_config()
+        if config_dict.get("model_type") == "qwen3_5_moe":
+            self._create_qwen_moe_identity_lora(lora_path, config_dict)
+            return
+
         # Create an identity (zero) LoRA using PEFT so vLLM can load it.
         from peft import get_peft_model
         from transformers import AutoModelForCausalLM
@@ -133,8 +224,14 @@ class MegatronService:
             if os.path.exists(source_config):
                 shutil.copy(source_config, config_path)
                 return
+        config_dict = self._default_lora_adapter_config().to_dict()
+        # PEFT emits target_modules as a set; normalize for JSON output.
+        if isinstance(config_dict.get("target_modules"), set):
+            config_dict["target_modules"] = sorted(config_dict["target_modules"])
+        if config_dict.get("base_model_name_or_path") is None:
+            config_dict["base_model_name_or_path"] = self.base_model
         with open(config_path, "w") as f:
-            json.dump(asdict(self._default_lora_adapter_config()), f)
+            json.dump(config_dict, f)
 
     async def _add_lora_aliases(
         self, llm: AsyncLLM, step: int, checkpoint_dir: str
@@ -196,8 +293,13 @@ class MegatronService:
         lora_path_for_server = (
             lora_path if self._adapter_has_weights(lora_path) else None
         )
+        model_name_for_server = self.model_name
+        if lora_path_for_server is None:
+            # When we cannot materialize an identity adapter for a new model
+            # architecture, keep the step-qualified model alias available.
+            model_name_for_server = f"{self.model_name}@{self._latest_step}"
         server_config = dev.get_openai_server_config(
-            model_name=self.model_name,
+            model_name=model_name_for_server,
             base_model=self.base_model,
             log_file=f"{self.output_dir}/logs/vllm.log",
             lora_path=lora_path_for_server,
@@ -255,6 +357,19 @@ class MegatronService:
         num_lines = 0
         while True:
             await asyncio.sleep(0.1)
+            if (
+                self._megatron_process is None
+                or self._megatron_process.returncode is not None
+            ):
+                exit_code = (
+                    self._megatron_process.returncode
+                    if self._megatron_process is not None
+                    else "unknown"
+                )
+                raise RuntimeError(
+                    "Megatron training process exited while waiting for completion "
+                    f"signal (exit code: {exit_code})."
+                )
             try:
                 with open("/tmp/megatron_training_log.jsonl", "a+") as log_file:
                     log_file.seek(0)

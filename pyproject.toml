@@ -38,7 +38,7 @@ backend = [
     "pytest>=8.4.1",
     "nbmake>=1.5.5",
     "gql<4",
-    "vllm==0.15.1 ; sys_platform == 'linux'",
+    "vllm @ https://wheels.vllm.ai/f5972a872fa3fabd94b7a6c6f031f4b5bcee2b2d/vllm-0.16.0rc2.dev441%2Bgf5972a872-cp38-abi3-manylinux_2_31_x86_64.whl ; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 megatron = [
     "torch>=2.8.0",
