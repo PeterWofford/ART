@@ -670,8 +670,8 @@ class UnslothService:
                 ),
             )
 
-        # Transformers v5 removed `warnings_issued` from PreTrainedModel,
-        # but Unsloth's GRPOTrainer still accesses it during init.
+        # Unsloth's model patching can leave the PEFT model without
+        # `warnings_issued`, which GRPOTrainer expects during init.
         if not hasattr(peft_model, "warnings_issued"):
             peft_model.warnings_issued = {}  # type: ignore[attr-defined]
 
