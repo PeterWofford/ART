@@ -124,14 +124,14 @@ required-version = ">=0.6.15"
 # numpy>=2 on Python 3.9+, but megatron-core requires numpy<2.
 override-dependencies = ["transformer-engine>=2.11.0", "numpy<2"]
 exclude-dependencies = ["pynvml"]
-no-build-isolation-package = ["apex", "transformer-engine-torch", "nv-grouped-gemm"]
+no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-core", "megatron-bridge", "nv-grouped-gemm", "mamba-ssm", "causal-conv1d"]
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.8.0"]
 transformer-engine-torch = ["torch>=2.8.0"]
 
 [tool.uv.extra-build-variables]
-apex = { APEX_CPP_EXT = "1", APEX_CUDA_EXT = "1", APEX_FAST_LAYER_NORM = "1", APEX_PARALLEL_BUILD = "1", NVCC_APPEND_FLAGS = "--threads 1" }
+apex = { APEX_CPP_EXT = "1", APEX_CUDA_EXT = "1", APEX_FAST_LAYER_NORM = "1", APEX_PARALLEL_BUILD = "16", NVCC_APPEND_FLAGS = "--threads 4" }
 
 [tool.ty.environment]
 python-version = "3.11"
