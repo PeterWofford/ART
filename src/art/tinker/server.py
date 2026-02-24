@@ -68,7 +68,6 @@ class OpenAICompatibleTinkerServer:
                     messages,  # type: ignore
                     tools=tools,  # type: ignore
                     add_generation_prompt=True,
-                    return_dict=False,
                 ),
             )
 
