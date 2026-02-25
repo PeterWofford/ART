@@ -22,6 +22,10 @@ class ModelService(Protocol):
 
     async def vllm_engine_is_sleeping(self) -> bool: ...
 
+    async def close(self) -> None: ...
+
+    async def shutdown(self) -> None: ...
+
     def train(
         self,
         disk_packed_tensors: DiskPackedTensors,

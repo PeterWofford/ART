@@ -720,6 +720,29 @@ class UnslothService:
             engine_args.pop(key, None)
         return asyncio.create_task(get_llm(AsyncEngineArgs(**engine_args)))  # ty:ignore[invalid-argument-type]
 
+    async def shutdown(self) -> None:
+        llm_task = self.__dict__.get("llm")
+        if isinstance(llm_task, asyncio.Task):
+            llm = None
+            if llm_task.done():
+                try:
+                    llm = llm_task.result()
+                except Exception:
+                    llm = None
+            else:
+                llm_task.cancel()
+                try:
+                    llm = await llm_task
+                except asyncio.CancelledError:
+                    llm = None
+                except Exception:
+                    llm = None
+            if llm is not None:
+                llm.shutdown()
+
+    async def close(self) -> None:
+        await self.shutdown()
+
 
 # ============================================================================
 # Worker Sleep/Wake Functions

@@ -3,11 +3,9 @@ from dataclasses import dataclass
 import datetime
 from functools import cached_property
 import json
-import math
 import os
 from pathlib import Path
 import shutil
-import subprocess
 from typing import Any, AsyncIterator
 
 from peft.tuners.lora.config import LoraConfig
@@ -23,10 +21,17 @@ from .. import dev, types
 from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
-from ..unsloth.service import do_sleep, do_wake_up, gc_and_empty_cuda_cache
+from ..unsloth.service import gc_and_empty_cuda_cache
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
-from ..vllm import get_llm, openai_server_task, run_on_workers
+from ..vllm import get_llm, openai_server_task
+from .lora_contract import (
+    DEFAULT_LORA_ALPHA,
+    DEFAULT_LORA_RANK,
+    build_qwen_moe_identity_lora_tensors,
+    default_target_modules,
+)
+from .process_lifecycle import ensure_megatron_running, terminate_megatron_process
 
 
 class MegatronTrainingJob(BaseModel):
@@ -50,6 +55,8 @@ class MegatronService:
     _lora_id_counter: int = 1
     _megatron_process: asyncio.subprocess.Process | None = None
     _optimizer_state_path: str | None = None
+    _openai_task: asyncio.Task[None] | None = None
+    _openai_config: dev.OpenAIServerConfig | None = None
 
     def _next_lora_id(self) -> int:
         self._lora_id_counter += 1
@@ -65,17 +72,9 @@ class MegatronService:
     def _default_lora_adapter_config(self) -> LoraConfig:
         # Keep in sync with LoRA settings in megatron/train.py.
         return LoraConfig(
-            r=1,
-            lora_alpha=32,
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            r=DEFAULT_LORA_RANK,
+            lora_alpha=DEFAULT_LORA_ALPHA,
+            target_modules=default_target_modules(),
             bias="none",
         )
 
@@ -89,77 +88,11 @@ class MegatronService:
     def _create_qwen_moe_identity_lora(
         self, lora_path: str, config_dict: dict[str, Any]
     ) -> None:
-        text_config = config_dict.get("text_config")
-        if not isinstance(text_config, dict):
-            text_config = config_dict
-
-        hidden_size = int(text_config["hidden_size"])
-        num_hidden_layers = int(text_config["num_hidden_layers"])
-        num_attention_heads = int(text_config["num_attention_heads"])
-        num_key_value_heads = int(
-            text_config.get("num_key_value_heads")
-            or text_config.get("num_query_groups")
-            or num_attention_heads
+        tensors = build_qwen_moe_identity_lora_tensors(
+            config_dict,
+            rank=int(self._default_lora_adapter_config().r),
+            dtype=torch.bfloat16,
         )
-        kv_channels = int(
-            text_config.get("kv_channels") or (hidden_size // num_attention_heads)
-        )
-        num_experts = int(text_config["num_experts"])
-        expert_intermediate_size_raw = (
-            text_config.get("moe_intermediate_size")
-            or text_config.get("intermediate_size")
-            or text_config.get("ffn_hidden_size")
-        )
-        if expert_intermediate_size_raw is None:
-            raise ValueError(
-                "Unable to infer MoE intermediate size from base model config."
-            )
-        expert_intermediate_size = int(expert_intermediate_size_raw)
-
-        q_out_features = kv_channels * num_attention_heads
-        kv_out_features = kv_channels * num_key_value_heads
-        rank = int(self._default_lora_adapter_config().r)
-        dtype = torch.bfloat16
-
-        def _init_a(*shape: int) -> torch.Tensor:
-            tensor = torch.empty(shape, dtype=dtype)
-            torch.nn.init.kaiming_uniform_(tensor, a=math.sqrt(5))
-            return tensor
-
-        tensors: dict[str, torch.Tensor] = {}
-        for layer_idx in range(num_hidden_layers):
-            layer_prefix = f"base_model.model.model.layers.{layer_idx}"
-
-            for proj_name, out_features in (
-                ("q_proj", q_out_features),
-                ("k_proj", kv_out_features),
-                ("v_proj", kv_out_features),
-                ("o_proj", hidden_size),
-            ):
-                proj_prefix = f"{layer_prefix}.self_attn.{proj_name}"
-                tensors[f"{proj_prefix}.lora_A.weight"] = _init_a(rank, hidden_size)
-                tensors[f"{proj_prefix}.lora_B.weight"] = torch.zeros(
-                    out_features, rank, dtype=dtype
-                )
-
-            experts_prefix = f"{layer_prefix}.mlp.experts"
-            for expert_idx in range(num_experts):
-                expert_prefix = f"{experts_prefix}.{expert_idx}"
-
-                for proj_name in ("gate_proj", "up_proj"):
-                    proj_prefix = f"{expert_prefix}.{proj_name}"
-                    tensors[f"{proj_prefix}.lora_A.weight"] = _init_a(rank, hidden_size)
-                    tensors[f"{proj_prefix}.lora_B.weight"] = torch.zeros(
-                        expert_intermediate_size, rank, dtype=dtype
-                    )
-
-                down_prefix = f"{expert_prefix}.down_proj"
-                tensors[f"{down_prefix}.lora_A.weight"] = _init_a(
-                    rank, expert_intermediate_size
-                )
-                tensors[f"{down_prefix}.lora_B.weight"] = torch.zeros(
-                    hidden_size, rank, dtype=dtype
-                )
 
         os.makedirs(lora_path, exist_ok=True)
         save_file(tensors, os.path.join(lora_path, "adapter_model.safetensors"))
@@ -255,28 +188,63 @@ class MegatronService:
 
     async def _ensure_megatron_running(self) -> None:
         """Lazily start Megatron training process if not running."""
-        if self._megatron_process is not None:
-            if self._megatron_process.returncode is None:
-                return
-            self._megatron_process = None
-
-        try:
-            import megatron.bridge  # type: ignore
-
-            setup_cmd = ""
-        except ImportError:
-            setup_script = Path(__file__).parent / "setup.sh"
-            setup_cmd = f"bash {setup_script} && "
-
-        subprocess.run(["pkill", "-9", "megatron-service"], check=False)
+        setup_script = Path(__file__).parent / "setup.sh"
         train_script = Path(__file__).parent / "train.py"
-        num_gpus = torch.cuda.device_count()
-        os.environ["MODEL_IDENTIFIER"] = self.base_model
-
-        command = (
-            f"{setup_cmd}uv run torchrun --nproc_per_node {num_gpus} {train_script}"
+        self._megatron_process = await ensure_megatron_running(
+            self._megatron_process,
+            base_model=self.base_model,
+            setup_script=setup_script,
+            train_script=train_script,
         )
-        self._megatron_process = await asyncio.create_subprocess_shell(command)
+
+    async def shutdown(self) -> None:
+        await self._shutdown_openai_server()
+        await self._shutdown_llm()
+        await terminate_megatron_process(self._megatron_process)
+        self._megatron_process = None
+
+    async def close(self) -> None:
+        await self.shutdown()
+
+    async def _shutdown_openai_server(self) -> None:
+        if self._openai_task is None:
+            return
+        self._openai_task.cancel()
+        try:
+            await self._openai_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+        self._openai_task = None
+
+    async def _restart_openai_server(self, llm: AsyncLLM) -> None:
+        if self._openai_config is None:
+            return
+        self._openai_task = await openai_server_task(
+            engine=llm, config=self._openai_config
+        )
+
+    async def _shutdown_llm(self) -> None:
+        llm_task = self.__dict__.get("llm")
+        if isinstance(llm_task, asyncio.Task):
+            llm = None
+            if llm_task.done():
+                try:
+                    llm = llm_task.result()
+                except Exception:
+                    llm = None
+            else:
+                llm_task.cancel()
+                try:
+                    llm = await llm_task
+                except asyncio.CancelledError:
+                    llm = None
+                except Exception:
+                    llm = None
+            if llm is not None:
+                llm.shutdown()
+        self.__dict__.pop("llm", None)
 
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
@@ -305,7 +273,10 @@ class MegatronService:
             lora_path=lora_path_for_server,
             config=config,
         )
-        await openai_server_task(engine=await self.llm, config=server_config)
+        self._openai_config = server_config
+        self._openai_task = await openai_server_task(
+            engine=await self.llm, config=server_config
+        )
         return (
             server_config.get("server_args", {}).get("host") or "0.0.0.0",
             server_config.get("server_args", {}).get("port", 8000),
@@ -321,12 +292,18 @@ class MegatronService:
         _config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        separate_gpus = bool(os.environ.get("ART_MEGATRON_CUDA_VISIBLE_DEVICES"))
         llm = await self.llm
-        await llm.pause_generation()
-        await llm.reset_prefix_cache()
-        await run_on_workers(llm, do_sleep, level=2)
-        self._is_sleeping = True
-        gc_and_empty_cuda_cache()
+        if separate_gpus:
+            # Training on separate GPUs; keep vLLM serving.
+            pass
+        else:
+            await llm.pause_generation()
+            await llm.reset_prefix_cache()
+            await self._shutdown_openai_server()
+            await self._shutdown_llm()
+            self._is_sleeping = True
+            gc_and_empty_cuda_cache()
 
         # Start Megatron after vLLM has freed GPU memory.
         await self._ensure_megatron_running()
@@ -397,18 +374,15 @@ class MegatronService:
         )
         self._ensure_lora_adapter_config(new_checkpoint_dir, source_path=lora_path)
 
-        wake_lock_path = "/tmp/megatron_vllm_waking"
-        try:
-            with open(wake_lock_path, "w") as lock_file:
-                lock_file.write("waking vllm\n")
-            await run_on_workers(llm, do_wake_up)
+        if separate_gpus:
+            await self._add_lora_aliases(llm, next_step, new_checkpoint_dir)
+            await llm.resume_generation()
+        else:
+            llm = await self.llm
+            await self._restart_openai_server(llm)
             self._is_sleeping = False
-        finally:
-            if os.path.exists(wake_lock_path):
-                os.remove(wake_lock_path)
-
-        await self._add_lora_aliases(llm, next_step, new_checkpoint_dir)
-        await llm.resume_generation()
+            await self._add_lora_aliases(llm, next_step, new_checkpoint_dir)
+            await llm.resume_generation()
 
     # SFT not supported for MegatronService
     async def train_sft(

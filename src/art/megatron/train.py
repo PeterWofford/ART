@@ -120,6 +120,7 @@ def print0(*values: Any) -> None:
 
 
 offload_state = OffloadState()
+skip_offload = os.environ.get("ART_MEGATRON_SKIP_OFFLOAD", "0") == "1"
 
 
 def calculate_mask(
@@ -147,7 +148,8 @@ def calculate_mask(
     return mask
 
 
-offload_to_cpu(model, optimizer, rank, offload_state)
+if not skip_offload:
+    offload_to_cpu(model, optimizer, rank, offload_state)
 
 while True:
     torch.distributed.barrier()
@@ -164,7 +166,8 @@ while True:
     while os.path.exists(wake_lock_path):
         time.sleep(0.2)
 
-    reload_to_gpu(model, optimizer, rank, offload_state)
+    if not skip_offload:
+        reload_to_gpu(model, optimizer, rank, offload_state)
 
     job_name = job_names[0]
     job_path = os.path.join(jobs_dir, job_name)
@@ -329,7 +332,8 @@ while True:
     print("Saving optimizer shard to", optimizer_shard_path)
     os.makedirs(job.optimizer_state_path, exist_ok=True)
     torch.save(optimizer.state_dict(), optimizer_shard_path)
-    offload_to_cpu(model, optimizer, rank, offload_state)
+    if not skip_offload:
+        offload_to_cpu(model, optimizer, rank, offload_state)
     # Release mmap-backed packed tensor references on all ranks before rank0 cleanup.
     del packed_tensors
     if "inputs" in locals():

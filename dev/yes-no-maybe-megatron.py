@@ -1,92 +1,42 @@
 import asyncio
-from itertools import permutations
 import os
 
 from dotenv import load_dotenv
-import openai
-import torch
 
 import art
 from art.megatron import MegatronBackend
-
-
-async def rollout(
-    client: openai.AsyncOpenAI, model_name: str, prompt: str
-) -> art.Trajectory:
-    messages: art.Messages = [{"role": "user", "content": prompt}]
-    chat_completion = await client.chat.completions.create(
-        messages=messages, model=model_name, max_tokens=100, timeout=100
-    )
-    choice = chat_completion.choices[0]
-    content = choice.message.content
-    assert isinstance(content, str)
-    if content == "yes":
-        reward = 0.5
-    elif content == "no":
-        reward = 0.75
-    elif content == "maybe":
-        reward = 1.0
-    else:
-        reward = 0.0
-    return art.Trajectory(messages_and_choices=[*messages, choice], reward=reward)
-
-
-def with_quotes(w: str) -> str:
-    return f"'{w}'"
+from dev.yes_no_maybe.prompts import build_prompt_variants, slice_prompts
+from dev.yes_no_maybe.runtime_config import resolve_engine_args, resolve_run_config
+from dev.yes_no_maybe.trainer import run_training
 
 
 async def main():
     load_dotenv()
 
     backend = MegatronBackend()
-    engine_args: art.dev.EngineArgs = {
-        "gpu_memory_utilization": 0.8,
-        "tensor_parallel_size": torch.cuda.device_count(),
-        "language_model_only": os.environ.get("VLLM_LANGUAGE_MODEL_ONLY", "1")
-        == "1",
-        "enforce_eager": os.environ.get("VLLM_ENFORCE_EAGER", "1") == "1",
-        "max_model_len": int(os.environ.get("VLLM_MAX_MODEL_LEN", "32768")),
-    }
-    # base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
-    base_model = "Qwen/Qwen3.5-35B-A3B"
-    model = art.TrainableModel(
-        name=os.environ.get("MODEL_NAME", "megatron-001"),
-        project="yes-no-maybe-megatron",
-        base_model=base_model,
-        _internal_config=art.dev.InternalModelConfig(
-            engine_args=engine_args,
-        ),
-    )
-    await model.register(backend)
-
-    prompts = [
-        f"{prefix} with {', '.join([with_quotes(w) if use_quotes else w for w in words]) if len(words) == 3 else f'{words[0]}' + (f' or {words[1]}' if len(words) > 1 else '')}"
-        for prefix in ["respond", "just respond"]
-        for use_quotes in [True, False]
-        for words in (
-            list(p) for n in [3, 2] for p in permutations(["yes", "no", "maybe"], n)
+    try:
+        engine_args = resolve_engine_args()
+        # base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
+        base_model = "Qwen/Qwen3.5-35B-A3B"
+        model = art.TrainableModel(
+            name=os.environ.get("MODEL_NAME", "megatron-001"),
+            project="yes-no-maybe-megatron",
+            base_model=base_model,
+            _internal_config=art.dev.InternalModelConfig(
+                engine_args=engine_args,
+            ),
         )
-    ]
+        await model.register(backend)
 
-    openai_client = model.openai_client()
-    max_steps = int(os.environ.get("NUM_STEPS", "20"))
-    start_step = await model.get_step()
-
-    for step in range(start_step, start_step + max_steps):
-        print(f"\n=== Step {step + 1} ===")
-        train_groups = await art.gather_trajectory_groups(
-            (
-                art.TrajectoryGroup(
-                    rollout(openai_client, model.get_inference_name(), prompt)
-                    for _ in range(32)
-                )
-                for prompt in prompts
-            )
+        run_config = resolve_run_config()
+        prompts = slice_prompts(
+            build_prompt_variants(),
+            offset=run_config.prompt_offset,
+            limit=run_config.prompt_limit,
         )
-        await model.train(
-            train_groups,
-            config=art.TrainConfig(learning_rate=1e-4),
-        )
+        await run_training(model, prompts, run_config)
+    finally:
+        await backend.close()
 
 
 if __name__ == "__main__":

@@ -43,6 +43,7 @@ backend = [
 megatron = [
     "torch>=2.8.0",
     "apex",
+    "flash-attn",
     "transformer-engine==2.11.0",
     "transformer-engine-cu12==2.11.0",
     "transformer-engine-torch==2.11.0",
@@ -128,6 +129,7 @@ no-build-isolation-package = ["apex", "transformer-engine-torch", "nv-grouped-ge
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.8.0"]
+flash-attn = ["torch>=2.8.0"]
 transformer-engine-torch = ["torch>=2.8.0"]
 
 [tool.uv.extra-build-variables]

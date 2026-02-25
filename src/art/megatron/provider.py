@@ -1,31 +1,42 @@
+import logging
+import os
+
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
-from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
-from megatron.core.transformer.enums import AttnBackend
 import torch
+
+from .bridge_patches import register_qwen35_bridge_patches
+from .provider_config import configure_provider
+from .provider_contract import require_supported_qwen_bridge
+from .provider_flags import get_provider_flags
+
+logger = logging.getLogger(__name__)
+_MEGATRON_DEBUG = os.environ.get("ART_MEGATRON_DEBUG", "0") == "1"
 
 
 def get_provider(model: str) -> GPTModelProvider:
+    register_qwen35_bridge_patches()
+    flags = get_provider_flags()
+    if _MEGATRON_DEBUG:
+        logger.warning("Resolving Megatron provider for model=%s", model)
     bridge = AutoBridge.from_hf_pretrained(
         model,
         torch_dtype=torch.bfloat16,
         trust_remote_code=True,
     )
-    assert isinstance(bridge._model_bridge, Qwen3MoEBridge), (
-        "Only Qwen3 MoE models are supported"
-    )
-    provider = bridge.to_megatron_provider()
-    provider.attention_backend = AttnBackend.fused
-    provider.recompute_granularity = "full"
-    provider.recompute_method = "uniform"
-    provider.recompute_num_layers = 1
-    provider.tensor_model_parallel_size = min(2, torch.cuda.device_count())
-    provider.context_parallel_size = 1
-    provider.pipeline_model_parallel_size = 1
-    provider.expert_model_parallel_size = torch.cuda.device_count()
-    provider.expert_tensor_parallel_size = 1
-    provider.moe_shared_expert_overlap = True
-    provider.moe_router_dtype = "fp32"
-    if provider.tensor_model_parallel_size > 1:
-        provider.sequence_parallel = True
+    if _MEGATRON_DEBUG:
+        logger.warning(
+            "AutoBridge resolved architecture=%s bridge=%s.%s",
+            getattr(bridge, "_causal_lm_architecture", "<unknown>"),
+            type(bridge._model_bridge).__module__,
+            type(bridge._model_bridge).__name__,
+        )
+    require_supported_qwen_bridge(bridge)
+    if flags.skip_hf_base_weights:
+        logger.warning(
+            "ART_MEGATRON_SKIP_HF_BASE_WEIGHTS=1 -> skipping HF base-weight import; "
+            "training model is random-initialized for control-plane validation."
+        )
+    provider = bridge.to_megatron_provider(load_weights=not flags.skip_hf_base_weights)
+    configure_provider(provider, flags=flags, bridge=bridge, debug=_MEGATRON_DEBUG)
     return provider

@@ -93,11 +93,27 @@ class LocalBackend(Backend):
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
+        for _, service in self._services.items():
+            if hasattr(service, "shutdown"):
+                try:
+                    await service.shutdown()  # type: ignore[func-returns-value]
+                except Exception:
+                    pass
+            elif self._in_process and hasattr(service, "close"):
+                try:
+                    await service.close()  # type: ignore[func-returns-value]
+                except Exception:
+                    pass
         self._close()
 
     def _close(self) -> None:
         for _, service in self._services.items():
-            close_proxy(service)
+            try:
+                close_proxy(service)
+            except ValueError:
+                # Proxy queue may already be closed after remote shutdown.
+                pass
+        self._services.clear()
 
     async def register(
         self,
@@ -212,8 +228,11 @@ class LocalBackend(Backend):
         if not tokenized_results:
             return None
         max_tokens = max(len(result.tokens) for result in tokenized_results)
-        # Round up max_tokens to the nearest multiple of 2048
-        sequence_length = math.ceil(max_tokens / 2048) * 2048
+        pack_granularity = int(os.environ.get("ART_PACK_SEQUENCE_GRANULARITY", "2048"))
+        if pack_granularity <= 0:
+            pack_granularity = 2048
+        # Round up max_tokens to the nearest configured packing granularity.
+        sequence_length = math.ceil(max_tokens / pack_granularity) * pack_granularity
         # Cap sequence length at the model's max sequence length
         sequence_length = min(
             sequence_length,

@@ -190,6 +190,14 @@ class TinkerService:
                 del state.models[model_name]
                 print(f"Removed model {model_name} from server")
 
+    async def shutdown(self) -> None:
+        if self._server is not None:
+            await self._server.stop()
+            self._server = None
+
+    async def close(self) -> None:
+        await self.shutdown()
+
     @cached_property
     def _state_task(self) -> asyncio.Task["TinkerState"]:
         return asyncio.create_task(self._get_state())
