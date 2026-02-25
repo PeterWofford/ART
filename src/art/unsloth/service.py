@@ -800,18 +800,16 @@ class UnslothService:
             for i in range(0, len(batch.trajectory_tensors), microbatch_size):
                 micro = batch.trajectory_tensors[i : i + microbatch_size]
                 # Trim to the longest actual sequence in this microbatch
-                max_seq_len = max(
-                    int(t["attention_mask"].sum().item()) for t in micro
-                )
+                max_seq_len = max(int(t["attention_mask"].sum().item()) for t in micro)
                 input_ids = torch.cat(
                     [t["input_ids"][:, :max_seq_len] for t in micro]
                 ).to(device)
                 attention_mask = torch.cat(
                     [t["attention_mask"][:, :max_seq_len] for t in micro]
                 ).to(device)
-                labels = torch.cat(
-                    [t["labels"][:, :max_seq_len] for t in micro]
-                ).to(device)
+                labels = torch.cat([t["labels"][:, :max_seq_len] for t in micro]).to(
+                    device
+                )
 
                 # Forward pass with num_items_in_batch for proper loss normalization
                 outputs = peft_model(
