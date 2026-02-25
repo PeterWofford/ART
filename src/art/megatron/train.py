@@ -24,6 +24,7 @@ import torch
 
 from art import dev, types
 from art.loss import loss_fn, shift_tensor
+from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.offload import OffloadState, offload_to_cpu, reload_to_gpu
 from art.megatron.provider import get_provider
@@ -122,31 +123,6 @@ def print0(*values: Any) -> None:
 offload_state = OffloadState()
 
 
-def calculate_mask(
-    batch_size: int,
-    seq_len: int,
-    device: torch.device,
-    group_ids: torch.Tensor,
-    parent_ids: torch.Tensor,
-) -> torch.Tensor:
-    causal_mask = (
-        torch.tril(
-            torch.ones(
-                seq_len,
-                seq_len,
-                dtype=torch.bool,
-                device=device,
-            )
-        )
-        .unsqueeze(0)
-        .expand(batch_size, seq_len, seq_len)
-    )
-    group_mask = group_ids.unsqueeze(2) == group_ids.unsqueeze(1)
-    parent_mask = parent_ids.unsqueeze(2) == group_ids.unsqueeze(1)
-    mask = causal_mask & (group_mask | parent_mask)
-    return mask
-
-
 offload_to_cpu(model, optimizer, rank, offload_state)
 
 while True:
@@ -236,26 +212,19 @@ while True:
         for key, value in inputs.items():
             if isinstance(value, torch.Tensor):
                 inputs[key] = value.to(device)  # type: ignore
-        attention_mask = ~calculate_mask(
-            batch_size=inputs["tokens"].shape[0],
-            seq_len=inputs["tokens"].shape[1],
-            device=device,
+        attention_state = create_shared_prefix_attention_state(
             group_ids=inputs["group_ids"],
             parent_ids=inputs["parent_ids"],
-        ).unsqueeze(1)  # add head dimension [B, H=1, S, S]
-        attention_bias = torch.where(
-            attention_mask,
-            torch.tensor(
-                float("-inf"), dtype=next(model[0].parameters()).dtype, device=device
-            ),
-            torch.tensor(0.0, dtype=next(model[0].parameters()).dtype, device=device),
         )
+        # Megatron full-layer recompute saves positional tensor args, so keep a tiny
+        # placeholder Tensor here and pass flex BlockMask state via attention_bias.
+        attention_mask = torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device)
         new_logprobs: torch.Tensor = -model[0](
             input_ids=inputs["tokens"],
             position_ids=inputs["input_pos"],
             attention_mask=attention_mask,
             labels=shift_tensor(inputs["tokens"], 0),
-            extra_block_kwargs={"attention_bias": attention_bias},
+            extra_block_kwargs={"attention_bias": attention_state},
         )
         loss = loss_fn(
             inputs,  # type: ignore

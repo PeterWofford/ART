@@ -1,8 +1,14 @@
+import copy
+import inspect
+
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.spec_utils import ModuleSpec
 import torch
+
+from art.megatron.flex_attention import FlexDotProductAttention
 
 
 def get_provider(model: str) -> GPTModelProvider:
@@ -15,7 +21,27 @@ def get_provider(model: str) -> GPTModelProvider:
         "Only Qwen3 MoE models are supported"
     )
     provider = bridge.to_megatron_provider()
-    provider.attention_backend = AttnBackend.fused
+    base_layer_spec = provider.transformer_layer_spec
+
+    def _flex_attention_layer_spec(
+        config: GPTModelProvider, vp_stage: int | None = None
+    ) -> ModuleSpec:
+        if isinstance(base_layer_spec, ModuleSpec):
+            layer_spec = copy.deepcopy(base_layer_spec)
+        elif "vp_stage" in inspect.signature(base_layer_spec).parameters:
+            layer_spec = base_layer_spec(config, vp_stage=vp_stage)
+        else:
+            layer_spec = base_layer_spec(config)
+
+        # Keep Megatron's standard layer stack and replace only core attention.
+        layer_spec = copy.deepcopy(layer_spec)
+        layer_spec.submodules.self_attention.submodules.core_attention = (  # type: ignore[union-attr]
+            FlexDotProductAttention
+        )
+        return layer_spec
+
+    provider.transformer_layer_spec = _flex_attention_layer_spec
+    provider.attention_backend = AttnBackend.auto
     provider.recompute_granularity = "full"
     provider.recompute_method = "uniform"
     provider.recompute_num_layers = 1
