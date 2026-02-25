@@ -794,22 +794,12 @@ class UnslothService:
                 batch.num_trainable_tokens, dtype=torch.long, device=device
             )
 
-            # Process trajectories in microbatches, trimming padding to the
-            # longest sequence in each microbatch to avoid wasted GPU compute.
-            microbatch_size = 1
-            for i in range(0, len(batch.trajectory_tensors), microbatch_size):
-                micro = batch.trajectory_tensors[i : i + microbatch_size]
-                # Trim to the longest actual sequence in this microbatch
-                max_seq_len = max(int(t["attention_mask"].sum().item()) for t in micro)
-                input_ids = torch.cat(
-                    [t["input_ids"][:, :max_seq_len] for t in micro]
-                ).to(device)
-                attention_mask = torch.cat(
-                    [t["attention_mask"][:, :max_seq_len] for t in micro]
-                ).to(device)
-                labels = torch.cat([t["labels"][:, :max_seq_len] for t in micro]).to(
-                    device
-                )
+            # Process each trajectory in the batch (gradient accumulation)
+            for trajectory_tensor in batch.trajectory_tensors:
+                # Move tensors to device
+                input_ids = trajectory_tensor["input_ids"].to(device)
+                attention_mask = trajectory_tensor["attention_mask"].to(device)
+                labels = trajectory_tensor["labels"].to(device)
 
                 # Forward pass with num_items_in_batch for proper loss normalization
                 outputs = peft_model(
