@@ -796,10 +796,13 @@ class UnslothService:
 
             # Process each trajectory in the batch (gradient accumulation)
             for trajectory_tensor in batch.trajectory_tensors:
-                # Move tensors to device
-                input_ids = trajectory_tensor["input_ids"].to(device)
-                attention_mask = trajectory_tensor["attention_mask"].to(device)
-                labels = trajectory_tensor["labels"].to(device)
+                # Strip any trailing padding before moving to GPU
+                seq_len = int(trajectory_tensor["attention_mask"].sum().item())
+                input_ids = trajectory_tensor["input_ids"][:, :seq_len].to(device)
+                attention_mask = trajectory_tensor["attention_mask"][:, :seq_len].to(
+                    device
+                )
+                labels = trajectory_tensor["labels"][:, :seq_len].to(device)
 
                 # Forward pass with num_items_in_batch for proper loss normalization
                 outputs = peft_model(
