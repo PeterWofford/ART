@@ -132,13 +132,6 @@ override-dependencies = [
 exclude-dependencies = ["pynvml"]
 no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-core", "megatron-bridge", "nv-grouped-gemm", "mamba-ssm", "causal-conv1d"]
 
-# Provide static metadata for apex so `uv lock` doesn't need to build it
-# (apex requires torch at build time, which isn't available on client machines)
-[[tool.uv.dependency-metadata]]
-name = "apex"
-version = "0.1"
-requires-dist = ["packaging"]
-
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.8.0"]
 transformer-engine-torch = ["torch>=2.8.0"]
