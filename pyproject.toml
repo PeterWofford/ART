@@ -129,6 +129,7 @@ override-dependencies = [
     # is confirmed working per unsloth February-2026 release notes
     "transformers==5.1.0",
 ]
+exclude-dependencies = ["pynvml"]
 no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-core", "megatron-bridge", "nv-grouped-gemm", "mamba-ssm", "causal-conv1d"]
 
 # Provide static metadata for apex so `uv lock` doesn't need to build it
