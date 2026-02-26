@@ -11,7 +11,6 @@ from megatron.core.utils import divide
 from pydantic import BaseModel, ConfigDict
 import torch
 from torch import Tensor
-import torch._inductor.config as inductor_config
 from torch.nn.attention.flex_attention import (
     BlockMask,
     create_block_mask,
@@ -29,20 +28,15 @@ class SharedPrefixAttentionState(BaseModel):
 class FlexAttentionWrapper(torch.nn.Module):
     """Compiled `flex_attention` wrapper with Torchtitan-style inductor options."""
 
-    _requested_compile_options = {
-        "wrap_inductor_compiled_regions": True,
+    # Torchtitan inductor options for compiling flex attention.
+    _compile_options = {
         "max_autotune": True,
         "coordinate_descent_tuning": True,
         "triton.cudagraphs": False,
     }
-    _supported_compile_options = {
-        key: value
-        for key, value in _requested_compile_options.items()
-        if key in inductor_config.get_config_copy()
-    }
     _compiled_flex_attention: ClassVar = torch.compile(
         flex_attention,
-        options=_supported_compile_options,
+        options=_compile_options,
     )
 
     def forward(
@@ -78,6 +72,8 @@ def create_shared_prefix_attention_state(
 ) -> SharedPrefixAttentionState:
     """Build a compiled block mask for ART shared-prefix packing.
 
+    Initialized on the device of the group_ids tensor.
+
     Args:
         group_ids: `[B, S]` group id for each token in a packed sequence.
         parent_ids: `[B, S]` parent group id for each token in a packed sequence.
@@ -91,7 +87,8 @@ def create_shared_prefix_attention_state(
     ) -> Tensor:
         del head_idx
         # Token q can attend token k if k is causal and either from the same
-        # group or from q's parent-prefix group.
+        # traj (traj -> traj)/within the shared prefix (prefix -> prefix) (same_group)
+        # or from the prefix which q uses (traj -> prefix) (parent_prefix).
         same_group = group_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
         parent_prefix = parent_ids[batch_idx, query_idx] == group_ids[batch_idx, kv_idx]
         return (query_idx >= kv_idx) & (same_group | parent_prefix)
@@ -108,7 +105,10 @@ def create_shared_prefix_attention_state(
 
 
 class FlexDotProductAttention(torch.nn.Module):
-    """Megatron core-attention module backed by compiled torch flex attention."""
+    """Megatron core-attention module backed by compiled torch flex attention.
+
+    The current implementation lacks support for fp8 and context parallelism (which are available in TEDotProductAttention)
+    """
 
     def __init__(
         self,

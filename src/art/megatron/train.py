@@ -212,7 +212,7 @@ while True:
         for key, value in inputs.items():
             if isinstance(value, torch.Tensor):
                 inputs[key] = value.to(device)  # type: ignore
-        attention_state = create_shared_prefix_attention_state(
+        attention_state = create_shared_prefix_attention_state(  # should happen after group_ids is moved to device
             group_ids=inputs["group_ids"],
             parent_ids=inputs["parent_ids"],
         )

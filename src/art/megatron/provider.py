@@ -1,5 +1,7 @@
 import copy
+from functools import partial
 import inspect
+from typing import Callable
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -9,6 +11,21 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 import torch
 
 from art.megatron.flex_attention import FlexDotProductAttention
+
+
+def _resolve_layer_spec(
+    base_layer_spec: ModuleSpec | Callable[[GPTModelProvider], ModuleSpec],
+    config: GPTModelProvider,
+    vp_stage: int | None = None,
+) -> ModuleSpec:
+    if isinstance(base_layer_spec, ModuleSpec):
+        return copy.deepcopy(base_layer_spec)
+    kwargs = (
+        {"vp_stage": vp_stage}
+        if vp_stage in inspect.signature(base_layer_spec).parameters
+        else {}
+    )
+    return base_layer_spec(config, **kwargs)
 
 
 def get_provider(model: str) -> GPTModelProvider:
@@ -26,16 +43,9 @@ def get_provider(model: str) -> GPTModelProvider:
     def _flex_attention_layer_spec(
         config: GPTModelProvider, vp_stage: int | None = None
     ) -> ModuleSpec:
-        if isinstance(base_layer_spec, ModuleSpec):
-            layer_spec = copy.deepcopy(base_layer_spec)
-        elif "vp_stage" in inspect.signature(base_layer_spec).parameters:
-            layer_spec = base_layer_spec(config, vp_stage=vp_stage)
-        else:
-            layer_spec = base_layer_spec(config)
-
+        layer_spec = _resolve_layer_spec(base_layer_spec, config, vp_stage)
         # Keep Megatron's standard layer stack and replace only core attention.
-        layer_spec = copy.deepcopy(layer_spec)
-        layer_spec.submodules.self_attention.submodules.core_attention = (  # type: ignore[union-attr]
+        layer_spec.submodules.self_attention.submodules.core_attention = (  # ty: ignore[unresolved-attribute]
             FlexDotProductAttention
         )
         return layer_spec
