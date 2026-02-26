@@ -345,22 +345,47 @@ class UnslothService:
         if config and "engine_args" in config:
             engine_args.update(dict(config["engine_args"]))
 
-        for key in ("data_parallel_size", "data_parallel_size_local"):
-            value = engine_args.get(key)
-            if value is None:
-                continue
-            parsed_value = _parse_int_arg(key, value)
-            if parsed_value != inference_gpu_count:
+        tensor_parallel_size = engine_args.get("tensor_parallel_size")
+        tp_size = 1
+        if tensor_parallel_size is not None:
+            tp_size = _parse_int_arg("tensor_parallel_size", tensor_parallel_size)
+            engine_args["tensor_parallel_size"] = tp_size
+
+        if tp_size > 1:
+            if tp_size != inference_gpu_count:
                 raise ValueError(
-                    f"{key} must equal len(inference_gpu_ids) "
+                    "tensor_parallel_size must equal len(inference_gpu_ids) "
                     f"({inference_gpu_count}) in dedicated mode"
                 )
-            engine_args[key] = parsed_value
-
-        if inference_gpu_count > 1:
-            engine_args.setdefault("data_parallel_size", inference_gpu_count)
-            engine_args.setdefault("data_parallel_size_local", inference_gpu_count)
+            for key in ("data_parallel_size", "data_parallel_size_local"):
+                value = engine_args.get(key)
+                if value is None:
+                    continue
+                parsed_value = _parse_int_arg(key, value)
+                if parsed_value > 1:
+                    raise ValueError(
+                        f"{key} must be 1 or unset when tensor_parallel_size > 1 "
+                        "in dedicated mode"
+                    )
+                engine_args[key] = parsed_value
             engine_args.setdefault("distributed_executor_backend", "mp")
+        else:
+            for key in ("data_parallel_size", "data_parallel_size_local"):
+                value = engine_args.get(key)
+                if value is None:
+                    continue
+                parsed_value = _parse_int_arg(key, value)
+                if parsed_value != inference_gpu_count:
+                    raise ValueError(
+                        f"{key} must equal len(inference_gpu_ids) "
+                        f"({inference_gpu_count}) in dedicated mode"
+                    )
+                engine_args[key] = parsed_value
+
+            if inference_gpu_count > 1:
+                engine_args.setdefault("data_parallel_size", inference_gpu_count)
+                engine_args.setdefault("data_parallel_size_local", inference_gpu_count)
+                engine_args.setdefault("distributed_executor_backend", "mp")
 
         engine_args.setdefault("generation_config", "vllm")
         engine_args["enable_lora"] = True

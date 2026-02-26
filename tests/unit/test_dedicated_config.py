@@ -119,6 +119,59 @@ def test_dedicated_data_parallel_size_allows_matching_values():
     )
 
 
+def test_dedicated_tensor_parallel_size_allows_matching_values():
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1, 2],
+            engine_args={  # type: ignore[typeddict-item]
+                "tensor_parallel_size": 2,
+            },
+        )
+    )
+
+
+def test_dedicated_tensor_parallel_size_must_match_inference_gpus():
+    with pytest.raises(ValueError, match="tensor_parallel_size must equal"):
+        validate_dedicated_config(
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1, 2],
+                engine_args={  # type: ignore[typeddict-item]
+                    "tensor_parallel_size": 3
+                },
+            )
+        )
+
+
+def test_dedicated_tensor_parallel_conflicts_with_data_parallel():
+    with pytest.raises(ValueError, match="must be 1 or unset when tensor_parallel_size > 1"):
+        validate_dedicated_config(
+            InternalModelConfig(
+                trainer_gpu_ids=[0],
+                inference_gpu_ids=[1, 2],
+                engine_args={  # type: ignore[typeddict-item]
+                    "tensor_parallel_size": 2,
+                    "data_parallel_size": 2,
+                },
+            )
+        )
+
+
+def test_dedicated_tensor_parallel_allows_data_parallel_one():
+    validate_dedicated_config(
+        InternalModelConfig(
+            trainer_gpu_ids=[0],
+            inference_gpu_ids=[1, 2],
+            engine_args={  # type: ignore[typeddict-item]
+                "tensor_parallel_size": 2,
+                "data_parallel_size": 1,
+                "data_parallel_size_local": 1,
+            },
+        )
+    )
+
+
 def test_trainer_not_starting_at_zero():
     with pytest.raises(ValueError, match="must start at GPU 0"):
         validate_dedicated_config(

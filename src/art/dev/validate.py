@@ -8,6 +8,12 @@ def is_dedicated_mode(config: InternalModelConfig) -> bool:
     return "trainer_gpu_ids" in config and "inference_gpu_ids" in config
 
 
+def _parse_dedicated_int_arg(name: str, value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be an integer in dedicated mode")
+    return value
+
+
 def validate_dedicated_config(config: InternalModelConfig) -> None:
     """Validate dedicated mode GPU configuration.
 
@@ -63,13 +69,35 @@ def validate_dedicated_config(config: InternalModelConfig) -> None:
         )
 
     engine_args = config.get("engine_args", {})
+    tensor_parallel_size = engine_args.get("tensor_parallel_size")
+    tp_size = 1
+    if tensor_parallel_size is not None:
+        tp_size = _parse_dedicated_int_arg("tensor_parallel_size", tensor_parallel_size)
+
+    if tp_size > 1:
+        if tp_size != inference_gpu_count:
+            raise ValueError(
+                "tensor_parallel_size must equal len(inference_gpu_ids) "
+                f"({inference_gpu_count}) in dedicated mode"
+            )
+        for key in ("data_parallel_size", "data_parallel_size_local"):
+            value = engine_args.get(key)
+            if value is None:
+                continue
+            parsed_value = _parse_dedicated_int_arg(key, value)
+            if parsed_value > 1:
+                raise ValueError(
+                    f"{key} must be 1 or unset when tensor_parallel_size > 1 "
+                    "in dedicated mode"
+                )
+        return
+
     for key in ("data_parallel_size", "data_parallel_size_local"):
         value = engine_args.get(key)
         if value is None:
             continue
-        if isinstance(value, bool) or not isinstance(value, int):
-            raise ValueError(f"{key} must be an integer in dedicated mode")
-        if value != inference_gpu_count:
+        parsed_value = _parse_dedicated_int_arg(key, value)
+        if parsed_value != inference_gpu_count:
             raise ValueError(
                 f"{key} must equal len(inference_gpu_ids) ({inference_gpu_count}) "
                 "in dedicated mode"
