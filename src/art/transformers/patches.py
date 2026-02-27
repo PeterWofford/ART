@@ -21,9 +21,7 @@ def _patched_preprocess_mask_arguments(
     past_key_values: Optional[Cache],
     position_ids: Optional[torch.Tensor],
     layer_idx: Optional[int],
-) -> tuple[
-    bool, Optional[Union[torch.Tensor, "BlockMask"]], int, int
-]:
+) -> tuple[bool, Optional[Union[torch.Tensor, "BlockMask"]], int, int]:
     if position_ids is not None and len(position_ids.shape) == 3:
         position_ids = position_ids[0]
     return _preprocess_mask_arguments(
