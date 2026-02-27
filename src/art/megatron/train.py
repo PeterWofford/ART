@@ -1,9 +1,18 @@
 # isort: off
 import os
 
+
+def _set_cache_dir(env_var: str, default_path: str) -> None:
+    if not os.environ.get(env_var):
+        os.environ[env_var] = os.path.expanduser(default_path)
+    os.makedirs(os.environ[env_var], exist_ok=True)
+
+
 os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+_set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")
+_set_cache_dir("TRITON_CACHE_DIR", "~/.triton/cache")
 # isort: on
 
 import gc
@@ -21,6 +30,7 @@ from megatron.core.transformer.module import MegatronModule
 from pydantic import BaseModel
 from safetensors.torch import load_file, save_file
 import torch
+from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
 from art import dev, types
 from art.loss import loss_fn, shift_tensor
@@ -55,6 +65,11 @@ model = provider.provide_distributed_model(
 
 rank = torch.distributed.get_rank()
 world_size = torch.distributed.get_world_size()
+
+if rank == 0:
+    print("TORCHINDUCTOR_CACHE_DIR:", os.environ["TORCHINDUCTOR_CACHE_DIR"])
+    print("Resolved inductor cache_dir():", inductor_cache_dir())
+    print("TRITON_CACHE_DIR:", os.environ["TRITON_CACHE_DIR"])
 
 for module in model:
     while not isinstance(module, GPTModel) and hasattr(module, "module"):
@@ -301,9 +316,11 @@ while True:
     offload_to_cpu(model, optimizer, rank, offload_state)
     # Release mmap-backed packed tensor references on all ranks before rank0 cleanup.
     del packed_tensors
+    del adapter_model
     if "inputs" in locals():
         del inputs
     gc.collect()
+    torch.cuda.empty_cache()
     # Ensure all ranks have finished saving before signaling completion
     torch.distributed.barrier()
     if rank == 0:
