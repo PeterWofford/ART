@@ -53,14 +53,14 @@ Read `CONTRIBUTING.md` at the repo root for guidance on code quality checks (pre
 
 ## Deploying a GPU Cluster
 
-Name the SkyPilot cluster the same as the feature branch. For example, if the branch is `fix/short-description`:
+Name the SkyPilot cluster after the branch name without the `fix/` prefix, replacing `/` with `-` (SkyPilot doesn't allow slashes). For example, if the branch is `fix/short-description`:
 ```
-uv run sky launch -c fix/short-description skypilot-config.yaml
+uv run sky launch -c short-description skypilot-config.yaml -y
 ```
 
-To connect: `ssh fix/short-description`
+To connect: `ssh short-description`
 
-To tear down when done: `uv run sky down fix/short-description`
+To tear down when done: `uv run sky down short-description`
 
 ## GPU Cluster Testing Tips
 
