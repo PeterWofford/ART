@@ -52,12 +52,16 @@ def _infer_moe_params(
         raise ValueError("Could not find fused MoE tensors to infer parameters")
 
     # Get hidden_size from gate_up_proj lora_B: [hidden, num_experts*rank]
+    # or from down_proj lora_A: [num_experts*rank, hidden]
     for key, tensor in tensors.items():
         if re.search(r"mlp\.experts\.base_layer\.lora_B\.weight$", key):
             hidden_size = tensor.shape[0]
             break
+        if re.search(r"mlp\.experts\.lora_A\.weight$", key):
+            hidden_size = tensor.shape[1]
+            break
     else:
-        raise ValueError("Could not find gate_up_proj lora_B to infer hidden_size")
+        raise ValueError("Could not infer hidden_size from fused MoE tensors")
 
     return num_experts, rank, intermediate_size, hidden_size
 
