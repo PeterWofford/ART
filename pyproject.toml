@@ -138,6 +138,10 @@ transformer-engine-torch = ["torch>=2.8.0"]
 
 [tool.uv.extra-build-variables]
 apex = { APEX_CPP_EXT = "1", APEX_CUDA_EXT = "1", APEX_FAST_LAYER_NORM = "1", APEX_PARALLEL_BUILD = "16", NVCC_APPEND_FLAGS = "--threads 4" }
+# cuDNN headers are installed via the nvidia-cudnn-cu12 pip package but
+# transformer-engine-torch's build only searches /usr/local/cuda/include when
+# the CUDA toolkit is present, missing the pip-installed headers.
+transformer-engine-torch = { CPLUS_INCLUDE_PATH = "/opt/conda/lib/python3.11/site-packages/nvidia/cudnn/include" }
 
 [tool.ty.environment]
 python-version = "3.11"
