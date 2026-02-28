@@ -197,9 +197,7 @@ def tokenize_trajectory(
             continue_final_message=True,
         ),
     )
-    sentinal_token_id = max(
-        set(range(cast(int, tokenizer.vocab_size))) - set(original_token_ids)
-    )
+    sentinal_token_id = max(set(range(tokenizer.vocab_size)) - set(original_token_ids))
     sentinal_token = tokenizer.decode(sentinal_token_id)
     token_template_messages: list[dict[str, Any]] = []
     for original, message in zip(messages_and_choices, messages):
@@ -287,11 +285,14 @@ def tokenize_trajectory(
             except (IndexError, ValueError):
                 token_ids[start:end] = [
                     token_id if token_id is not None else tokenizer.eos_token_id
-                    for token_id in tokenizer.convert_tokens_to_ids(
-                        [
-                            token_logprob.token or tokenizer.eos_token
-                            for token_logprob in token_logprobs
-                        ]
+                    for token_id in cast(
+                        list[int],
+                        tokenizer.convert_tokens_to_ids(
+                            [
+                                token_logprob.token or tokenizer.eos_token
+                                for token_logprob in token_logprobs
+                            ]
+                        ),
                     )
                 ]
             logprobs[start:end] = (
@@ -346,7 +347,7 @@ def tokenize_trajectory(
     return TokenizedResult(
         advantage=advantage,
         chat=chat,
-        tokens=[tokenizer.decode(token_id) for token_id in token_ids],
+        tokens=[cast(str, tokenizer.decode(token_id)) for token_id in token_ids],
         token_ids=token_ids,
         input_pos=list(range(len(token_ids))),
         assistant_mask=assistant_mask,
