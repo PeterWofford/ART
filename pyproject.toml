@@ -129,7 +129,6 @@ override-dependencies = [
     # is confirmed working per unsloth February-2026 release notes
     "transformers==5.2.0",
 ]
-exclude-dependencies = ["pynvml"]
 # Keep apex build isolation enabled so uv can inject torch from
 # `extra-build-dependencies` during lock/sync on non-GPU client machines.
 no-build-isolation-package = ["transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-core", "megatron-bridge", "nv-grouped-gemm", "mamba-ssm", "causal-conv1d"]
