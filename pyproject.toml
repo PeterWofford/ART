@@ -19,7 +19,7 @@ dependencies = [
 plotting = ["matplotlib>=3.10.1", "seaborn>=0.13.2"]
 
 backend = [
-    "peft>=0.18.0",
+    "peft>=0.14.0",
     "hf-xet>=1.1.0",
     "bitsandbytes>=0.45.2",
     "unsloth==2026.2.1",
@@ -30,7 +30,7 @@ backend = [
     "awscli>=1.38.1",
     "setuptools>=78.1.0",
     "wandb==0.25.0",
-    "transformers==5.2.0",
+    "transformers>=4.55.2,<=4.57.3",
     "duckdb>=1.0.0",
     "pyarrow>=15.0.0",
     "trl==0.20.0",
@@ -65,7 +65,7 @@ tinker = [
     "pydantic>=2.12.5",
     "tinker>=0.8.1",
     "torch>=2.8.0",
-    "transformers==5.2.0",
+    "transformers>=4.55.2,<=4.57.3",
     "uvicorn>=0.35.0",
     "datrie>=0.8.3",
 ]
@@ -122,13 +122,7 @@ required-version = ">=0.6.15"
 # Override numpy to <2.0 for compatibility with megatron-core in the training
 # environment. vLLM 0.15.1 pulls opencv-python-headless>=4.13 which wants
 # numpy>=2 on Python 3.9+, but megatron-core requires numpy<2.
-override-dependencies = [
-    "transformer-engine>=2.11.0",
-    "numpy<2",
-    # Override unsloth's overly strict constraint on transformers — v5.x
-    # is confirmed working per unsloth February-2026 release notes
-    "transformers==5.2.0",
-]
+override-dependencies = ["transformer-engine>=2.11.0", "numpy<2"]
 # Keep apex build isolation enabled so uv can inject torch from
 # `extra-build-dependencies` during lock/sync on non-GPU client machines.
 no-build-isolation-package = ["transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-core", "megatron-bridge", "nv-grouped-gemm", "mamba-ssm", "causal-conv1d"]
