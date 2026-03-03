@@ -1,0 +1,45 @@
+name: Package Install
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-smoke-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build wheel
+        run: uv build --wheel --out-dir dist
+
+      - name: Smoke test uv add + sync for backend extra
+        run: |
+          wheel_path="$(python - <<'PY'
+          from pathlib import Path
+
+          print(next(Path("dist").glob("openpipe_art-*.whl")).resolve())
+          PY
+          )"
+
+          project_dir="$(mktemp -d)"
+          cd "$project_dir"
+          uv init --name art-install-smoke --python 3.11 --bare
+          uv add "openpipe-art[backend] @ file://${wheel_path}"
+          uv sync
