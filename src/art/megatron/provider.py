@@ -64,4 +64,5 @@ def get_provider(model: str) -> GPTModelProvider:
     provider.moe_router_dtype = "fp32"
     if provider.tensor_model_parallel_size > 1:
         provider.sequence_parallel = True
+    provider.finalize()
     return provider
