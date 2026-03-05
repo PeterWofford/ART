@@ -328,7 +328,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
                 initial_version = self.state.policy_version
 
-                group = await self.rollout_fn(self.model, scenario, self.config)
+                token = self.model.activate_metrics_context("train")
+                try:
+                    group = await self.rollout_fn(self.model, scenario, self.config)
+                finally:
+                    token.var.reset(token)
                 if not isinstance(group, TrajectoryGroup):
                     errored = True
                     continue
@@ -562,7 +566,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._status.note_val_started(step)
         reward: float | None = None
         try:
-            result = await self.eval_fn(self.model, step, self.config)
+            token = self.model.activate_metrics_context("eval")
+            try:
+                result = await self.eval_fn(self.model, step, self.config)
+            finally:
+                token.var.reset(token)
             splits: dict[str, list[art.Trajectory | art.TrajectoryGroup]]
             if isinstance(result, dict):
                 splits = result

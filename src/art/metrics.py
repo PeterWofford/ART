@@ -1,26 +1,164 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from contextlib import contextmanager
 from contextvars import ContextVar, Token
-from typing import Any
+from dataclasses import dataclass
+from functools import wraps
+from inspect import iscoroutinefunction
+from typing import Any, ParamSpec, TypeVar
+
+from .costs import tokens_to_cost
 
 _active_builder: ContextVar["MetricsBuilder"] = ContextVar("_active_metrics_builder")
 
 _HIERARCHICAL_SECTIONS = {"costs", "time", "data"}
+_DEFAULT_PROVIDER = "openai"
+_OPENAI_PROVIDER = "openai"
+_ANTHROPIC_PROVIDER = "anthropic"
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+CostExtractor = Callable[[Any], float | None]
+ResponseGetter = Callable[[Any], Any]
+
+
+@dataclass(frozen=True)
+class TokenPricing:
+    prompt_per_million: float
+    completion_per_million: float
+
+
+_DEFAULT_TOKEN_PRICING = {
+    _OPENAI_PROVIDER: TokenPricing(prompt_per_million=2.5, completion_per_million=10.0),
+    _ANTHROPIC_PROVIDER: TokenPricing(
+        prompt_per_million=3.0, completion_per_million=15.0
+    ),
+}
+
+
+@dataclass
+class _SharedMetricsState:
+    lock: asyncio.Lock
+    step_buffer: dict[str, float]
+    cum_state: dict[str, float]
+    unique_scenario_ids: set[str]
+    cost_extractors: dict[str, CostExtractor]
+    token_pricing: dict[str, TokenPricing]
+
+
+def _new_shared_metrics_state() -> _SharedMetricsState:
+    return _SharedMetricsState(
+        lock=asyncio.Lock(),
+        step_buffer={},
+        cum_state={},
+        unique_scenario_ids=set(),
+        cost_extractors={},
+        token_pricing=dict(_DEFAULT_TOKEN_PRICING),
+    )
+
+
+def _normalize_provider(provider: str | None) -> str | None:
+    if provider is None:
+        return None
+    normalized = provider.strip().lower()
+    if not normalized:
+        return None
+    return normalized
+
+
+def _read_usage_field(usage: Any, field: str) -> float | None:
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        value = usage.get(field)
+    else:
+        value = getattr(usage, field, None)
+    if value is None:
+        return None
+    return float(value)
+
+
+def _response_usage(response: Any) -> Any:
+    if isinstance(response, dict):
+        return response.get("usage")
+    return getattr(response, "usage", None)
+
+
+def _extract_openai_token_counts(response: Any) -> tuple[float, float] | None:
+    usage = _response_usage(response)
+    prompt_tokens = _read_usage_field(usage, "prompt_tokens")
+    completion_tokens = _read_usage_field(usage, "completion_tokens")
+    if prompt_tokens is None and completion_tokens is None:
+        return None
+    return prompt_tokens or 0.0, completion_tokens or 0.0
+
+
+def _extract_anthropic_token_counts(response: Any) -> tuple[float, float] | None:
+    usage = _response_usage(response)
+    input_tokens = _read_usage_field(usage, "input_tokens")
+    output_tokens = _read_usage_field(usage, "output_tokens")
+    if input_tokens is None and output_tokens is None:
+        return None
+    return input_tokens or 0.0, output_tokens or 0.0
+
+
+def _detect_provider(response: Any) -> str | None:
+    usage = _response_usage(response)
+    if usage is None:
+        return None
+
+    if (
+        _read_usage_field(usage, "prompt_tokens") is not None
+        or _read_usage_field(usage, "completion_tokens") is not None
+    ):
+        return _OPENAI_PROVIDER
+    if (
+        _read_usage_field(usage, "input_tokens") is not None
+        or _read_usage_field(usage, "output_tokens") is not None
+    ):
+        return _ANTHROPIC_PROVIDER
+    return None
+
+
+def _estimate_cost(
+    token_counts: tuple[float, float] | None,
+    pricing: TokenPricing,
+) -> float | None:
+    if token_counts is None:
+        return None
+    prompt_tokens, completion_tokens = token_counts
+    return tokens_to_cost(prompt_tokens, pricing.prompt_per_million) + tokens_to_cost(
+        completion_tokens,
+        pricing.completion_per_million,
+    )
 
 
 class MetricsBuilder:
     """Build and accumulate step-level metrics for logging."""
 
-    def __init__(self, cost_context: str) -> None:
+    def __init__(
+        self,
+        cost_context: str,
+        *,
+        _shared_state: _SharedMetricsState | None = None,
+    ) -> None:
         if not cost_context:
             raise ValueError("cost_context must be non-empty")
 
         self.cost_context = cost_context
-        self._lock = asyncio.Lock()
-        self._step_buffer: dict[str, float] = {}
-        self._cum_state: dict[str, float] = {}
-        self._unique_scenario_ids: set[str] = set()
+        self._shared_state = (
+            _shared_state if _shared_state is not None else _new_shared_metrics_state()
+        )
+        self._lock = self._shared_state.lock
+        self._step_buffer = self._shared_state.step_buffer
+        self._cum_state = self._shared_state.cum_state
+        self._unique_scenario_ids = self._shared_state.unique_scenario_ids
+        self._cost_extractors = self._shared_state.cost_extractors
+        self._token_pricing = self._shared_state.token_pricing
 
     def add_cost(self, path: str, usd: float) -> None:
         if not path:
@@ -99,9 +237,51 @@ class MetricsBuilder:
     def activate(self) -> Token["MetricsBuilder"]:
         return _active_builder.set(self)
 
+    @contextmanager
+    def activate_context(self):
+        token = self.activate()
+        try:
+            yield self
+        finally:
+            token.var.reset(token)
+
     @staticmethod
     def get_active() -> "MetricsBuilder":
         return _active_builder.get()
+
+    def for_cost_context(self, cost_context: str) -> "MetricsBuilder":
+        normalized_cost_context = cost_context.strip()
+        if not normalized_cost_context:
+            raise ValueError("cost_context must be non-empty")
+        if normalized_cost_context == self.cost_context:
+            return self
+        return MetricsBuilder(
+            cost_context=normalized_cost_context,
+            _shared_state=self._shared_state,
+        )
+
+    def register_cost_extractor(
+        self, provider: str, extractor: CostExtractor
+    ) -> None:
+        normalized_provider = _normalize_provider(provider)
+        if normalized_provider is None:
+            raise ValueError("provider must be non-empty")
+        self._cost_extractors[normalized_provider] = extractor
+
+    def register_token_pricing(
+        self,
+        provider: str,
+        *,
+        prompt_per_million: float,
+        completion_per_million: float,
+    ) -> None:
+        normalized_provider = _normalize_provider(provider)
+        if normalized_provider is None:
+            raise ValueError("provider must be non-empty")
+        self._token_pricing[normalized_provider] = TokenPricing(
+            prompt_per_million=float(prompt_per_million),
+            completion_per_million=float(completion_per_million),
+        )
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -172,3 +352,146 @@ class MetricsBuilder:
         rollups["costs/all"] = costs_all
 
         return rollups
+
+    def _resolve_token_pricing(
+        self,
+        provider: str | None,
+        *,
+        prompt_price_per_million: float | None = None,
+        completion_price_per_million: float | None = None,
+    ) -> TokenPricing:
+        normalized_provider = _normalize_provider(provider) or _DEFAULT_PROVIDER
+        default_pricing = self._token_pricing.get(
+            normalized_provider,
+            self._token_pricing[_DEFAULT_PROVIDER],
+        )
+        return TokenPricing(
+            prompt_per_million=(
+                float(prompt_price_per_million)
+                if prompt_price_per_million is not None
+                else default_pricing.prompt_per_million
+            ),
+            completion_per_million=(
+                float(completion_price_per_million)
+                if completion_price_per_million is not None
+                else default_pricing.completion_per_million
+            ),
+        )
+
+    def _extract_api_cost(
+        self,
+        response: Any,
+        *,
+        provider: str | None = None,
+        prompt_price_per_million: float | None = None,
+        completion_price_per_million: float | None = None,
+    ) -> float | None:
+        provider_name = _normalize_provider(provider) or _detect_provider(response)
+        if provider_name is not None:
+            custom_extractor = self._cost_extractors.get(provider_name)
+            if custom_extractor is not None:
+                custom_cost = custom_extractor(response)
+                if custom_cost is not None:
+                    return float(custom_cost)
+
+            token_pricing = self._resolve_token_pricing(
+                provider_name,
+                prompt_price_per_million=prompt_price_per_million,
+                completion_price_per_million=completion_price_per_million,
+            )
+            if provider_name == _OPENAI_PROVIDER:
+                return _estimate_cost(
+                    _extract_openai_token_counts(response),
+                    token_pricing,
+                )
+            if provider_name == _ANTHROPIC_PROVIDER:
+                return _estimate_cost(
+                    _extract_anthropic_token_counts(response),
+                    token_pricing,
+                )
+
+        token_pricing = self._resolve_token_pricing(
+            provider_name,
+            prompt_price_per_million=prompt_price_per_million,
+            completion_price_per_million=completion_price_per_million,
+        )
+        token_counts = _extract_openai_token_counts(response)
+        if token_counts is None:
+            token_counts = _extract_anthropic_token_counts(response)
+        return _estimate_cost(token_counts, token_pricing)
+
+
+def _record_api_cost(
+    *,
+    result: Any,
+    source: str,
+    provider: str | None,
+    response_getter: ResponseGetter | None,
+    prompt_price_per_million: float | None,
+    completion_price_per_million: float | None,
+) -> None:
+    try:
+        builder = MetricsBuilder.get_active()
+    except LookupError:
+        return
+
+    response = response_getter(result) if response_getter is not None else result
+    cost = builder._extract_api_cost(
+        response,
+        provider=provider,
+        prompt_price_per_million=prompt_price_per_million,
+        completion_price_per_million=completion_price_per_million,
+    )
+    if cost is None:
+        return
+    builder.add_cost(f"{builder.cost_context}/{source}", cost)
+
+
+def track_api_cost(
+    *,
+    source: str,
+    provider: str | None = None,
+    response_getter: ResponseGetter | None = None,
+    prompt_price_per_million: float | None = None,
+    completion_price_per_million: float | None = None,
+) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    normalized_source = source.strip("/")
+    if not normalized_source:
+        raise ValueError("source must be non-empty")
+
+    normalized_provider = _normalize_provider(provider)
+
+    def _decorate(func: Callable[P, R]) -> Callable[P, R]:
+        if iscoroutinefunction(func):
+
+            @wraps(func)
+            async def _async_wrapper(*args: P.args, **kwargs: P.kwargs):
+                result = await func(*args, **kwargs)
+                _record_api_cost(
+                    result=result,
+                    source=normalized_source,
+                    provider=normalized_provider,
+                    response_getter=response_getter,
+                    prompt_price_per_million=prompt_price_per_million,
+                    completion_price_per_million=completion_price_per_million,
+                )
+                return result
+
+            return _async_wrapper
+
+        @wraps(func)
+        def _sync_wrapper(*args: P.args, **kwargs: P.kwargs):
+            result = func(*args, **kwargs)
+            _record_api_cost(
+                result=result,
+                source=normalized_source,
+                provider=normalized_provider,
+                response_getter=response_getter,
+                prompt_price_per_million=prompt_price_per_million,
+                completion_price_per_million=completion_price_per_million,
+            )
+            return result
+
+        return _sync_wrapper
+
+    return _decorate

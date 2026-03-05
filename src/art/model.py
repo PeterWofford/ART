@@ -1,4 +1,5 @@
 import asyncio
+from contextvars import Token
 from datetime import datetime
 import json
 import os
@@ -509,6 +510,16 @@ class Model(
                 continue
             non_cost_metrics[metric] = numeric_value
         return non_cost_metrics
+
+    def metrics_builder(self, cost_context: str | None = None) -> MetricsBuilder:
+        if cost_context is None:
+            return self._metrics_builder
+        return self._metrics_builder.for_cost_context(cost_context)
+
+    def activate_metrics_context(
+        self, cost_context: str
+    ) -> Token[MetricsBuilder]:
+        return self.metrics_builder(cost_context).activate()
 
     def _load_metrics_builder_state(self) -> None:
         if self._metrics_builder_state_loaded:
