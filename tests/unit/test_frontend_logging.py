@@ -467,6 +467,42 @@ class TestMetricCalculation:
         # All successful trajectories = 0% exception rate
         assert entry["val/exception_rate"] == 0.0
 
+    @pytest.mark.asyncio
+    async def test_train_trajectory_metrics_default_to_train_prefix_baseline(
+        self, tmp_path: Path
+    ):
+        model = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        trajectories = [
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=0.7,
+                        metrics={
+                            "custom_score": 1.0,
+                            "reward/prefixed": 2.0,
+                        },
+                        messages_and_choices=[{"role": "user", "content": "test"}],
+                    )
+                ],
+                exceptions=[],
+            )
+        ]
+
+        await model.log(trajectories, split="train")
+
+        history_path = tmp_path / "test/models/test/history.jsonl"
+        with open(history_path) as f:
+            entry = json.loads(f.readline())
+
+        assert entry["train/custom_score"] == 1.0
+        assert entry["reward/prefixed"] == 2.0
+
 
 class TestWandbIntegration:
     """Test wandb integration logic (without mocking wandb itself)."""
