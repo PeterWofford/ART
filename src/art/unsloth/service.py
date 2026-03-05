@@ -151,6 +151,33 @@ def save_checkpoint(
     verbose: bool = False,
 ) -> str:
     """Save a checkpoint and return the checkpoint directory path."""
+    # _use_adapter() may load reference adapters for KL/logprob computation and
+    # keep them attached to the PEFT model. Before saving, keep only active
+    # adapter(s) and drop the rest to release GPU/CPU memory.
+    try:
+        peft_model = trainer.accelerator.unwrap_model(  # type: ignore[attr-defined]
+            trainer.model, keep_fp32_wrapper=False
+        )
+        active_adapters = peft_model.active_adapter
+        if isinstance(active_adapters, str):
+            keep_adapters = {active_adapters}
+        else:
+            keep_adapters = set(active_adapters)
+
+        before_adapters = list(peft_model.peft_config.keys())
+        print(f"Adapters before cleanup: {before_adapters}")
+        print(f"Keeping active adapter(s): {sorted(keep_adapters)}")
+
+        for adapter_name in before_adapters:
+            if adapter_name not in keep_adapters:
+                peft_model.delete_adapter(adapter_name)
+                print(f"Deleted unused adapter: {adapter_name}")
+
+        after_adapters = list(peft_model.peft_config.keys())
+        print(f"Adapters after cleanup: {after_adapters}")
+    except Exception as e:
+        print(f"Warning: failed to cleanup unused adapters: {e}")
+
     if verbose:
         print("Saving new LoRA adapter...")
     next_step = get_step_from_dir(output_dir) + 1
@@ -158,6 +185,8 @@ def save_checkpoint(
     os.makedirs(checkpoint_dir, exist_ok=True)
     trainer.save_model(checkpoint_dir)
     convert_checkpoint_if_needed(checkpoint_dir)
+
+    gc_and_empty_cuda_cache()
     return checkpoint_dir
 
 
