@@ -36,7 +36,15 @@ async def _mock_judge_call(step: int) -> _Response:
 
 
 async def main() -> None:
-    project = os.environ.get("ART_METRICS_PROJECT", "metrics-taxonomy-smoke")
+    project_spec = os.environ.get("ART_METRICS_PROJECT", "metrics-taxonomy-smoke")
+    entity = os.environ.get("ART_METRICS_ENTITY")
+    project = project_spec
+    if entity is None and "/" in project_spec:
+        split_entity, split_project = project_spec.split("/", 1)
+        if split_entity and split_project:
+            entity = split_entity
+            project = split_project
+
     model_name = os.environ.get(
         "ART_METRICS_MODEL", f"metrics-smoke-{int(time.time())}"
     )
@@ -45,6 +53,7 @@ async def main() -> None:
     model = art.Model(
         name=model_name,
         project=project,
+        entity=entity,
         base_path=base_path,
         report_metrics=["wandb"],
     )
