@@ -109,6 +109,7 @@ class Model(
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
+    _wandb_defined_metrics: set[str]
     _run_start_time: float
     _metrics_builder: MetricsBuilder
     _metrics_builder_state_loaded: bool
@@ -141,6 +142,7 @@ class Model(
             report_metrics=report_metrics,
             **kwargs,
         )
+        object.__setattr__(self, "_wandb_defined_metrics", set())
         object.__setattr__(self, "_run_start_time", time.time())
         object.__setattr__(self, "_metrics_builder", MetricsBuilder(cost_context="train"))
         object.__setattr__(self, "_metrics_builder_state_loaded", False)
@@ -397,6 +399,14 @@ class Model(
                 ),
             )
             self._wandb_run = run
+            object.__setattr__(
+                self,
+                "_wandb_defined_metrics",
+                {
+                    "training_step",
+                    "time/wall_clock_sec",
+                },
+            )
 
             # Define training_step as the x-axis for all metrics.
             # This allows out-of-order logging (e.g., async validation for previous steps).
@@ -461,7 +471,19 @@ class Model(
         ) or (self.report_metrics is not None and "wandb" in self.report_metrics)
         if should_log_wandb:
             if run := self._get_wandb_run():
+                self._define_wandb_step_metrics(prefixed.keys())
                 run.log(prefixed)
+
+    def _define_wandb_step_metrics(self, keys: Iterable[str]) -> None:
+        import wandb
+
+        for key in keys:
+            if not key.startswith("costs/"):
+                continue
+            if key in self._wandb_defined_metrics:
+                continue
+            wandb.define_metric(key, step_metric="training_step")
+            self._wandb_defined_metrics.add(key)
 
     def _extract_non_cost_metrics(
         self, metrics: dict[str, float], split: str

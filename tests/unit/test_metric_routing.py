@@ -74,3 +74,41 @@ class TestMetricRoutingBaseline:
             (("val/*",), {"step_metric": "training_step"}),
             (("test/*",), {"step_metric": "training_step"}),
         ]
+
+    def test_log_metrics_defines_nested_cost_keys_with_training_step(
+        self, tmp_path: Path
+    ) -> None:
+        fake_run = MagicMock()
+        fake_run._is_finished = False
+
+        fake_wandb = types.SimpleNamespace()
+        fake_wandb.init = MagicMock(return_value=fake_run)
+        fake_wandb.define_metric = MagicMock()
+        fake_wandb.Settings = lambda **kwargs: kwargs
+
+        with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
+            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+                model = Model(
+                    name="test-model",
+                    project="test-project",
+                    base_path=str(tmp_path),
+                    report_metrics=["wandb"],
+                )
+                model._log_metrics(
+                    {
+                        "costs/train/sample": 0.1,
+                        "costs/train/prefill_cum": 0.2,
+                    },
+                    split="train",
+                    step=1,
+                )
+
+        define_calls = [
+            (call.args, call.kwargs)
+            for call in fake_wandb.define_metric.call_args_list
+        ]
+        assert (("costs/train/sample",), {"step_metric": "training_step"}) in define_calls
+        assert (
+            (("costs/train/prefill_cum",), {"step_metric": "training_step"})
+            in define_calls
+        )
