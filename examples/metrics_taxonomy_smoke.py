@@ -5,6 +5,34 @@ from pathlib import Path
 import time
 
 import art
+from art.metrics import track_api_cost
+
+
+class _Usage:
+    def __init__(self, prompt_tokens: int, completion_tokens: int) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
+
+class _Response:
+    def __init__(self, prompt_tokens: int, completion_tokens: int) -> None:
+        self.usage = _Usage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+
+
+@track_api_cost(
+    source="llm_judge/decorator_demo",
+    provider="openai",
+    prompt_price_per_million=1.0,
+    completion_price_per_million=2.0,
+)
+async def _mock_judge_call(step: int) -> _Response:
+    return _Response(
+        prompt_tokens=50 * step,
+        completion_tokens=20 * step,
+    )
 
 
 async def main() -> None:
@@ -22,6 +50,12 @@ async def main() -> None:
     )
 
     for step in (1, 2):
+        train_token = model.activate_metrics_context("train")
+        try:
+            await _mock_judge_call(step)
+        finally:
+            train_token.var.reset(train_token)
+
         trajectories = [
             art.TrajectoryGroup(
                 trajectories=[
