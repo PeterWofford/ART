@@ -231,7 +231,7 @@ class TestHistoryJsonlCompatibility:
         # Check both splits are present
         columns = df.columns
         assert any("val/" in col for col in columns)
-        assert any("train/" in col for col in columns)
+        assert any("reward/" in col for col in columns)
 
 
 class TestPathStructure:
@@ -500,6 +500,9 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
+        assert entry["reward/mean"] == 0.7
+        assert entry["reward/exception_rate"] == 0.0
+        assert "train/reward" not in entry
         assert entry["reward/custom_score"] == 1.0
         assert entry["reward/prefixed"] == 2.0
 
@@ -719,8 +722,8 @@ class TestTrainSFTMetricsAggregation:
         # Verify metrics are aggregated (averaged)
         entry = json.loads(lines[0])
         assert entry["step"] == 1
-        assert entry["train/loss"] == pytest.approx(0.8)  # (1.0 + 0.8 + 0.6) / 3
-        assert entry["train/grad_norm"] == pytest.approx(0.4)  # (0.5 + 0.4 + 0.3) / 3
+        assert entry["loss/train"] == pytest.approx(0.8)  # (1.0 + 0.8 + 0.6) / 3
+        assert entry["loss/grad_norm"] == pytest.approx(0.4)  # (0.5 + 0.4 + 0.3) / 3
 
     @pytest.mark.asyncio
     async def test_train_sft_single_step_increment(self, tmp_path: Path):

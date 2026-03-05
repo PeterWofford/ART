@@ -43,6 +43,25 @@ METRIC_SECTIONS = frozenset(
     }
 )
 METRIC_SPLITS = frozenset({"train", "val", "test"})
+TRAIN_METRIC_KEY_RENAMES = {
+    "reward": "reward/mean",
+    "reward_std_dev": "reward/std_dev",
+    "exception_rate": "reward/exception_rate",
+    "policy_loss": "loss/train",
+    "loss": "loss/train",
+    "entropy": "loss/entropy",
+    "kl_div": "loss/kl_div",
+    "kl_policy_ref": "loss/kl_policy_ref",
+    "grad_norm": "loss/grad_norm",
+    "learning_rate": "loss/learning_rate",
+    "tokens_per_second": "throughput/train_tok_per_sec",
+    "num_groups_submitted": "train/num_groups_submitted",
+    "num_groups_trainable": "train/num_groups_trainable",
+    "num_trajectories": "train/num_trajectories",
+    "num_trainable_tokens": "train/num_trainable_tokens",
+    "train_tokens": "data/step_trainer_tokens",
+    "num_datums": "data/step_num_datums",
+}
 
 
 class Model(
@@ -481,8 +500,17 @@ class Model(
                         f"{cost_context}/{component}", numeric_value
                     )
                 continue
-            non_cost_metrics[metric] = numeric_value
+            routed_metric = self._rename_train_metric_key(metric, split)
+            non_cost_metrics[routed_metric] = numeric_value
         return non_cost_metrics
+
+    @staticmethod
+    def _rename_train_metric_key(metric: str, split: str) -> str:
+        if split != "train":
+            return metric
+        if metric.startswith("group_metric_"):
+            return f"reward/group_{metric[len('group_metric_'):]}"
+        return TRAIN_METRIC_KEY_RENAMES.get(metric, metric)
 
     async def log(
         self,
@@ -549,7 +577,16 @@ class Model(
         )
 
         # 2. Calculate aggregate metrics (excluding additive costs)
-        all_metrics: dict[str, list[float]] = {"reward": [], "exception_rate": []}
+        reward_key = "reward/mean" if split == "train" else "reward"
+        exception_rate_key = (
+            "reward/exception_rate" if split == "train" else "exception_rate"
+        )
+        reward_std_dev_key = "reward/std_dev" if split == "train" else "reward_std_dev"
+
+        all_metrics: dict[str, list[float]] = {
+            reward_key: [],
+            exception_rate_key: [],
+        }
         group_metrics: dict[str, list[float]] = {}
 
         for group in trajectory_groups:
@@ -566,12 +603,12 @@ class Model(
                     group_metrics[metric].append(float(value))
             for trajectory in group:
                 if isinstance(trajectory, BaseException):
-                    all_metrics["exception_rate"].append(1)
+                    all_metrics[exception_rate_key].append(1)
                     continue
                 else:
-                    all_metrics["exception_rate"].append(0)
+                    all_metrics[exception_rate_key].append(0)
                 # Add reward metric
-                all_metrics["reward"].append(trajectory.reward)
+                all_metrics[reward_key].append(trajectory.reward)
 
                 # Collect other custom metrics
                 trajectory_metrics: dict[str, float] = {}
@@ -599,14 +636,17 @@ class Model(
         # Aggregate group-level metrics once per group
         for metric, values in group_metrics.items():
             if len(values) > 0:
-                averages[f"group_metric_{metric}"] = sum(values) / len(values)
+                group_key = (
+                    f"reward/group_{metric}" if split == "train" else f"group_metric_{metric}"
+                )
+                averages[group_key] = sum(values) / len(values)
 
         # Calculate average standard deviation of rewards within groups
         from .utils.old_benchmarking.calculate_step_metrics import (
             calculate_step_std_dev,
         )
 
-        averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
+        averages[reward_std_dev_key] = calculate_step_std_dev(trajectory_groups)
 
         # Merge in any additional metrics passed directly
         if metrics is not None:
@@ -899,6 +939,10 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
                 k: sum(d.get(k, 0) for d in training_metrics)
                 / sum(1 for d in training_metrics if k in d)
                 for k in {k for d in training_metrics for k in d}
+            }
+            avg_metrics = {
+                self._rename_train_metric_key(key, "train"): value
+                for key, value in avg_metrics.items()
             }
             # Get the current step after training
             step = await self.get_step()
