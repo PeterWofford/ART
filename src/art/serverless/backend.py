@@ -9,6 +9,7 @@ from art.serverless.client import Client, ExperimentalTrainingConfig
 
 from .. import dev
 from ..backend import AnyTrainableModel, Backend
+from ..metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY, rename_train_metrics
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
 from ..utils.record_provenance import record_provenance
@@ -247,7 +248,7 @@ class ServerlessBackend(Backend):
                 k: sum(d.get(k, 0) for d in training_metrics)
                 / sum(1 for d in training_metrics if k in d)
                 for k in {k for d in training_metrics for k in d}
-                if k != "num_gradient_steps"
+                if k != TRAIN_GRADIENT_STEPS_KEY
             }
 
         # Get step and artifact name
@@ -307,7 +308,13 @@ class ServerlessBackend(Backend):
                     assert pbar is not None and num_sequences is not None
                     pbar.update(1)
                     pbar.set_postfix(event.data)
-                    yield {**event.data, "num_gradient_steps": num_sequences}
+                    metrics = rename_train_metrics(
+                        {k: float(v) for k, v in event.data.items()}
+                    )
+                    yield {
+                        **metrics,
+                        TRAIN_GRADIENT_STEPS_KEY: float(num_sequences),
+                    }
                 elif event.type == "training_started":
                     num_sequences = event.data["num_sequences"]
                     if pbar is None:
@@ -472,7 +479,13 @@ class ServerlessBackend(Backend):
                     assert pbar is not None and num_batches is not None
                     pbar.update(1)
                     pbar.set_postfix(event.data)
-                    yield {**event.data, "num_gradient_steps": num_batches}
+                    metrics = rename_train_metrics(
+                        {k: float(v) for k, v in event.data.items()}
+                    )
+                    yield {
+                        **metrics,
+                        TRAIN_GRADIENT_STEPS_KEY: float(num_batches),
+                    }
                 elif event.type == "training_started":
                     num_batches = event.data.get("num_sequences", 0)
                     if pbar is None:

@@ -39,6 +39,7 @@ from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
 from ..backend import AnyTrainableModel, Backend
+from ..metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY, rename_train_metrics
 from ..model import Model, TrainableModel
 from ..preprocessing.pack import (
     PackedTensors,
@@ -579,7 +580,7 @@ class LocalBackend(Backend):
                 k: sum(d.get(k, 0) for d in training_metrics)
                 / sum(1 for d in training_metrics if k in d)
                 for k in {k for d in training_metrics for k in d}
-                if k != "num_gradient_steps"
+                if k != TRAIN_GRADIENT_STEPS_KEY
             }
 
         # Get step and checkpoint path
@@ -686,9 +687,9 @@ class LocalBackend(Backend):
             # Yield metrics showing no groups were trainable
             # (the frontend will handle logging)
             yield {
-                "num_groups_submitted": num_groups_submitted,
-                "num_groups_trainable": 0,
-                "num_gradient_steps": 0,
+                "train/num_groups_submitted": float(num_groups_submitted),
+                "train/num_groups_trainable": 0.0,
+                TRAIN_GRADIENT_STEPS_KEY: 0.0,
             }
             return
         disk_packed_tensors = packed_tensors_to_dir(
@@ -701,14 +702,15 @@ class LocalBackend(Backend):
         async for result in service.train(
             disk_packed_tensors, config, dev_config, verbose
         ):
+            result = rename_train_metrics(result)
             num_gradient_steps = int(
-                result.pop("num_gradient_steps", estimated_gradient_steps)
+                result.pop(TRAIN_GRADIENT_STEPS_KEY, estimated_gradient_steps)
             )
             assert num_gradient_steps == estimated_gradient_steps, (
                 f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
             )
             results.append(result)
-            yield {**result, "num_gradient_steps": num_gradient_steps}
+            yield {**result, TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps)}
             pbar.update(1)
             pbar.set_postfix(result)
         pbar.close()

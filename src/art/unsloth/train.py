@@ -12,6 +12,7 @@ from trl import GRPOTrainer
 
 from .. import dev
 from ..loss import loss_fn, shift_tensor
+from ..metrics_taxonomy import rename_train_metrics
 from ..types import TrainConfig
 
 if TYPE_CHECKING:
@@ -169,14 +170,16 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             _config,
         )
 
-        trainer._metrics["train"]["learning_rate"].append(config.learning_rate)
-        trainer._metrics["train"]["policy_loss"].append(loss.mean_policy_loss.item())
+        trainer._metrics["train"]["loss/learning_rate"].append(config.learning_rate)
+        trainer._metrics["train"]["loss/train"].append(loss.mean_policy_loss.item())
         if loss.mean_entropy is not None:
-            trainer._metrics["train"]["entropy"].append(loss.mean_entropy.item())
+            trainer._metrics["train"]["loss/entropy"].append(loss.mean_entropy.item())
         if config.beta > 0.0:
-            trainer._metrics["train"]["kl_div"].append(loss.mean_kl.item())
+            trainer._metrics["train"]["loss/kl_div"].append(loss.mean_kl.item())
         if loss.kl_policy_ref is not None:
-            trainer._metrics["train"]["kl_policy_ref"].append(loss.kl_policy_ref.item())
+            trainer._metrics["train"]["loss/kl_policy_ref"].append(
+                loss.kl_policy_ref.item()
+            )
         return loss.mean_policy_loss + config.beta * loss.mean_kl
 
     return compute_loss
@@ -195,8 +198,7 @@ def get_log_fn(
         if next(iter(logs.keys())).startswith("eval_"):
             metrics = {f"eval_{key}": val for key, val in metrics.items()}
 
-        logs = {**logs, **metrics}
-        logs.pop("learning_rate", None)
+        logs = {**rename_train_metrics(logs), **metrics}
         results_queue.put_nowait(logs)
         trainer._metrics["train"].clear()
 

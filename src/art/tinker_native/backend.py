@@ -30,6 +30,7 @@ from art.tinker.cookbook_v import renderers, tokenizer_utils
 from .. import dev
 from ..backend import Backend
 from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
+from ..metrics_taxonomy import rename_train_metric_key
 from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
@@ -217,8 +218,8 @@ class TinkerNativeBackend(Backend):
         )
 
         metrics: dict[str, float] = {
-            "num_groups_submitted": float(len(groups_list)),
-            "num_datums": float(len(datums)),
+            "train/num_groups_submitted": float(len(groups_list)),
+            "data/step_num_datums": float(len(datums)),
         }
 
         if not datums:
@@ -227,10 +228,12 @@ class TinkerNativeBackend(Backend):
         train_tokens = 0
         for datum in datums:
             train_tokens += len(datum.model_input.to_ints())
-        metrics["train_tokens"] = float(train_tokens)
+        metrics["data/step_trainer_tokens"] = float(train_tokens)
         pricing = get_model_pricing(model.base_model)
         if pricing is not None:
-            metrics["costs_train"] = compute_train_cost(train_tokens, pricing)
+            metrics["costs/train/tinker_train"] = compute_train_cost(
+                train_tokens, pricing
+            )
 
         if adam_params is None:
             adam_params = tinker.AdamParams(
@@ -268,12 +271,12 @@ class TinkerNativeBackend(Backend):
             for key, value in forward_output.metrics.items():
                 if value is None:
                     continue
-                metrics[key] = float(value)
+                metrics[rename_train_metric_key(key)] = float(value)
         if optim_output.metrics:
             for key, value in optim_output.metrics.items():
                 if value is None:
                     continue
-                metrics[key] = float(value)
+                metrics[rename_train_metric_key(key)] = float(value)
 
         next_step = state.current_step + 1
         checkpoint_name = f"step_{next_step:06d}"

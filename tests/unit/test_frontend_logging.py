@@ -726,9 +726,21 @@ class TestTrainSFTMetricsAggregation:
 
         async def mock_train_sft(*args, **kwargs):
             # Simulate 3 batches with different metrics
-            yield {"loss": 1.0, "learning_rate": 1e-4, "grad_norm": 0.5}
-            yield {"loss": 0.8, "learning_rate": 1e-4, "grad_norm": 0.4}
-            yield {"loss": 0.6, "learning_rate": 1e-4, "grad_norm": 0.3}
+            yield {
+                "loss/train": 1.0,
+                "loss/learning_rate": 1e-4,
+                "loss/grad_norm": 0.5,
+            }
+            yield {
+                "loss/train": 0.8,
+                "loss/learning_rate": 1e-4,
+                "loss/grad_norm": 0.4,
+            }
+            yield {
+                "loss/train": 0.6,
+                "loss/learning_rate": 1e-4,
+                "loss/grad_norm": 0.3,
+            }
 
         mock_backend._train_sft = mock_train_sft
         mock_backend._get_step = AsyncMock(return_value=1)  # Step after training
