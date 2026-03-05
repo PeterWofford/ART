@@ -468,7 +468,7 @@ class TestMetricCalculation:
         assert entry["val/exception_rate"] == 0.0
 
     @pytest.mark.asyncio
-    async def test_train_trajectory_metrics_default_to_train_prefix_baseline(
+    async def test_train_trajectory_metrics_default_to_reward_prefix(
         self, tmp_path: Path
     ):
         model = Model(
@@ -500,8 +500,51 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["train/custom_score"] == 1.0
+        assert entry["reward/custom_score"] == 1.0
         assert entry["reward/prefixed"] == 2.0
+
+    @pytest.mark.asyncio
+    async def test_costs_are_logged_in_hierarchical_taxonomy(self, tmp_path: Path):
+        model = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        await model.log(
+            trajectories=None,
+            split="train",
+            step=1,
+            metrics={
+                "costs_prefill": 0.2,
+                "costs_sample": 0.3,
+            },
+        )
+        await model.log(
+            trajectories=None,
+            split="train",
+            step=2,
+            metrics={
+                "costs_prefill": 0.1,
+            },
+        )
+
+        history_path = tmp_path / "test/models/test/history.jsonl"
+        with open(history_path) as f:
+            first = json.loads(f.readline())
+            second = json.loads(f.readline())
+
+        assert first["costs/train/prefill"] == pytest.approx(0.2)
+        assert first["costs/train/sample"] == pytest.approx(0.3)
+        assert first["costs/train"] == pytest.approx(0.5)
+        assert first["costs/all"] == pytest.approx(0.5)
+        assert first["costs/all_cum"] == pytest.approx(0.5)
+
+        assert second["costs/train/prefill"] == pytest.approx(0.1)
+        assert second["costs/train/prefill_cum"] == pytest.approx(0.3)
+        assert second["costs/train_cum"] == pytest.approx(0.6)
+        assert second["costs/all_cum"] == pytest.approx(0.6)
 
 
 class TestWandbIntegration:
