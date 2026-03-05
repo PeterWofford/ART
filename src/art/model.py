@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime
 import json
 import os
+import time
 from typing import TYPE_CHECKING, Any, Generic, Iterable, Optional, cast, overload
 import warnings
 
@@ -29,6 +30,19 @@ StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 COSTS_STATE_KEY = "_costs"
 COSTS_METRIC_PREFIX = "costs_"
 COSTS_TOTAL_KEY = f"{COSTS_METRIC_PREFIX}total"
+METRIC_SECTIONS = frozenset(
+    {
+        "reward",
+        "loss",
+        "offpolicy",
+        "pipeline",
+        "throughput",
+        "costs",
+        "time",
+        "data",
+    }
+)
+METRIC_SPLITS = frozenset({"train", "val", "test"})
 
 
 class Model(
@@ -93,6 +107,7 @@ class Model(
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
+    _run_start_time: float
     _costs_lock: asyncio.Lock
     _cost_calculator: CostCalculator
 
@@ -123,6 +138,7 @@ class Model(
             report_metrics=report_metrics,
             **kwargs,
         )
+        object.__setattr__(self, "_run_start_time", time.time())
 
     @overload
     def __new__(
@@ -380,9 +396,16 @@ class Model(
             # Define training_step as the x-axis for all metrics.
             # This allows out-of-order logging (e.g., async validation for previous steps).
             wandb.define_metric("training_step")
+            wandb.define_metric("time/wall_clock_sec")
+            wandb.define_metric("reward/*", step_metric="training_step")
+            wandb.define_metric("loss/*", step_metric="training_step")
+            wandb.define_metric("throughput/*", step_metric="training_step")
+            wandb.define_metric("costs/*", step_metric="training_step")
+            wandb.define_metric("time/*", step_metric="training_step")
+            wandb.define_metric("data/*", step_metric="training_step")
             wandb.define_metric("train/*", step_metric="training_step")
             wandb.define_metric("val/*", step_metric="training_step")
-            wandb.define_metric("costs/*", step_metric="training_step")
+            wandb.define_metric("test/*", step_metric="training_step")
         return self._wandb_run
 
     def _log_metrics(
@@ -392,7 +415,24 @@ class Model(
         step: int,
     ) -> None:
         """Log metrics to history.jsonl and optionally wandb."""
-        prefixed = {f"{split}/{k}": v for k, v in metrics.items()}
+        if split in METRIC_SPLITS:
+            prefixed = {}
+            for key, value in metrics.items():
+                first_component = key.split("/", 1)[0]
+                has_prefix_component = "/" in key
+                if has_prefix_component and (
+                    first_component in METRIC_SECTIONS
+                    or first_component in METRIC_SPLITS
+                ):
+                    prefixed[key] = value
+                else:
+                    prefixed[f"{split}/{key}"] = value
+        else:
+            prefixed = {f"{split}/{k}": v for k, v in metrics.items()}
+
+        prefixed["training_step"] = step
+        prefixed["time/wall_clock_sec"] = time.time() - self._run_start_time
+
         output_dir = self._get_output_dir()
 
         # Ensure output directory exists
@@ -416,7 +456,7 @@ class Model(
         ) or (self.report_metrics is not None and "wandb" in self.report_metrics)
         if should_log_wandb:
             if run := self._get_wandb_run():
-                run.log({"training_step": step, **prefixed})
+                run.log(prefixed)
 
     async def _record_costs(
         self,

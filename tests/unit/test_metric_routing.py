@@ -8,7 +8,9 @@ from art import Model
 
 
 class TestMetricRoutingBaseline:
-    def test_log_metrics_prefixes_all_keys_with_split(self, tmp_path: Path) -> None:
+    def test_log_metrics_routes_known_sections_without_split_prefix(
+        self, tmp_path: Path
+    ) -> None:
         model = Model(
             name="test-model",
             project="test-project",
@@ -20,6 +22,7 @@ class TestMetricRoutingBaseline:
             {
                 "reward/mean": 0.9,
                 "custom": 1.0,
+                "rewardish/value": 2.0,
             },
             split="train",
             step=7,
@@ -29,13 +32,13 @@ class TestMetricRoutingBaseline:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["train/reward/mean"] == 0.9
+        assert entry["reward/mean"] == 0.9
         assert entry["train/custom"] == 1.0
-        assert "reward/mean" not in entry
-        assert "training_step" not in entry
-        assert "time/wall_clock_sec" not in entry
+        assert entry["train/rewardish/value"] == 2.0
+        assert entry["training_step"] == 7
+        assert entry["time/wall_clock_sec"] >= 0
 
-    def test_get_wandb_run_registers_existing_sections(self, tmp_path: Path) -> None:
+    def test_get_wandb_run_registers_taxonomy_sections(self, tmp_path: Path) -> None:
         fake_run = MagicMock()
         fake_run._is_finished = False
 
@@ -60,7 +63,14 @@ class TestMetricRoutingBaseline:
         ]
         assert define_calls == [
             (("training_step",), {}),
+            (("time/wall_clock_sec",), {}),
+            (("reward/*",), {"step_metric": "training_step"}),
+            (("loss/*",), {"step_metric": "training_step"}),
+            (("throughput/*",), {"step_metric": "training_step"}),
+            (("costs/*",), {"step_metric": "training_step"}),
+            (("time/*",), {"step_metric": "training_step"}),
+            (("data/*",), {"step_metric": "training_step"}),
             (("train/*",), {"step_metric": "training_step"}),
             (("val/*",), {"step_metric": "training_step"}),
-            (("costs/*",), {"step_metric": "training_step"}),
+            (("test/*",), {"step_metric": "training_step"}),
         ]

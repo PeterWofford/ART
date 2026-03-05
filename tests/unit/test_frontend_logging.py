@@ -337,10 +337,22 @@ class TestMetricCalculation:
             entry = json.loads(f.readline())
 
         # All metrics should be prefixed (except step and recorded_at)
-        metric_keys = [k for k in entry.keys() if k not in ["step", "recorded_at"]]
+        metric_keys = [
+            k
+            for k in entry.keys()
+            if k
+            not in [
+                "step",
+                "recorded_at",
+                "training_step",
+                "time/wall_clock_sec",
+            ]
+        ]
         assert all(k.startswith("val/") for k in metric_keys), (
             f"Not all metrics prefixed: {metric_keys}"
         )
+        assert entry["training_step"] == 0
+        assert entry["time/wall_clock_sec"] >= 0
 
     @pytest.mark.asyncio
     async def test_standard_metrics_present(self, tmp_path: Path):
