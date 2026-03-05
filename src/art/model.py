@@ -30,6 +30,7 @@ StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 
 COSTS_METRIC_PREFIX = "costs_"
 COSTS_TOTAL_KEY = f"{COSTS_METRIC_PREFIX}total"
+METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
 METRIC_SECTIONS = frozenset(
     {
         "reward",
@@ -128,6 +129,7 @@ class Model(
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
     _run_start_time: float
     _metrics_builder: MetricsBuilder
+    _metrics_builder_state_loaded: bool
     _cost_calculator: CostCalculator
 
     def __init__(
@@ -159,6 +161,7 @@ class Model(
         )
         object.__setattr__(self, "_run_start_time", time.time())
         object.__setattr__(self, "_metrics_builder", MetricsBuilder(cost_context="train"))
+        object.__setattr__(self, "_metrics_builder_state_loaded", False)
 
     @overload
     def __new__(
@@ -504,6 +507,20 @@ class Model(
             non_cost_metrics[routed_metric] = numeric_value
         return non_cost_metrics
 
+    def _load_metrics_builder_state(self) -> None:
+        if self._metrics_builder_state_loaded:
+            return
+        state = self.read_state() or {}
+        metrics_state = state.get(METRICS_BUILDER_STATE_KEY)
+        if isinstance(metrics_state, dict):
+            self._metrics_builder.load_state_dict(metrics_state)
+        object.__setattr__(self, "_metrics_builder_state_loaded", True)
+
+    def _persist_metrics_builder_state(self) -> None:
+        self.merge_state(
+            {METRICS_BUILDER_STATE_KEY: self._metrics_builder.state_dict()}
+        )
+
     @staticmethod
     def _rename_train_metric_key(metric: str, split: str) -> str:
         if split != "train":
@@ -542,6 +559,8 @@ class Model(
         if step is None:
             step = await self.get_step() if self.trainable else 0
 
+        self._load_metrics_builder_state()
+
         # If only metrics provided (no trajectories), just log them and return
         if trajectories is None:
             if metrics is not None:
@@ -551,6 +570,7 @@ class Model(
                 costs = await self._metrics_builder.flush(step)
                 if costs:
                     self._log_metrics(costs, split, step)
+                self._persist_metrics_builder_state()
             return
 
         # Convert to list[TrajectoryGroup]
@@ -660,6 +680,7 @@ class Model(
         costs = await self._metrics_builder.flush(step)
         if costs:
             self._log_metrics(costs, split, step)
+        self._persist_metrics_builder_state()
 
     async def get_step(self) -> int:
         """

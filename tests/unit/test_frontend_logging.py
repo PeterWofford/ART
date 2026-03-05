@@ -549,6 +549,45 @@ class TestMetricCalculation:
         assert second["costs/train_cum"] == pytest.approx(0.6)
         assert second["costs/all_cum"] == pytest.approx(0.6)
 
+    @pytest.mark.asyncio
+    async def test_cost_cumulative_persists_across_model_recreation(
+        self, tmp_path: Path
+    ):
+        model_1 = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+        await model_1.log(
+            trajectories=None,
+            split="train",
+            step=1,
+            metrics={"costs_prefill": 0.25},
+        )
+
+        model_2 = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+        await model_2.log(
+            trajectories=None,
+            split="train",
+            step=2,
+            metrics={"costs_prefill": 0.75},
+        )
+
+        history_path = tmp_path / "test/models/test/history.jsonl"
+        with open(history_path) as f:
+            first = json.loads(f.readline())
+            second = json.loads(f.readline())
+
+        assert first["costs/train/prefill_cum"] == pytest.approx(0.25)
+        assert second["costs/train/prefill_cum"] == pytest.approx(1.0)
+        assert second["costs/all_cum"] == pytest.approx(1.0)
+
 
 class TestWandbIntegration:
     """Test wandb integration logic (without mocking wandb itself)."""
