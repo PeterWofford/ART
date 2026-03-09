@@ -118,6 +118,9 @@ class Model(
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
     _wandb_defined_metrics: set[str]
     _run_start_time: float
+    _run_start_monotonic: float
+    _last_local_train_log_monotonic: float
+    _last_local_train_step: int | None
     _metrics_builder: MetricsBuilder
     _metrics_builder_state_loaded: bool
     _cost_calculator: CostCalculator
@@ -151,6 +154,9 @@ class Model(
         )
         object.__setattr__(self, "_wandb_defined_metrics", set())
         object.__setattr__(self, "_run_start_time", time.time())
+        object.__setattr__(self, "_run_start_monotonic", time.monotonic())
+        object.__setattr__(self, "_last_local_train_log_monotonic", self._run_start_monotonic)
+        object.__setattr__(self, "_last_local_train_step", None)
         object.__setattr__(self, "_metrics_builder", MetricsBuilder(cost_context="train"))
         object.__setattr__(self, "_metrics_builder_state_loaded", False)
 
@@ -495,7 +501,7 @@ class Model(
             wandb.define_metric(key, step_metric="training_step")
             self._wandb_defined_metrics.add(key)
 
-    def _route_metrics_and_extract_non_costs(
+    def _route_metrics_and_collect_non_costs(
         self, metrics: dict[str, float], split: str
     ) -> dict[str, float]:
         non_cost_metrics: dict[str, float] = {}
@@ -522,6 +528,44 @@ class Model(
                 continue
             non_cost_metrics[metric] = numeric_value
         return non_cost_metrics
+
+    def _collect_automatic_backend_metrics(
+        self,
+        *,
+        split: str,
+        step: int,
+        provided_metric_keys: set[str],
+    ) -> dict[str, float]:
+        if split != "train" or self._backend is None:
+            return {}
+
+        supports_step_metrics = getattr(
+            self._backend, "supports_automatic_train_step_metrics", None
+        )
+        if not callable(supports_step_metrics) or not supports_step_metrics():
+            return {}
+
+        if self._last_local_train_step == step:
+            return {}
+
+        now = time.monotonic()
+        step_wall_s = max(0.0, now - self._last_local_train_log_monotonic)
+        object.__setattr__(self, "_last_local_train_log_monotonic", now)
+        object.__setattr__(self, "_last_local_train_step", step)
+
+        automatic_metrics: dict[str, float] = {}
+        if "time/step_wall_s" not in provided_metric_keys:
+            automatic_metrics["time/step_wall_s"] = step_wall_s
+
+        gpu_cost_getter = getattr(self._backend, "automatic_gpu_cost_per_hour_usd", None)
+        if callable(gpu_cost_getter) and "costs/gpu" not in provided_metric_keys:
+            gpu_cost_per_hour_usd = gpu_cost_getter(self)
+            if gpu_cost_per_hour_usd is not None:
+                automatic_metrics["costs/gpu"] = (
+                    step_wall_s * float(gpu_cost_per_hour_usd) / 3600.0
+                )
+
+        return automatic_metrics
 
     def _add_default_step_metrics(
         self,
@@ -635,7 +679,15 @@ class Model(
         # If only metrics provided (no trajectories), just log them and return
         if trajectories is None:
             if metrics is not None:
-                metrics_without_costs = self._route_metrics_and_extract_non_costs(
+                provided_metric_keys = set(metrics)
+                automatic_metrics = self._collect_automatic_backend_metrics(
+                    split=split,
+                    step=step,
+                    provided_metric_keys=provided_metric_keys,
+                )
+                if automatic_metrics:
+                    self._route_metrics_and_collect_non_costs(automatic_metrics, split)
+                metrics_without_costs = self._route_metrics_and_collect_non_costs(
                     metrics, split
                 )
                 builder_metrics = await self._metrics_builder.flush()
@@ -646,11 +698,20 @@ class Model(
             return
 
         trajectory_groups = self._normalize_trajectory_groups(trajectories)
+        provided_metric_keys = set(metrics or {})
+
+        automatic_metrics = self._collect_automatic_backend_metrics(
+            split=split,
+            step=step,
+            provided_metric_keys=provided_metric_keys,
+        )
+        if automatic_metrics:
+            self._route_metrics_and_collect_non_costs(automatic_metrics, split)
 
         default_train_metrics = self._add_default_step_metrics(
             trajectory_groups,
             split=split,
-            provided_metric_keys=set(metrics or {}),
+            provided_metric_keys=provided_metric_keys,
         )
 
         # Ensure output directories exist
@@ -679,7 +740,7 @@ class Model(
 
         for group in trajectory_groups:
             if group.metrics:
-                group_non_cost = self._route_metrics_and_extract_non_costs(
+                group_non_cost = self._route_metrics_and_collect_non_costs(
                     cast(dict[str, float], group.metrics), split
                 )
             else:
@@ -704,7 +765,7 @@ class Model(
                         routed_metric = f"reward/{routed_metric}"
                     trajectory_metrics[routed_metric] = float(value)
 
-                non_cost_trajectory_metrics = self._route_metrics_and_extract_non_costs(
+                non_cost_trajectory_metrics = self._route_metrics_and_collect_non_costs(
                     trajectory_metrics,
                     split,
                 )
@@ -738,7 +799,7 @@ class Model(
 
         # Merge in any additional metrics passed directly
         if metrics is not None:
-            metrics_without_costs = self._route_metrics_and_extract_non_costs(
+            metrics_without_costs = self._route_metrics_and_collect_non_costs(
                 metrics, split
             )
             averages.update(metrics_without_costs)

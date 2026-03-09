@@ -898,6 +898,95 @@ class TestWandbIntegration:
             assert should_log is False
 
 
+class TestLocalBackendAutomaticMetrics:
+    @pytest.mark.asyncio
+    async def test_train_logs_automatic_wall_time_and_gpu_cost(
+        self, tmp_path: Path
+    ) -> None:
+        backend = LocalBackend(gpu_cost_per_hour_usd=3.0)
+
+        with patch("art.model.time.monotonic", side_effect=[100.0, 106.0, 111.0]):
+            model = TrainableModel(
+                name="test-model",
+                project="test-project",
+                base_model="Qwen/Qwen3-4B-Instruct-2507",
+                base_path=str(tmp_path),
+                report_metrics=[],
+                _internal_config={"trainer_gpu_ids": [0]},
+            )
+            model._backend = backend
+
+            await model.log(
+                trajectories=None,
+                split="train",
+                step=1,
+                metrics={"loss/train": 1.0},
+            )
+            await model.log(
+                trajectories=None,
+                split="train",
+                step=2,
+                metrics={"loss/train": 0.5},
+            )
+
+        history_path = tmp_path / "test-project/models/test-model/history.jsonl"
+        rows = [json.loads(line) for line in history_path.open() if line.strip()]
+
+        first_gpu_cost = 6.0 * 3.0 / 3600.0
+        second_gpu_cost = 5.0 * 3.0 / 3600.0
+
+        assert rows[0]["time/step_wall_s"] == pytest.approx(6.0)
+        assert rows[0]["costs/gpu"] == pytest.approx(first_gpu_cost)
+        assert rows[0]["costs/all"] == pytest.approx(first_gpu_cost)
+        assert rows[0]["costs/cum/gpu"] == pytest.approx(first_gpu_cost)
+
+        assert rows[1]["time/step_wall_s"] == pytest.approx(5.0)
+        assert rows[1]["costs/gpu"] == pytest.approx(second_gpu_cost)
+        assert rows[1]["costs/cum/gpu"] == pytest.approx(
+            first_gpu_cost + second_gpu_cost
+        )
+        assert rows[1]["costs/cum/all"] == pytest.approx(
+            first_gpu_cost + second_gpu_cost
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_local_gpu_skips_cost_but_keeps_wall_time(
+        self, tmp_path: Path
+    ) -> None:
+        backend = LocalBackend()
+
+        with patch("art.model.time.monotonic", side_effect=[50.0, 55.0]):
+            with patch("art.local.backend.torch.cuda.is_available", return_value=True):
+                with patch("art.local.backend.torch.cuda.device_count", return_value=1):
+                    with patch(
+                        "art.local.backend.torch.cuda.get_device_name",
+                        return_value="NVIDIA A100-SXM4-80GB",
+                    ):
+                        model = TrainableModel(
+                            name="test-model",
+                            project="test-project",
+                            base_model="Qwen/Qwen3-4B-Instruct-2507",
+                            base_path=str(tmp_path),
+                            report_metrics=[],
+                            _internal_config={"trainer_gpu_ids": [0]},
+                        )
+                        model._backend = backend
+                        await model.log(
+                            trajectories=None,
+                            split="train",
+                            step=1,
+                            metrics={"loss/train": 1.0},
+                        )
+
+        history_path = tmp_path / "test-project/models/test-model/history.jsonl"
+        with open(history_path) as f:
+            entry = json.loads(f.readline())
+
+        assert entry["time/step_wall_s"] == pytest.approx(5.0)
+        assert "costs/gpu" not in entry
+        assert "costs/all" not in entry
+
+
 class TestModelAttributes:
     """Test new Model attributes."""
 

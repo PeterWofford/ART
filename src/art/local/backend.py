@@ -13,6 +13,10 @@ import warnings
 
 logger = logging.getLogger(__name__)
 
+_AUTO_GPU_HOURLY_PRICING_USD = {
+    "H200": 3.0,
+}
+
 import aiohttp
 import numpy as np
 from openai import AsyncOpenAI
@@ -68,7 +72,13 @@ from .service import ModelService
 
 
 class LocalBackend(Backend):
-    def __init__(self, *, in_process: bool = False, path: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        in_process: bool = False,
+        path: str | None = None,
+        gpu_cost_per_hour_usd: float | None = None,
+    ) -> None:
         """
         Initializes a local, directory-based Backend interface at the given path.
 
@@ -79,15 +89,75 @@ class LocalBackend(Backend):
         Args:
             in_process: Whether to run the local service in-process.
             path: The path to the local directory. Defaults to "{repo_root}/.art".
+            gpu_cost_per_hour_usd: Optional per-GPU hourly price override used for
+                automatic `costs/gpu` accounting on train steps. When unset,
+                ART auto-detects supported GPU types (H200 at $3/hr today) and
+                skips GPU cost logging for unknown devices instead of guessing.
         """
         self._in_process = in_process
         self._path = path or get_default_art_path()
+        self._gpu_cost_per_hour_usd = (
+            float(gpu_cost_per_hour_usd)
+            if gpu_cost_per_hour_usd is not None
+            else None
+        )
         os.makedirs(self._path, exist_ok=True)
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
         self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
+
+    def supports_automatic_train_step_metrics(self) -> bool:
+        return True
+
+    def automatic_gpu_cost_per_hour_usd(self, model: Model) -> float | None:
+        per_gpu_cost = self._resolve_gpu_cost_per_hour_usd()
+        if per_gpu_cost is None:
+            return None
+
+        gpu_count = self._allocated_gpu_count(model)
+        if gpu_count <= 0:
+            return None
+        return per_gpu_cost * gpu_count
+
+    def _resolve_gpu_cost_per_hour_usd(self) -> float | None:
+        if self._gpu_cost_per_hour_usd is not None:
+            return self._gpu_cost_per_hour_usd
+        if not torch.cuda.is_available():
+            return None
+
+        num_visible_gpus = torch.cuda.device_count()
+        if num_visible_gpus <= 0:
+            return None
+
+        resolved_costs: list[float] = []
+        for index in range(num_visible_gpus):
+            device_name = torch.cuda.get_device_name(index).upper()
+            for gpu_name, hourly_cost in _AUTO_GPU_HOURLY_PRICING_USD.items():
+                if gpu_name in device_name:
+                    resolved_costs.append(hourly_cost)
+                    break
+            else:
+                return None
+
+        if not resolved_costs:
+            return None
+        if len(set(resolved_costs)) != 1:
+            return None
+        return resolved_costs[0]
+
+    def _allocated_gpu_count(self, model: Model) -> int:
+        if isinstance(model, TrainableModel) and model._internal_config is not None:
+            trainer_gpu_ids = set(model._internal_config.get("trainer_gpu_ids", []))
+            inference_gpu_ids = set(model._internal_config.get("inference_gpu_ids", []))
+            allocated_gpu_ids = trainer_gpu_ids | inference_gpu_ids
+            if allocated_gpu_ids:
+                return len(allocated_gpu_ids)
+
+        if not torch.cuda.is_available():
+            return 0
+        return torch.cuda.device_count()
 
     def __enter__(self) -> Self:
         return self

@@ -55,15 +55,21 @@ ART now emits the following metrics from library internals where the data is ava
 - `loss/*` from trainer backends
 - `time/wall_clock_sec` and `training_step` on every logged row
 - `time/step_trainer_s` for training calls
-- `time/step_wall_s`, `time/step_actor_s`, `time/step_eval_s` from `PipelineTrainer`
+- `time/step_wall_s` from `PipelineTrainer` and `LocalBackend` train-step logs
+- `time/step_actor_s`, `time/step_eval_s` from `PipelineTrainer`
 - `data/step_num_scenarios`, `data/step_num_trajectories`, `data/step_num_groups_submitted`
 - `data/step_num_groups_trainable` for train splits
 - `data/cum/num_unique_scenarios` when scenario IDs are present in group or trajectory metadata
 - `data/step_trainer_tokens` where the backend knows the trainer token count
+- `costs/gpu` on `LocalBackend` train-step logs when ART can resolve GPU pricing
 - `throughput/cum/trainer_idle_s`, `throughput/cum/actor_idle_s`
 - `throughput/avg_trainer_tok_per_s`, `throughput/avg_actor_tok_per_s` when both token and time inputs are available
 
 Some metrics remain user-owned because ART cannot infer them reliably for every workflow, especially actor token usage outside the pipeline trainer.
+
+For automatic GPU cost on `LocalBackend`, ART currently auto-detects H200s at
+$3/hour per GPU. For other GPU types, pass `gpu_cost_per_hour_usd=...` to
+`LocalBackend(...)` if you want ART to emit `costs/gpu` instead of skipping it.
 
 ## User Helpers
 
