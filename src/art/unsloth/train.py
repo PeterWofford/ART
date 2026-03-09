@@ -12,7 +12,7 @@ from trl import GRPOTrainer
 
 from .. import dev
 from ..loss import loss_fn, shift_tensor
-from ..metrics_taxonomy import rename_train_metrics
+from ..metrics_taxonomy import rename_train_metric_key, rename_train_metrics
 from ..types import TrainConfig
 
 if TYPE_CHECKING:
@@ -194,12 +194,16 @@ def get_log_fn(
         }  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
-        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+        # start with "eval_". Normalize them into the `val/...` taxonomy instead.
         if next(iter(logs.keys())).startswith("eval_"):
-            metrics = {f"eval_{key}": val for key, val in metrics.items()}
-
-        logs = {**rename_train_metrics(logs), **metrics}
-        results_queue.put_nowait(logs)
+            normalized_metrics = {f"val/{key}": val for key, val in metrics.items()}
+            normalized_logs = {
+                f"val/{rename_train_metric_key(key[len('eval_') :])}": val
+                for key, val in logs.items()
+            }
+            results_queue.put_nowait({**normalized_metrics, **normalized_logs})
+        else:
+            results_queue.put_nowait({**rename_train_metrics(logs), **metrics})
         trainer._metrics["train"].clear()
 
     return log
