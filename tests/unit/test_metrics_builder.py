@@ -194,6 +194,20 @@ class TestMetricsBuilder:
         assert second["data/cum_num_unique_scenarios"] == 4
 
     @pytest.mark.asyncio
+    async def test_empty_flush_does_not_repeat_stale_derived_metrics(self) -> None:
+        builder = MetricsBuilder(cost_context="train")
+        builder.add_metric("time/step_trainer_s", 2.0)
+        builder.add_metric("data/step_trainer_tokens", 20.0)
+        builder.add_data(scenario_ids=["s1"])
+
+        first = await builder.flush(step=1)
+        assert first["throughput/avg_trainer_tok_per_s"] == pytest.approx(10.0)
+        assert first["data/cum_num_unique_scenarios"] == 1
+
+        second = await builder.flush(step=2)
+        assert second == {}
+
+    @pytest.mark.asyncio
     async def test_concurrent_add_cost_calls_do_not_lose_updates(self) -> None:
         builder = MetricsBuilder(cost_context="train")
 

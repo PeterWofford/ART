@@ -707,6 +707,44 @@ class TestMetricCalculation:
         assert entry["data/step_actor_tokens"] == pytest.approx(10)
         assert entry["data/step_actor_tokens_cum"] == pytest.approx(10)
 
+    @pytest.mark.asyncio
+    async def test_log_without_new_builder_metrics_skips_extra_taxonomy_row(
+        self, tmp_path: Path
+    ):
+        model = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        model.metrics_builder().add_data(scenario_ids=["scenario-a"])
+        await model.log(
+            trajectories=None,
+            split="train",
+            step=1,
+            metrics={
+                "time/step_trainer_s": 2.0,
+                "data/step_trainer_tokens": 20.0,
+            },
+        )
+        await model.log(
+            trajectories=None,
+            split="train",
+            step=2,
+            metrics={"loss/train": 1.0},
+        )
+
+        history_path = tmp_path / "test/models/test/history.jsonl"
+        rows = [json.loads(line) for line in history_path.open() if line.strip()]
+
+        assert len(rows) == 2
+        assert rows[0]["throughput/avg_trainer_tok_per_s"] == pytest.approx(10.0)
+        assert rows[0]["data/cum_num_unique_scenarios"] == pytest.approx(1.0)
+        assert rows[1]["loss/train"] == pytest.approx(1.0)
+        assert "throughput/avg_trainer_tok_per_s" not in rows[1]
+        assert "data/cum_num_unique_scenarios" not in rows[1]
+
 
 class TestWandbIntegration:
     """Test wandb integration logic (without mocking wandb itself)."""

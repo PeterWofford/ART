@@ -51,6 +51,7 @@ class _SharedMetricsState:
     step_buffer: dict[str, float]
     cum_state: dict[str, float]
     unique_scenario_ids: set[str]
+    pending_scenario_ids: set[str]
     cost_extractors: dict[str, CostExtractor]
     token_pricing: dict[str, TokenPricing]
 
@@ -61,6 +62,7 @@ def _new_shared_metrics_state() -> _SharedMetricsState:
         step_buffer={},
         cum_state={},
         unique_scenario_ids=set(),
+        pending_scenario_ids=set(),
         cost_extractors={},
         token_pricing=dict(_DEFAULT_TOKEN_PRICING),
     )
@@ -162,6 +164,7 @@ class MetricsBuilder:
         self._step_buffer = self._shared_state.step_buffer
         self._cum_state = self._shared_state.cum_state
         self._unique_scenario_ids = self._shared_state.unique_scenario_ids
+        self._pending_scenario_ids = self._shared_state.pending_scenario_ids
         self._cost_extractors = self._shared_state.cost_extractors
         self._token_pricing = self._shared_state.token_pricing
 
@@ -187,7 +190,9 @@ class MetricsBuilder:
         if step_actor_tokens is not None:
             self.add_metric("data/step_actor_tokens", float(step_actor_tokens))
         if scenario_ids is not None:
-            self._unique_scenario_ids.update(scenario_ids)
+            self._pending_scenario_ids.update(
+                str(scenario_id) for scenario_id in scenario_ids
+            )
 
     def add_user_timing(
         self,
@@ -245,13 +250,15 @@ class MetricsBuilder:
                 self._cum_state[cum_key] = next_value
                 result[cum_key] = next_value
 
-            if self._unique_scenario_ids:
+            if self._pending_scenario_ids:
+                self._unique_scenario_ids.update(self._pending_scenario_ids)
                 result["data/cum_num_unique_scenarios"] = float(
                     len(self._unique_scenario_ids)
                 )
 
             self._update_throughput_metrics(result)
             self._step_buffer.clear()
+            self._pending_scenario_ids.clear()
             return result
 
     def activate(self) -> Token["MetricsBuilder"]:
@@ -319,11 +326,13 @@ class MetricsBuilder:
         self._shared_state.cum_state.update(restored_cum_state)
         self._shared_state.unique_scenario_ids.clear()
         self._shared_state.unique_scenario_ids.update(restored_unique_ids)
+        self._shared_state.pending_scenario_ids.clear()
 
         # Keep local references aligned with the shared state so derived builders
         # created before or after resume observe the same cumulative state.
         self._cum_state = self._shared_state.cum_state
         self._unique_scenario_ids = self._shared_state.unique_scenario_ids
+        self._pending_scenario_ids = self._shared_state.pending_scenario_ids
 
     def _validate_and_add(self, key: str, value: float) -> None:
         if key.endswith("_cum"):
@@ -391,21 +400,30 @@ class MetricsBuilder:
             self._cum_state[cum_key] = next_value
             result[cum_key] = next_value
 
-        trainer_tokens = self._cum_state.get("data/step_trainer_tokens_cum")
-        trainer_seconds = self._cum_state.get("time/step_trainer_s_cum")
         if (
-            trainer_tokens is not None
-            and trainer_seconds is not None
-            and trainer_seconds > 0
+            "data/step_trainer_tokens" in result
+            or "time/step_trainer_s" in result
         ):
-            result["throughput/avg_trainer_tok_per_s"] = (
-                trainer_tokens / trainer_seconds
-            )
+            trainer_tokens = self._cum_state.get("data/step_trainer_tokens_cum")
+            trainer_seconds = self._cum_state.get("time/step_trainer_s_cum")
+            if (
+                trainer_tokens is not None
+                and trainer_seconds is not None
+                and trainer_seconds > 0
+            ):
+                result["throughput/avg_trainer_tok_per_s"] = (
+                    trainer_tokens / trainer_seconds
+                )
 
-        actor_tokens = self._cum_state.get("data/step_actor_tokens_cum")
-        actor_seconds = self._cum_state.get("time/step_actor_s_cum")
-        if actor_tokens is not None and actor_seconds is not None and actor_seconds > 0:
-            result["throughput/avg_actor_tok_per_s"] = actor_tokens / actor_seconds
+        if "data/step_actor_tokens" in result or "time/step_actor_s" in result:
+            actor_tokens = self._cum_state.get("data/step_actor_tokens_cum")
+            actor_seconds = self._cum_state.get("time/step_actor_s_cum")
+            if (
+                actor_tokens is not None
+                and actor_seconds is not None
+                and actor_seconds > 0
+            ):
+                result["throughput/avg_actor_tok_per_s"] = actor_tokens / actor_seconds
 
     def _resolve_token_pricing(
         self,
