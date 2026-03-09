@@ -19,9 +19,28 @@ _active_builder: ContextVar["MetricsBuilder"] = ContextVar("_active_metrics_buil
 
 _HIERARCHICAL_SECTIONS = {"costs", "time", "data"}
 _THROUGHPUT_IDLE_MAPPINGS = {
-    "throughput/step_trainer_idle_s": "throughput/cum_trainer_idle_s",
-    "throughput/step_actor_idle_s": "throughput/cum_actor_idle_s",
+    "throughput/step_trainer_idle_s": "throughput/cum/trainer_idle_s",
+    "throughput/step_actor_idle_s": "throughput/cum/actor_idle_s",
 }
+
+
+def is_cumulative_metric_key(key: str) -> bool:
+    parts = key.split("/", 2)
+    return len(parts) >= 2 and parts[1] == "cum"
+
+
+def is_builder_managed_metric(key: str) -> bool:
+    return key.startswith(("costs/", "time/step_", "data/step_", "throughput/step_"))
+
+
+def to_cumulative_metric_key(key: str) -> str:
+    if is_cumulative_metric_key(key):
+        raise ValueError(f"Metric key '{key}' is already cumulative.")
+
+    section, rest = key.split("/", 1)
+    if rest.startswith("step_"):
+        rest = rest[len("step_") :]
+    return f"{section}/cum/{rest}"
 
 
 @dataclass
@@ -167,7 +186,7 @@ class MetricsBuilder:
                 section = key.split("/", 1)[0]
                 if section not in _HIERARCHICAL_SECTIONS:
                     continue
-                cum_key = f"{key}_cum"
+                cum_key = to_cumulative_metric_key(key)
                 next_value = self._shared_state.cum_state.get(cum_key, 0.0) + value
                 self._shared_state.cum_state[cum_key] = next_value
                 result[cum_key] = next_value
@@ -176,7 +195,7 @@ class MetricsBuilder:
                 self._shared_state.unique_scenario_ids.update(
                     self._shared_state.pending_scenario_ids
                 )
-                result["data/cum_num_unique_scenarios"] = float(
+                result["data/cum/num_unique_scenarios"] = float(
                     len(self._shared_state.unique_scenario_ids)
                 )
 
@@ -253,9 +272,9 @@ class MetricsBuilder:
         self._shared_state.pending_scenario_ids.clear()
 
     def _validate_and_add(self, key: str, value: float) -> None:
-        if key.endswith("_cum"):
+        if is_cumulative_metric_key(key):
             raise ValueError(
-                f"Metric key '{key}' ends with '_cum', which is reserved for cumulative metrics."
+                f"Metric key '{key}' uses the reserved cumulative namespace."
             )
 
         for existing_key in self._shared_state.step_buffer:
@@ -329,10 +348,10 @@ class MetricsBuilder:
             or "time/step_trainer_s" in result
         ):
             trainer_tokens = self._shared_state.cum_state.get(
-                "data/step_trainer_tokens_cum"
+                "data/cum/trainer_tokens"
             )
             trainer_seconds = self._shared_state.cum_state.get(
-                "time/step_trainer_s_cum"
+                "time/cum/trainer_s"
             )
             if (
                 trainer_tokens is not None
@@ -345,9 +364,9 @@ class MetricsBuilder:
 
         if "data/step_actor_tokens" in result or "time/step_actor_s" in result:
             actor_tokens = self._shared_state.cum_state.get(
-                "data/step_actor_tokens_cum"
+                "data/cum/actor_tokens"
             )
-            actor_seconds = self._shared_state.cum_state.get("time/step_actor_s_cum")
+            actor_seconds = self._shared_state.cum_state.get("time/cum/actor_s")
             if (
                 actor_tokens is not None
                 and actor_seconds is not None

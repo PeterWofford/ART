@@ -15,7 +15,7 @@ from typing_extensions import Never, TypeVar
 
 from . import dev
 from .costs import CostCalculator
-from .metrics import MetricsBuilder
+from .metrics import MetricsBuilder, is_builder_managed_metric
 from .metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     average_metric_samples,
@@ -39,7 +39,6 @@ StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 COSTS_METRIC_PREFIX = "costs_"
 COSTS_TOTAL_KEY = f"{COSTS_METRIC_PREFIX}total"
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
-BUILDER_CUMULATIVE_PREFIXES = ("time/step_", "data/step_", "throughput/step_")
 METRIC_SECTIONS = frozenset(
     {
         "reward",
@@ -493,7 +492,7 @@ class Model(
             wandb.define_metric(key, step_metric="training_step")
             self._wandb_defined_metrics.add(key)
 
-    def _extract_non_cost_metrics(
+    def _route_metrics_and_extract_non_costs(
         self, metrics: dict[str, float], split: str
     ) -> dict[str, float]:
         non_cost_metrics: dict[str, float] = {}
@@ -515,7 +514,7 @@ class Model(
                         f"{cost_context}/{component}", numeric_value
                     )
                 continue
-            if metric.startswith(BUILDER_CUMULATIVE_PREFIXES):
+            if is_builder_managed_metric(metric):
                 self._metrics_builder.add_metric(metric, numeric_value)
                 continue
             non_cost_metrics[metric] = numeric_value
@@ -633,12 +632,13 @@ class Model(
         # If only metrics provided (no trajectories), just log them and return
         if trajectories is None:
             if metrics is not None:
-                metrics_without_costs = self._extract_non_cost_metrics(metrics, split)
-                if metrics_without_costs:
-                    self._log_metrics(metrics_without_costs, split, step)
-                costs = await self._metrics_builder.flush()
-                if costs:
-                    self._log_metrics(costs, split, step)
+                metrics_without_costs = self._route_metrics_and_extract_non_costs(
+                    metrics, split
+                )
+                builder_metrics = await self._metrics_builder.flush()
+                merged_metrics = {**metrics_without_costs, **builder_metrics}
+                if merged_metrics:
+                    self._log_metrics(merged_metrics, split, step)
                 self._persist_metrics_builder_state()
             return
 
@@ -676,7 +676,7 @@ class Model(
 
         for group in trajectory_groups:
             if group.metrics:
-                group_non_cost = self._extract_non_cost_metrics(
+                group_non_cost = self._route_metrics_and_extract_non_costs(
                     cast(dict[str, float], group.metrics), split
                 )
             else:
@@ -701,7 +701,7 @@ class Model(
                         routed_metric = f"reward/{routed_metric}"
                     trajectory_metrics[routed_metric] = float(value)
 
-                non_cost_trajectory_metrics = self._extract_non_cost_metrics(
+                non_cost_trajectory_metrics = self._route_metrics_and_extract_non_costs(
                     trajectory_metrics,
                     split,
                 )
@@ -735,16 +735,16 @@ class Model(
 
         # Merge in any additional metrics passed directly
         if metrics is not None:
-            metrics_without_costs = self._extract_non_cost_metrics(metrics, split)
+            metrics_without_costs = self._route_metrics_and_extract_non_costs(
+                metrics, split
+            )
             averages.update(metrics_without_costs)
 
-        # 3. Log metrics (writes to history.jsonl and wandb)
-        self._log_metrics(averages, split, step)
-
-        # 4. Log cumulative costs
-        costs = await self._metrics_builder.flush()
-        if costs:
-            self._log_metrics(costs, split, step)
+        # 3. Merge in any builder-managed metrics and log a single row.
+        builder_metrics = await self._metrics_builder.flush()
+        merged_metrics = {**averages, **builder_metrics}
+        if merged_metrics:
+            self._log_metrics(merged_metrics, split, step)
         self._persist_metrics_builder_state()
 
     async def get_step(self) -> int:

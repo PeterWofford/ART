@@ -21,9 +21,9 @@ class TestMetricsBuilder:
         assert metrics["costs/train"] == pytest.approx(1.77)
         assert metrics["costs/eval"] == pytest.approx(0.06)
         assert metrics["costs/all"] == pytest.approx(1.83)
-        assert metrics["costs/train/llm_judge_cum"] == pytest.approx(0.12)
-        assert metrics["costs/train_cum"] == pytest.approx(1.77)
-        assert metrics["costs/all_cum"] == pytest.approx(1.83)
+        assert metrics["costs/cum/train/llm_judge"] == pytest.approx(0.12)
+        assert metrics["costs/cum/train"] == pytest.approx(1.77)
+        assert metrics["costs/cum/all"] == pytest.approx(1.83)
 
     @pytest.mark.asyncio
     async def test_cum_accumulates_for_hierarchical_sections(self) -> None:
@@ -37,11 +37,11 @@ class TestMetricsBuilder:
         )
         first = await builder.flush()
 
-        assert first["time/step_wall_s_cum"] == pytest.approx(1.5)
-        assert first["time/step_actor_s_cum"] == pytest.approx(0.3)
-        assert first["data/step_num_scenarios_cum"] == pytest.approx(2)
-        assert first["data/step_actor_tokens_cum"] == pytest.approx(10)
-        assert first["data/cum_num_unique_scenarios"] == 2
+        assert first["time/cum/wall_s"] == pytest.approx(1.5)
+        assert first["time/cum/actor_s"] == pytest.approx(0.3)
+        assert first["data/cum/num_scenarios"] == pytest.approx(2)
+        assert first["data/cum/actor_tokens"] == pytest.approx(10)
+        assert first["data/cum/num_unique_scenarios"] == 2
 
         builder.add_user_timing(step_wall_s=0.5, step_actor_s=0.2)
         builder.add_data(
@@ -51,11 +51,11 @@ class TestMetricsBuilder:
         )
         second = await builder.flush()
 
-        assert second["time/step_wall_s_cum"] == pytest.approx(2.0)
-        assert second["time/step_actor_s_cum"] == pytest.approx(0.5)
-        assert second["data/step_num_scenarios_cum"] == pytest.approx(5)
-        assert second["data/step_actor_tokens_cum"] == pytest.approx(15)
-        assert second["data/cum_num_unique_scenarios"] == 3
+        assert second["time/cum/wall_s"] == pytest.approx(2.0)
+        assert second["time/cum/actor_s"] == pytest.approx(0.5)
+        assert second["data/cum/num_scenarios"] == pytest.approx(5)
+        assert second["data/cum/actor_tokens"] == pytest.approx(15)
+        assert second["data/cum/num_unique_scenarios"] == 3
 
     @pytest.mark.asyncio
     async def test_helper_metrics_accumulate_within_a_single_step(self) -> None:
@@ -90,8 +90,8 @@ class TestMetricsBuilder:
 
         metrics = await builder.flush()
 
-        assert metrics["throughput/cum_trainer_idle_s"] == pytest.approx(1.5)
-        assert metrics["throughput/cum_actor_idle_s"] == pytest.approx(0.5)
+        assert metrics["throughput/cum/trainer_idle_s"] == pytest.approx(1.5)
+        assert metrics["throughput/cum/actor_idle_s"] == pytest.approx(0.5)
         assert metrics["throughput/avg_trainer_tok_per_s"] == pytest.approx(10.0)
         assert metrics["throughput/avg_actor_tok_per_s"] == pytest.approx(5.0)
 
@@ -131,17 +131,17 @@ class TestMetricsBuilder:
         assert metrics["costs/train"] == pytest.approx(2.0)
         assert metrics["costs/all"] == pytest.approx(2.0)
 
-    def test_cum_suffix_is_reserved(self) -> None:
+    def test_cumulative_namespace_is_reserved(self) -> None:
         builder = MetricsBuilder(cost_context="train")
         with pytest.raises(ValueError):
-            builder.add_cost("train/llm_judge_cum", usd=0.1)
+            builder.add_metric("costs/cum/train/llm_judge", 0.1)
 
     @pytest.mark.asyncio
     async def test_sparse_steps_omit_rollup_for_missing_costs(self) -> None:
         builder = MetricsBuilder(cost_context="train")
         builder.add_cost("train/gpu", usd=1.0)
         first = await builder.flush()
-        assert first["costs/train_cum"] == pytest.approx(1.0)
+        assert first["costs/cum/train"] == pytest.approx(1.0)
 
         second = await builder.flush()
         assert not any(key.startswith("costs/") for key in second)
@@ -149,7 +149,7 @@ class TestMetricsBuilder:
         builder.add_cost("train/gpu", usd=2.0)
         third = await builder.flush()
         assert third["costs/train"] == pytest.approx(2.0)
-        assert third["costs/train_cum"] == pytest.approx(3.0)
+        assert third["costs/cum/train"] == pytest.approx(3.0)
 
     @pytest.mark.asyncio
     async def test_state_dict_round_trip_preserves_cumulative_state(self) -> None:
@@ -163,8 +163,8 @@ class TestMetricsBuilder:
         after.add_cost("train/gpu", usd=2.0)
 
         metrics = await after.flush()
-        assert metrics["costs/train_cum"] == pytest.approx(3.0)
-        assert metrics["costs/all_cum"] == pytest.approx(3.0)
+        assert metrics["costs/cum/train"] == pytest.approx(3.0)
+        assert metrics["costs/cum/all"] == pytest.approx(3.0)
 
     @pytest.mark.asyncio
     async def test_loaded_state_is_shared_with_other_cost_contexts(self) -> None:
@@ -180,7 +180,7 @@ class TestMetricsBuilder:
 
         metrics = await eval_builder.flush()
         assert metrics["costs/eval/judge"] == pytest.approx(2.0)
-        assert metrics["costs/all_cum"] == pytest.approx(3.0)
+        assert metrics["costs/cum/all"] == pytest.approx(3.0)
 
     @pytest.mark.asyncio
     async def test_add_response_cost_uses_registered_pricing(self) -> None:
@@ -205,11 +205,11 @@ class TestMetricsBuilder:
         builder = MetricsBuilder(cost_context="train")
         builder.add_data(scenario_ids=["s1", "s2", "s3"])
         first = await builder.flush()
-        assert first["data/cum_num_unique_scenarios"] == 3
+        assert first["data/cum/num_unique_scenarios"] == 3
 
         builder.add_data(scenario_ids=["s2", "s4"])
         second = await builder.flush()
-        assert second["data/cum_num_unique_scenarios"] == 4
+        assert second["data/cum/num_unique_scenarios"] == 4
 
     @pytest.mark.asyncio
     async def test_empty_flush_does_not_repeat_stale_derived_metrics(self) -> None:
@@ -220,7 +220,7 @@ class TestMetricsBuilder:
 
         first = await builder.flush()
         assert first["throughput/avg_trainer_tok_per_s"] == pytest.approx(10.0)
-        assert first["data/cum_num_unique_scenarios"] == 1
+        assert first["data/cum/num_unique_scenarios"] == 1
 
         second = await builder.flush()
         assert second == {}

@@ -227,9 +227,7 @@ class TestHistoryJsonlCompatibility:
         history_path = tmp_path / "test-project/models/test-model/history.jsonl"
         df = pl.read_ndjson(str(history_path))
 
-        # Each log call now emits the primary metrics row plus a taxonomy
-        # row for cumulative data/time metrics.
-        assert len(df) == 4
+        assert len(df) == 2
 
         # Check both splits are present
         columns = df.columns
@@ -351,9 +349,9 @@ class TestMetricCalculation:
                 "time/wall_clock_sec",
             ]
         ]
-        assert all(k.startswith("val/") for k in metric_keys), (
-            f"Not all metrics prefixed: {metric_keys}"
-        )
+        assert all(
+            k.startswith(("val/", "data/")) for k in metric_keys
+        ), f"Not all metrics routed into taxonomy namespaces: {metric_keys}"
         assert entry["training_step"] == 0
         assert entry["time/wall_clock_sec"] >= 0
 
@@ -619,7 +617,7 @@ class TestMetricCalculation:
         assert merged["data/step_num_trajectories"] == pytest.approx(3.0)
         assert merged["data/step_num_groups_submitted"] == pytest.approx(2.0)
         assert merged["data/step_num_groups_trainable"] == pytest.approx(1.0)
-        assert merged["data/cum_num_unique_scenarios"] == pytest.approx(2.0)
+        assert merged["data/cum/num_unique_scenarios"] == pytest.approx(2.0)
         assert merged["train/num_groups_submitted"] == pytest.approx(2.0)
         assert merged["train/num_groups_trainable"] == pytest.approx(1.0)
         assert merged["train/num_trajectories"] == pytest.approx(3.0)
@@ -660,12 +658,12 @@ class TestMetricCalculation:
         assert first["costs/train/sample"] == pytest.approx(0.3)
         assert first["costs/train"] == pytest.approx(0.5)
         assert first["costs/all"] == pytest.approx(0.5)
-        assert first["costs/all_cum"] == pytest.approx(0.5)
+        assert first["costs/cum/all"] == pytest.approx(0.5)
 
         assert second["costs/train/prefill"] == pytest.approx(0.1)
-        assert second["costs/train/prefill_cum"] == pytest.approx(0.3)
-        assert second["costs/train_cum"] == pytest.approx(0.6)
-        assert second["costs/all_cum"] == pytest.approx(0.6)
+        assert second["costs/cum/train/prefill"] == pytest.approx(0.3)
+        assert second["costs/cum/train"] == pytest.approx(0.6)
+        assert second["costs/cum/all"] == pytest.approx(0.6)
 
     @pytest.mark.asyncio
     async def test_cost_cumulative_persists_across_model_recreation(
@@ -702,9 +700,9 @@ class TestMetricCalculation:
             first = json.loads(f.readline())
             second = json.loads(f.readline())
 
-        assert first["costs/train/prefill_cum"] == pytest.approx(0.25)
-        assert second["costs/train/prefill_cum"] == pytest.approx(1.0)
-        assert second["costs/all_cum"] == pytest.approx(1.0)
+        assert first["costs/cum/train/prefill"] == pytest.approx(0.25)
+        assert second["costs/cum/train/prefill"] == pytest.approx(1.0)
+        assert second["costs/cum/all"] == pytest.approx(1.0)
 
     @pytest.mark.asyncio
     async def test_metrics_builder_loads_resume_state_before_builder_use(
@@ -733,8 +731,8 @@ class TestMetricCalculation:
             first = json.loads(f.readline())
             second = json.loads(f.readline())
 
-        assert first["data/cum_num_unique_scenarios"] == pytest.approx(1.0)
-        assert second["data/cum_num_unique_scenarios"] == pytest.approx(2.0)
+        assert first["data/cum/num_unique_scenarios"] == pytest.approx(1.0)
+        assert second["data/cum/num_unique_scenarios"] == pytest.approx(2.0)
 
     @pytest.mark.asyncio
     async def test_direct_time_and_data_metrics_get_cumulative_variants(
@@ -762,9 +760,9 @@ class TestMetricCalculation:
             entry = json.loads(f.readline())
 
         assert entry["time/step_actor_s"] == pytest.approx(1.5)
-        assert entry["time/step_actor_s_cum"] == pytest.approx(1.5)
+        assert entry["time/cum/actor_s"] == pytest.approx(1.5)
         assert entry["data/step_actor_tokens"] == pytest.approx(10)
-        assert entry["data/step_actor_tokens_cum"] == pytest.approx(10)
+        assert entry["data/cum/actor_tokens"] == pytest.approx(10)
 
     @pytest.mark.asyncio
     async def test_log_without_new_builder_metrics_skips_extra_taxonomy_row(
@@ -799,10 +797,10 @@ class TestMetricCalculation:
 
         assert len(rows) == 2
         assert rows[0]["throughput/avg_trainer_tok_per_s"] == pytest.approx(10.0)
-        assert rows[0]["data/cum_num_unique_scenarios"] == pytest.approx(1.0)
+        assert rows[0]["data/cum/num_unique_scenarios"] == pytest.approx(1.0)
         assert rows[1]["loss/train"] == pytest.approx(1.0)
         assert "throughput/avg_trainer_tok_per_s" not in rows[1]
-        assert "data/cum_num_unique_scenarios" not in rows[1]
+        assert "data/cum/num_unique_scenarios" not in rows[1]
 
 
 class TestWandbIntegration:
@@ -984,7 +982,7 @@ class TestTrainSFTMetricsAggregation:
         with open(history_path) as f:
             lines = f.readlines()
 
-        assert len(lines) == 2, f"Expected 2 log entries, got {len(lines)}"
+        assert len(lines) == 1, f"Expected 1 log entry, got {len(lines)}"
 
         entries = [json.loads(line) for line in lines]
         merged: dict[str, float] = {}
@@ -995,7 +993,7 @@ class TestTrainSFTMetricsAggregation:
         assert merged["loss/train"] == pytest.approx(0.8)  # (1.0 + 0.8 + 0.6) / 3
         assert merged["loss/grad_norm"] == pytest.approx(0.4)  # (0.5 + 0.4 + 0.3) / 3
         assert merged["time/step_trainer_s"] >= 0
-        assert merged["time/step_trainer_s_cum"] >= 0
+        assert merged["time/cum/trainer_s"] >= 0
 
     @pytest.mark.asyncio
     async def test_train_sft_single_step_increment(self, tmp_path: Path):
@@ -1032,7 +1030,7 @@ class TestTrainSFTMetricsAggregation:
         history_path = tmp_path / "test-project/models/test-sft-step/history.jsonl"
         df = pl.read_ndjson(str(history_path))
 
-        assert len(df) == 2, "Should have exactly 2 log entries"
+        assert len(df) == 1, "Should have exactly 1 log entry"
         assert set(df["step"].to_list()) == {1}, "Step should be 1 (single increment)"
 
     @pytest.mark.asyncio

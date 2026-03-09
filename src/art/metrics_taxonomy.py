@@ -33,6 +33,7 @@ TRAIN_METRIC_KEY_RENAMES = {
     "train_tokens": "data/step_trainer_tokens",
     "num_datums": "data/step_num_datums",
 }
+_INVARIANT_METRIC_KEYS = frozenset({TRAIN_GRADIENT_STEPS_KEY})
 
 
 def rename_train_metric_key(metric: str) -> str:
@@ -48,13 +49,32 @@ def rename_train_metrics(metrics: dict[str, float]) -> dict[str, float]:
 def average_metric_samples(metric_samples: Iterable[dict[str, float]]) -> dict[str, float]:
     totals: dict[str, float] = {}
     counts: dict[str, int] = {}
+    invariant_values: dict[str, float] = {}
 
     for sample in metric_samples:
         for key, value in sample.items():
-            totals[key] = totals.get(key, 0.0) + float(value)
+            numeric_value = float(value)
+            if key in _INVARIANT_METRIC_KEYS:
+                previous_value = invariant_values.get(key)
+                if previous_value is None:
+                    invariant_values[key] = numeric_value
+                elif previous_value != numeric_value:
+                    raise ValueError(
+                        f"Metric '{key}' must be invariant across samples, "
+                        f"got {previous_value} and {numeric_value}."
+                    )
+
+            totals[key] = totals.get(key, 0.0) + numeric_value
             counts[key] = counts.get(key, 0) + 1
 
-    return {key: totals[key] / counts[key] for key in totals}
+    return {
+        key: (
+            invariant_values[key]
+            if key in _INVARIANT_METRIC_KEYS
+            else totals[key] / counts[key]
+        )
+        for key in totals
+    }
 
 
 @dataclass(frozen=True)

@@ -97,7 +97,7 @@ class TestMetricRoutingBaseline:
                 model._log_metrics(
                     {
                         "costs/train/sample": 0.1,
-                        "costs/train/prefill_cum": 0.2,
+                        "costs/cum/train/prefill": 0.2,
                     },
                     split="train",
                     step=1,
@@ -109,6 +109,6 @@ class TestMetricRoutingBaseline:
         ]
         assert (("costs/train/sample",), {"step_metric": "training_step"}) in define_calls
         assert (
-            (("costs/train/prefill_cum",), {"step_metric": "training_step"})
+            (("costs/cum/train/prefill",), {"step_metric": "training_step"})
             in define_calls
         )

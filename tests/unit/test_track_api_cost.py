@@ -190,7 +190,7 @@ class TestTrackApiCostIntegration:
 
         assert first["costs/train/llm_judge/correctness"] == pytest.approx(0.0002)
         assert second["costs/eval/llm_judge/factuality"] == pytest.approx(0.00016)
-        assert second["costs/all_cum"] == pytest.approx(0.00036)
+        assert second["costs/cum/all"] == pytest.approx(0.00036)
 
     @pytest.mark.asyncio
     async def test_pipeline_trainer_activates_train_context_for_rollouts(

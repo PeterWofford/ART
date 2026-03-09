@@ -45,7 +45,7 @@ Cost leaves can be logged with either:
 ART rolls costs up automatically:
 
 - parent rollups (for example `costs/train`, `costs/all`)
-- cumulative keys with `_cum` suffix (for example `costs/all_cum`)
+- cumulative keys under the `cum/` namespace (for example `costs/cum/all`)
 
 ## Metrics Added By ART
 
@@ -58,9 +58,9 @@ ART now emits the following metrics from library internals where the data is ava
 - `time/step_wall_s`, `time/step_actor_s`, `time/step_eval_s` from `PipelineTrainer`
 - `data/step_num_scenarios`, `data/step_num_trajectories`, `data/step_num_groups_submitted`
 - `data/step_num_groups_trainable` for train splits
-- `data/cum_num_unique_scenarios` when scenario IDs are present in group or trajectory metadata
+- `data/cum/num_unique_scenarios` when scenario IDs are present in group or trajectory metadata
 - `data/step_trainer_tokens` where the backend knows the trainer token count
-- `throughput/cum_trainer_idle_s`, `throughput/cum_actor_idle_s`
+- `throughput/cum/trainer_idle_s`, `throughput/cum/actor_idle_s`
 - `throughput/avg_trainer_tok_per_s`, `throughput/avg_actor_tok_per_s` when both token and time inputs are available
 
 Some metrics remain user-owned because ART cannot infer them reliably for every workflow, especially actor token usage outside the pipeline trainer.
@@ -135,7 +135,7 @@ The next `model.log(...)` flush for that step will include:
 
 - `costs/train/llm_judge/correctness` (or `costs/eval/...`)
 - hierarchical rollups like `costs/train`, `costs/all`
-- cumulative keys like `costs/all_cum`
+- cumulative keys like `costs/cum/all`
 
 Built-in providers:
 
