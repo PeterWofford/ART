@@ -30,7 +30,12 @@ from art.tinker.cookbook_v import renderers, tokenizer_utils
 from .. import dev
 from ..backend import Backend
 from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
-from ..metrics_taxonomy import rename_train_metric_key
+from ..metrics_taxonomy import (
+    build_data_metrics_from_summary,
+    build_train_metrics_from_summary,
+    rename_train_metric_key,
+    summarize_trajectory_groups,
+)
 from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
@@ -209,6 +214,7 @@ class TinkerNativeBackend(Backend):
     ) -> TrainResult:
         state = self._model_state[model.name]
         groups_list = list(trajectory_groups)
+        summary = summarize_trajectory_groups(groups_list)
 
         datums = trajectory_groups_to_datums(
             groups_list,
@@ -218,7 +224,8 @@ class TinkerNativeBackend(Backend):
         )
 
         metrics: dict[str, float] = {
-            "train/num_groups_submitted": float(len(groups_list)),
+            **build_data_metrics_from_summary(summary, include_trainable_groups=True),
+            **build_train_metrics_from_summary(summary),
             "data/step_num_datums": float(len(datums)),
         }
 
@@ -234,6 +241,7 @@ class TinkerNativeBackend(Backend):
             metrics["costs/train/tinker_train"] = compute_train_cost(
                 train_tokens, pricing
             )
+        trainer_started = time.monotonic()
 
         if adam_params is None:
             adam_params = tinker.AdamParams(
@@ -301,6 +309,7 @@ class TinkerNativeBackend(Backend):
 
         state.current_step = next_step
         self._persist_model_state(model, state)
+        metrics["time/step_trainer_s"] = time.monotonic() - trainer_started
 
         return TrainResult(step=state.current_step, metrics=metrics)
 

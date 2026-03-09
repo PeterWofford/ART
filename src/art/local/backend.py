@@ -6,6 +6,7 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
 import warnings
@@ -39,7 +40,13 @@ from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
 from ..backend import AnyTrainableModel, Backend
-from ..metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY, rename_train_metrics
+from ..metrics_taxonomy import (
+    TRAIN_GRADIENT_STEPS_KEY,
+    build_data_metrics_from_summary,
+    build_train_metrics_from_summary,
+    rename_train_metrics,
+    summarize_trajectory_groups,
+)
 from ..model import Model, TrainableModel
 from ..preprocessing.pack import (
     PackedTensors,
@@ -568,6 +575,7 @@ class LocalBackend(Backend):
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
+        trainer_started = time.monotonic()
         async for metrics in self._train_model(
             model, groups_list, config, dev_config, verbose
         ):
@@ -582,6 +590,22 @@ class LocalBackend(Backend):
                 for k in {k for d in training_metrics for k in d}
                 if k != TRAIN_GRADIENT_STEPS_KEY
             }
+        summary = summarize_trajectory_groups(groups_list)
+        avg_metrics.setdefault(
+            "time/step_trainer_s", time.monotonic() - trainer_started
+        )
+        avg_metrics.update(
+            {
+                key: value
+                for key, value in {
+                    **build_data_metrics_from_summary(
+                        summary, include_trainable_groups=True
+                    ),
+                    **build_train_metrics_from_summary(summary),
+                }.items()
+                if key not in avg_metrics
+            }
+        )
 
         # Get step and checkpoint path
         step = await self._get_step(model)
@@ -619,13 +643,11 @@ class LocalBackend(Backend):
         if verbose:
             print("Packing tensors...")
 
-        # Count submitted groups and trainable groups
-        num_groups_submitted = len(trajectory_groups)
-        num_groups_trainable = sum(
-            1
-            for group in trajectory_groups
-            if group and len(set(trajectory.reward for trajectory in group)) > 1
-        )
+        summary = summarize_trajectory_groups(trajectory_groups)
+        base_metrics = {
+            **build_data_metrics_from_summary(summary, include_trainable_groups=True),
+            **build_train_metrics_from_summary(summary),
+        }
 
         packed_tensors = self._get_packed_tensors(
             model,
@@ -687,16 +709,20 @@ class LocalBackend(Backend):
             # Yield metrics showing no groups were trainable
             # (the frontend will handle logging)
             yield {
-                "train/num_groups_submitted": float(num_groups_submitted),
+                **base_metrics,
+                "data/step_num_groups_trainable": 0.0,
                 "train/num_groups_trainable": 0.0,
+                "data/step_trainer_tokens": 0.0,
                 TRAIN_GRADIENT_STEPS_KEY: 0.0,
             }
             return
+        base_metrics["data/step_trainer_tokens"] = float(
+            packed_tensors["assistant_mask"].sum().item()
+        )
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        results: list[dict[str, float]] = []
         estimated_gradient_steps = disk_packed_tensors["num_sequences"]
         pbar = tqdm.tqdm(total=estimated_gradient_steps, desc="train")
         async for result in service.train(
@@ -709,8 +735,11 @@ class LocalBackend(Backend):
             assert num_gradient_steps == estimated_gradient_steps, (
                 f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
             )
-            results.append(result)
-            yield {**result, TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps)}
+            yield {
+                **base_metrics,
+                **result,
+                TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
+            }
             pbar.update(1)
             pbar.set_postfix(result)
         pbar.close()
@@ -797,15 +826,21 @@ class LocalBackend(Backend):
         service = await self._get_service(model)
 
         pbar = tqdm.tqdm(total=len(batches), desc="sft train")
-        total_trainable_tokens = 0
+        total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
+        total_trajectories = len(trajectory_list)
         batch_count = 0
 
         async for result in service.train_sft(batches, verbose):
             pbar.update(1)
-            pbar.set_postfix({"loss": f"{result.get('loss', 0):.4f}"})
-            total_trainable_tokens += result.get("num_trainable_tokens", 0)
+            pbar.set_postfix({"loss": f"{result.get('loss/train', 0):.4f}"})
             batch_count += 1
-            yield result
+            yield {
+                **result,
+                "data/step_num_trajectories": float(total_trajectories),
+                "data/step_trainer_tokens": float(total_trainable_tokens),
+                "train/num_trajectories": float(total_trajectories),
+                "train/num_trainable_tokens": float(total_trainable_tokens),
+            }
 
         pbar.close()
 

@@ -7,6 +7,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from functools import wraps
 from inspect import iscoroutinefunction
+import time
 from typing import Any, ParamSpec, TypeVar
 
 from .costs import tokens_to_cost
@@ -14,6 +15,10 @@ from .costs import tokens_to_cost
 _active_builder: ContextVar["MetricsBuilder"] = ContextVar("_active_metrics_builder")
 
 _HIERARCHICAL_SECTIONS = {"costs", "time", "data"}
+_THROUGHPUT_IDLE_MAPPINGS = {
+    "throughput/step_trainer_idle_s": "throughput/cum_trainer_idle_s",
+    "throughput/step_actor_idle_s": "throughput/cum_actor_idle_s",
+}
 _DEFAULT_PROVIDER = "openai"
 _OPENAI_PROVIDER = "openai"
 _ANTHROPIC_PROVIDER = "anthropic"
@@ -210,6 +215,14 @@ class MetricsBuilder:
         if step_actor_idle_s is not None:
             self.add_metric("throughput/step_actor_idle_s", float(step_actor_idle_s))
 
+    @contextmanager
+    def measure(self, key: str):
+        started = time.monotonic()
+        try:
+            yield
+        finally:
+            self.add_metric(key, time.monotonic() - started)
+
     async def flush(self, step: int) -> dict[str, float]:
         del step
         async with self._lock:
@@ -237,6 +250,7 @@ class MetricsBuilder:
                     len(self._unique_scenario_ids)
                 )
 
+            self._update_throughput_metrics(result)
             self._step_buffer.clear()
             return result
 
@@ -368,6 +382,30 @@ class MetricsBuilder:
         rollups["costs/all"] = costs_all
 
         return rollups
+
+    def _update_throughput_metrics(self, result: dict[str, float]) -> None:
+        for step_key, cum_key in _THROUGHPUT_IDLE_MAPPINGS.items():
+            if step_key not in result:
+                continue
+            next_value = self._cum_state.get(cum_key, 0.0) + result[step_key]
+            self._cum_state[cum_key] = next_value
+            result[cum_key] = next_value
+
+        trainer_tokens = self._cum_state.get("data/step_trainer_tokens_cum")
+        trainer_seconds = self._cum_state.get("time/step_trainer_s_cum")
+        if (
+            trainer_tokens is not None
+            and trainer_seconds is not None
+            and trainer_seconds > 0
+        ):
+            result["throughput/avg_trainer_tok_per_s"] = (
+                trainer_tokens / trainer_seconds
+            )
+
+        actor_tokens = self._cum_state.get("data/step_actor_tokens_cum")
+        actor_seconds = self._cum_state.get("time/step_actor_s_cum")
+        if actor_tokens is not None and actor_seconds is not None and actor_seconds > 0:
+            result["throughput/avg_actor_tok_per_s"] = actor_tokens / actor_seconds
 
     def _resolve_token_pricing(
         self,

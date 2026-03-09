@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal
 import warnings
 
@@ -9,7 +10,13 @@ from art.serverless.client import Client, ExperimentalTrainingConfig
 
 from .. import dev
 from ..backend import AnyTrainableModel, Backend
-from ..metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY, rename_train_metrics
+from ..metrics_taxonomy import (
+    TRAIN_GRADIENT_STEPS_KEY,
+    build_data_metrics_from_summary,
+    build_train_metrics_from_summary,
+    rename_train_metrics,
+    summarize_trajectory_groups,
+)
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
 from ..utils.record_provenance import record_provenance
@@ -236,6 +243,7 @@ class ServerlessBackend(Backend):
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
+        trainer_started = time.monotonic()
         async for metrics in self._train_model(
             model, groups_list, config, dev_config, verbose
         ):
@@ -250,6 +258,22 @@ class ServerlessBackend(Backend):
                 for k in {k for d in training_metrics for k in d}
                 if k != TRAIN_GRADIENT_STEPS_KEY
             }
+        summary = summarize_trajectory_groups(groups_list)
+        avg_metrics.setdefault(
+            "time/step_trainer_s", time.monotonic() - trainer_started
+        )
+        avg_metrics.update(
+            {
+                key: value
+                for key, value in {
+                    **build_data_metrics_from_summary(
+                        summary, include_trainable_groups=True
+                    ),
+                    **build_train_metrics_from_summary(summary),
+                }.items()
+                if key not in avg_metrics
+            }
+        )
 
         # Get step and artifact name
         step = await self._get_step(model)
@@ -276,6 +300,11 @@ class ServerlessBackend(Backend):
         dev_config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        summary = summarize_trajectory_groups(trajectory_groups)
+        base_metrics = {
+            **build_data_metrics_from_summary(summary, include_trainable_groups=True),
+            **build_train_metrics_from_summary(summary),
+        }
         assert model.id is not None, "Model ID is required"
         training_job = await self._client.training_jobs.create(  # ty:ignore[possibly-missing-attribute]
             model_id=model.id,
@@ -312,6 +341,7 @@ class ServerlessBackend(Backend):
                         {k: float(v) for k, v in event.data.items()}
                     )
                     yield {
+                        **base_metrics,
                         **metrics,
                         TRAIN_GRADIENT_STEPS_KEY: float(num_sequences),
                     }
@@ -484,6 +514,8 @@ class ServerlessBackend(Backend):
                     )
                     yield {
                         **metrics,
+                        "data/step_num_trajectories": float(num_trajectories),
+                        "train/num_trajectories": float(num_trajectories),
                         TRAIN_GRADIENT_STEPS_KEY: float(num_batches),
                     }
                 elif event.type == "training_started":

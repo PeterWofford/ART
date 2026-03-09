@@ -16,7 +16,12 @@ from typing_extensions import Never, TypeVar
 from . import dev
 from .costs import CostCalculator
 from .metrics import MetricsBuilder
-from .metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
+from .metrics_taxonomy import (
+    TRAIN_GRADIENT_STEPS_KEY,
+    build_data_metrics_from_summary,
+    build_train_metrics_from_summary,
+    summarize_trajectory_groups,
+)
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig, TrainSFTConfig
 from .utils.trajectory_logging import write_trajectory_groups_parquet
@@ -33,7 +38,7 @@ StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 COSTS_METRIC_PREFIX = "costs_"
 COSTS_TOTAL_KEY = f"{COSTS_METRIC_PREFIX}total"
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
-BUILDER_CUMULATIVE_PREFIXES = ("time/step_", "data/step_")
+BUILDER_CUMULATIVE_PREFIXES = ("time/step_", "data/step_", "throughput/step_")
 METRIC_SECTIONS = frozenset(
     {
         "reward",
@@ -515,6 +520,39 @@ class Model(
             non_cost_metrics[metric] = numeric_value
         return non_cost_metrics
 
+    def _add_default_step_metrics(
+        self,
+        trajectory_groups: list[TrajectoryGroup],
+        *,
+        split: str,
+        provided_metric_keys: set[str],
+    ) -> dict[str, float]:
+        if split not in METRIC_SPLITS:
+            return {}
+
+        summary = summarize_trajectory_groups(trajectory_groups)
+        default_data_metrics = build_data_metrics_from_summary(
+            summary,
+            include_trainable_groups=split == "train",
+        )
+        for key, value in default_data_metrics.items():
+            if key in provided_metric_keys:
+                continue
+            self._metrics_builder.add_metric(key, value)
+
+        if summary.scenario_ids:
+            self._metrics_builder.add_data(scenario_ids=summary.scenario_ids)
+
+        if split != "train":
+            return {}
+
+        default_train_metrics = build_train_metrics_from_summary(summary)
+        return {
+            key: value
+            for key, value in default_train_metrics.items()
+            if key not in provided_metric_keys
+        }
+
     def metrics_builder(self, cost_context: str | None = None) -> MetricsBuilder:
         if cost_context is None:
             return self._metrics_builder
@@ -595,6 +633,12 @@ class Model(
         else:
             trajectory_groups = cast(list[TrajectoryGroup], list(trajectories))
 
+        default_train_metrics = self._add_default_step_metrics(
+            trajectory_groups,
+            split=split,
+            provided_metric_keys=set(metrics or {}),
+        )
+
         # Ensure output directories exist
         output_dir = self._get_output_dir()
         trajectories_dir = f"{output_dir}/trajectories/{split}"
@@ -662,6 +706,8 @@ class Model(
         for metric, values in all_metrics.items():
             if len(values) > 0:
                 averages[metric] = sum(values) / len(values)
+
+        averages.update(default_train_metrics)
 
         # Aggregate group-level metrics once per group
         for metric, values in group_metrics.items():
@@ -907,6 +953,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
         # 1. Train (backend no longer logs internally)
         training_metrics: list[dict[str, float]] = []
+        trainer_started = time.monotonic()
         async for metrics in self.backend()._train_model(
             self,
             groups_list,
@@ -915,6 +962,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             verbose,
         ):
             training_metrics.append(metrics)
+        trainer_elapsed = time.monotonic() - trainer_started
 
         # 2. Calculate aggregated training metrics
         avg_metrics: dict[str, float] = {}
@@ -925,6 +973,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
                 for k in {k for d in training_metrics for k in d}
                 if k != TRAIN_GRADIENT_STEPS_KEY
             }
+        avg_metrics.setdefault("time/step_trainer_s", trainer_elapsed)
 
         # 3. Log trajectories and training metrics together (single wandb log call)
         step = await self.get_step()
@@ -955,6 +1004,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         # Collect all metrics and aggregate them at the end (same as RL)
         _config = _config or {}  # ty:ignore[invalid-assignment]
         training_metrics: list[dict[str, float]] = []
+        trainer_started = time.monotonic()
         async for metrics in self.backend()._train_sft(
             self,
             trajectories,
@@ -963,6 +1013,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             verbose,
         ):
             training_metrics.append(metrics)
+        trainer_elapsed = time.monotonic() - trainer_started
 
         # Log aggregated training metrics once (same as RL)
         if training_metrics:
@@ -971,6 +1022,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
                 / sum(1 for d in training_metrics if k in d)
                 for k in {k for d in training_metrics for k in d}
             }
+            avg_metrics["time/step_trainer_s"] = trainer_elapsed
             # Get the current step after training
             step = await self.get_step()
-            self._log_metrics(avg_metrics, "train", step)
+            await self.log(trajectories=None, split="train", metrics=avg_metrics, step=step)
