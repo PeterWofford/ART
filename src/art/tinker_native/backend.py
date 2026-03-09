@@ -31,8 +31,7 @@ from .. import dev
 from ..backend import Backend
 from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
 from ..metrics_taxonomy import (
-    build_data_metrics_from_summary,
-    build_train_metrics_from_summary,
+    build_training_summary_metrics,
     rename_train_metric_key,
     summarize_trajectory_groups,
 )
@@ -224,8 +223,10 @@ class TinkerNativeBackend(Backend):
         )
 
         metrics: dict[str, float] = {
-            **build_data_metrics_from_summary(summary, include_trainable_groups=True),
-            **build_train_metrics_from_summary(summary),
+            **build_training_summary_metrics(
+                summary,
+                include_trainable_groups=True,
+            ),
             "data/step_num_datums": float(len(datums)),
         }
 

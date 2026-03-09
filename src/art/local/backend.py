@@ -42,8 +42,8 @@ from .. import dev
 from ..backend import AnyTrainableModel, Backend
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
-    build_data_metrics_from_summary,
-    build_train_metrics_from_summary,
+    average_metric_samples,
+    build_training_summary_metrics,
     rename_train_metrics,
     summarize_trajectory_groups,
 )
@@ -582,13 +582,7 @@ class LocalBackend(Backend):
             training_metrics.append(metrics)
 
         # Aggregate metrics
-        avg_metrics: dict[str, float] = {}
-        if training_metrics:
-            avg_metrics = {
-                k: sum(d.get(k, 0) for d in training_metrics)
-                / sum(1 for d in training_metrics if k in d)
-                for k in {k for d in training_metrics for k in d}
-            }
+        avg_metrics = average_metric_samples(training_metrics)
         summary = summarize_trajectory_groups(groups_list)
         avg_metrics.setdefault(
             "time/step_trainer_s", time.monotonic() - trainer_started
@@ -596,12 +590,10 @@ class LocalBackend(Backend):
         avg_metrics.update(
             {
                 key: value
-                for key, value in {
-                    **build_data_metrics_from_summary(
-                        summary, include_trainable_groups=True
-                    ),
-                    **build_train_metrics_from_summary(summary),
-                }.items()
+                for key, value in build_training_summary_metrics(
+                    summary,
+                    include_trainable_groups=True,
+                ).items()
                 if key not in avg_metrics
             }
         )
@@ -643,10 +635,10 @@ class LocalBackend(Backend):
             print("Packing tensors...")
 
         summary = summarize_trajectory_groups(trajectory_groups)
-        base_metrics = {
-            **build_data_metrics_from_summary(summary, include_trainable_groups=True),
-            **build_train_metrics_from_summary(summary),
-        }
+        base_metrics = build_training_summary_metrics(
+            summary,
+            include_trainable_groups=True,
+        )
 
         packed_tensors = self._get_packed_tensors(
             model,

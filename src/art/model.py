@@ -18,6 +18,7 @@ from .costs import CostCalculator
 from .metrics import MetricsBuilder
 from .metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
+    average_metric_samples,
     build_data_metrics_from_summary,
     build_train_metrics_from_summary,
     summarize_trajectory_groups,
@@ -973,13 +974,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         trainer_elapsed = time.monotonic() - trainer_started
 
         # 2. Calculate aggregated training metrics
-        avg_metrics: dict[str, float] = {}
-        if training_metrics:
-            avg_metrics = {
-                k: sum(d.get(k, 0) for d in training_metrics)
-                / sum(1 for d in training_metrics if k in d)
-                for k in {k for d in training_metrics for k in d}
-            }
+        avg_metrics = average_metric_samples(training_metrics)
         avg_metrics.setdefault("time/step_trainer_s", trainer_elapsed)
 
         # 3. Log trajectories and training metrics together (single wandb log call)
@@ -1024,11 +1019,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
         # Log aggregated training metrics once (same as RL)
         if training_metrics:
-            avg_metrics = {
-                k: sum(d.get(k, 0) for d in training_metrics)
-                / sum(1 for d in training_metrics if k in d)
-                for k in {k for d in training_metrics for k in d}
-            }
+            avg_metrics = average_metric_samples(training_metrics)
             avg_metrics["time/step_trainer_s"] = trainer_elapsed
             # Get the current step after training
             step = await self.get_step()

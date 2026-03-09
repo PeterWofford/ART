@@ -45,6 +45,18 @@ def rename_train_metrics(metrics: dict[str, float]) -> dict[str, float]:
     return {rename_train_metric_key(key): float(value) for key, value in metrics.items()}
 
 
+def average_metric_samples(metric_samples: Iterable[dict[str, float]]) -> dict[str, float]:
+    totals: dict[str, float] = {}
+    counts: dict[str, int] = {}
+
+    for sample in metric_samples:
+        for key, value in sample.items():
+            totals[key] = totals.get(key, 0.0) + float(value)
+            counts[key] = counts.get(key, 0) + 1
+
+    return {key: totals[key] / counts[key] for key in totals}
+
+
 @dataclass(frozen=True)
 class TrajectoryBatchSummary:
     num_scenarios: int
@@ -99,6 +111,20 @@ def build_train_metrics_from_summary(
         "train/num_groups_submitted": float(summary.num_groups_submitted),
         "train/num_groups_trainable": float(summary.num_groups_trainable),
         "train/num_trajectories": float(summary.num_trajectories),
+    }
+
+
+def build_training_summary_metrics(
+    summary: TrajectoryBatchSummary,
+    *,
+    include_trainable_groups: bool,
+) -> dict[str, float]:
+    return {
+        **build_data_metrics_from_summary(
+            summary,
+            include_trainable_groups=include_trainable_groups,
+        ),
+        **build_train_metrics_from_summary(summary),
     }
 
 
