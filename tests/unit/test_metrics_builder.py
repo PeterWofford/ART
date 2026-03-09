@@ -183,6 +183,24 @@ class TestMetricsBuilder:
         assert metrics["costs/all_cum"] == pytest.approx(3.0)
 
     @pytest.mark.asyncio
+    async def test_add_response_cost_uses_registered_pricing(self) -> None:
+        builder = MetricsBuilder(cost_context="eval")
+        builder.register_token_pricing(
+            "anthropic",
+            prompt_per_million=5.0,
+            completion_per_million=7.0,
+        )
+
+        cost = builder.add_response_cost(
+            "llm_judge/faithfulness",
+            {"usage": {"input_tokens": 40, "output_tokens": 60}},
+        )
+
+        metrics = await builder.flush()
+        assert cost == pytest.approx(0.00062)
+        assert metrics["costs/eval/llm_judge/faithfulness"] == pytest.approx(0.00062)
+
+    @pytest.mark.asyncio
     async def test_unique_scenario_count_tracks_exact_ids(self) -> None:
         builder = MetricsBuilder(cost_context="train")
         builder.add_data(scenario_ids=["s1", "s2", "s3"])
