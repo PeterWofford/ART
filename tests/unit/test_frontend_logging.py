@@ -588,6 +588,36 @@ class TestMetricCalculation:
         assert second["costs/train/prefill_cum"] == pytest.approx(1.0)
         assert second["costs/all_cum"] == pytest.approx(1.0)
 
+    @pytest.mark.asyncio
+    async def test_direct_time_and_data_metrics_get_cumulative_variants(
+        self, tmp_path: Path
+    ):
+        model = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        await model.log(
+            trajectories=None,
+            split="train",
+            step=1,
+            metrics={
+                "time/step_actor_s": 1.5,
+                "data/step_actor_tokens": 10,
+            },
+        )
+
+        history_path = tmp_path / "test/models/test/history.jsonl"
+        with open(history_path) as f:
+            entry = json.loads(f.readline())
+
+        assert entry["time/step_actor_s"] == pytest.approx(1.5)
+        assert entry["time/step_actor_s_cum"] == pytest.approx(1.5)
+        assert entry["data/step_actor_tokens"] == pytest.approx(10)
+        assert entry["data/step_actor_tokens_cum"] == pytest.approx(10)
+
 
 class TestWandbIntegration:
     """Test wandb integration logic (without mocking wandb itself)."""

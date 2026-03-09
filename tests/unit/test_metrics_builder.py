@@ -58,6 +58,27 @@ class TestMetricsBuilder:
         assert second["data/cum_num_unique_scenarios"] == 3
 
     @pytest.mark.asyncio
+    async def test_helper_metrics_accumulate_within_a_single_step(self) -> None:
+        builder = MetricsBuilder(cost_context="train")
+
+        builder.add_data(step_num_scenarios=2, step_actor_tokens=10)
+        builder.add_data(step_num_scenarios=3, step_actor_tokens=5)
+        builder.add_user_timing(step_wall_s=1.5, step_actor_s=0.3, step_eval_s=0.2)
+        builder.add_user_timing(step_wall_s=0.5, step_actor_s=0.2, step_eval_s=0.1)
+        builder.add_idle_times(step_trainer_idle_s=1.0, step_actor_idle_s=2.0)
+        builder.add_idle_times(step_trainer_idle_s=0.5, step_actor_idle_s=1.0)
+
+        metrics = await builder.flush(step=1)
+
+        assert metrics["data/step_num_scenarios"] == pytest.approx(5)
+        assert metrics["data/step_actor_tokens"] == pytest.approx(15)
+        assert metrics["time/step_wall_s"] == pytest.approx(2.0)
+        assert metrics["time/step_actor_s"] == pytest.approx(0.5)
+        assert metrics["time/step_eval_s"] == pytest.approx(0.3)
+        assert metrics["throughput/step_trainer_idle_s"] == pytest.approx(1.5)
+        assert metrics["throughput/step_actor_idle_s"] == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
     async def test_costs_all_generated_for_single_and_multiple_children(self) -> None:
         single = MetricsBuilder(cost_context="train")
         single.add_cost("train/gpu", usd=2.0)
@@ -126,6 +147,22 @@ class TestMetricsBuilder:
 
         metrics = await after.flush(step=2)
         assert metrics["costs/train_cum"] == pytest.approx(3.0)
+        assert metrics["costs/all_cum"] == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_loaded_state_is_shared_with_other_cost_contexts(self) -> None:
+        before = MetricsBuilder(cost_context="train")
+        before.add_cost("train/gpu", usd=1.0)
+        await before.flush(step=1)
+
+        after = MetricsBuilder(cost_context="train")
+        after.load_state_dict(before.state_dict())
+
+        eval_builder = after.for_cost_context("eval")
+        eval_builder.add_cost("eval/judge", usd=2.0)
+
+        metrics = await eval_builder.flush(step=2)
+        assert metrics["costs/eval/judge"] == pytest.approx(2.0)
         assert metrics["costs/all_cum"] == pytest.approx(3.0)
 
     @pytest.mark.asyncio
