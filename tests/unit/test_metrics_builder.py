@@ -15,7 +15,7 @@ class TestMetricsBuilder:
         builder.add_cost("train/tinker_inference", usd=0.45)
         builder.add_cost("eval/llm_judge/correctness", usd=0.06)
 
-        metrics = await builder.flush(step=1)
+        metrics = await builder.flush()
 
         assert metrics["costs/train/llm_judge"] == pytest.approx(0.12)
         assert metrics["costs/train"] == pytest.approx(1.77)
@@ -35,7 +35,7 @@ class TestMetricsBuilder:
             step_actor_tokens=10,
             scenario_ids=["a", "b"],
         )
-        first = await builder.flush(step=1)
+        first = await builder.flush()
 
         assert first["time/step_wall_s_cum"] == pytest.approx(1.5)
         assert first["time/step_actor_s_cum"] == pytest.approx(0.3)
@@ -49,7 +49,7 @@ class TestMetricsBuilder:
             step_actor_tokens=5,
             scenario_ids=["b", "c"],
         )
-        second = await builder.flush(step=2)
+        second = await builder.flush()
 
         assert second["time/step_wall_s_cum"] == pytest.approx(2.0)
         assert second["time/step_actor_s_cum"] == pytest.approx(0.5)
@@ -68,7 +68,7 @@ class TestMetricsBuilder:
         builder.add_idle_times(step_trainer_idle_s=1.0, step_actor_idle_s=2.0)
         builder.add_idle_times(step_trainer_idle_s=0.5, step_actor_idle_s=1.0)
 
-        metrics = await builder.flush(step=1)
+        metrics = await builder.flush()
 
         assert metrics["data/step_num_scenarios"] == pytest.approx(5)
         assert metrics["data/step_actor_tokens"] == pytest.approx(15)
@@ -88,7 +88,7 @@ class TestMetricsBuilder:
         builder.add_metric("data/step_actor_tokens", 10.0)
         builder.add_idle_times(step_trainer_idle_s=1.5, step_actor_idle_s=0.5)
 
-        metrics = await builder.flush(step=1)
+        metrics = await builder.flush()
 
         assert metrics["throughput/cum_trainer_idle_s"] == pytest.approx(1.5)
         assert metrics["throughput/cum_actor_idle_s"] == pytest.approx(0.5)
@@ -99,13 +99,13 @@ class TestMetricsBuilder:
     async def test_costs_all_generated_for_single_and_multiple_children(self) -> None:
         single = MetricsBuilder(cost_context="train")
         single.add_cost("train/gpu", usd=2.0)
-        one = await single.flush(step=1)
+        one = await single.flush()
         assert one["costs/all"] == pytest.approx(2.0)
 
         multi = MetricsBuilder(cost_context="train")
         multi.add_cost("train/gpu", usd=2.0)
         multi.add_cost("eval/llm_judge/correctness", usd=0.5)
-        two = await multi.flush(step=1)
+        two = await multi.flush()
         assert two["costs/all"] == pytest.approx(2.5)
 
     def test_leaf_parent_conflicts_raise(self) -> None:
@@ -125,7 +125,7 @@ class TestMetricsBuilder:
         builder.add_cost("train/gpu", usd=1.25)
         builder.add_cost("train/gpu", usd=0.75)
 
-        metrics = await builder.flush(step=1)
+        metrics = await builder.flush()
 
         assert metrics["costs/train/gpu"] == pytest.approx(2.0)
         assert metrics["costs/train"] == pytest.approx(2.0)
@@ -140,14 +140,14 @@ class TestMetricsBuilder:
     async def test_sparse_steps_omit_rollup_for_missing_costs(self) -> None:
         builder = MetricsBuilder(cost_context="train")
         builder.add_cost("train/gpu", usd=1.0)
-        first = await builder.flush(step=1)
+        first = await builder.flush()
         assert first["costs/train_cum"] == pytest.approx(1.0)
 
-        second = await builder.flush(step=2)
+        second = await builder.flush()
         assert not any(key.startswith("costs/") for key in second)
 
         builder.add_cost("train/gpu", usd=2.0)
-        third = await builder.flush(step=3)
+        third = await builder.flush()
         assert third["costs/train"] == pytest.approx(2.0)
         assert third["costs/train_cum"] == pytest.approx(3.0)
 
@@ -155,14 +155,14 @@ class TestMetricsBuilder:
     async def test_state_dict_round_trip_preserves_cumulative_state(self) -> None:
         before = MetricsBuilder(cost_context="train")
         before.add_cost("train/gpu", usd=1.0)
-        await before.flush(step=1)
+        await before.flush()
 
         state = before.state_dict()
         after = MetricsBuilder(cost_context="train")
         after.load_state_dict(state)
         after.add_cost("train/gpu", usd=2.0)
 
-        metrics = await after.flush(step=2)
+        metrics = await after.flush()
         assert metrics["costs/train_cum"] == pytest.approx(3.0)
         assert metrics["costs/all_cum"] == pytest.approx(3.0)
 
@@ -170,7 +170,7 @@ class TestMetricsBuilder:
     async def test_loaded_state_is_shared_with_other_cost_contexts(self) -> None:
         before = MetricsBuilder(cost_context="train")
         before.add_cost("train/gpu", usd=1.0)
-        await before.flush(step=1)
+        await before.flush()
 
         after = MetricsBuilder(cost_context="train")
         after.load_state_dict(before.state_dict())
@@ -178,7 +178,7 @@ class TestMetricsBuilder:
         eval_builder = after.for_cost_context("eval")
         eval_builder.add_cost("eval/judge", usd=2.0)
 
-        metrics = await eval_builder.flush(step=2)
+        metrics = await eval_builder.flush()
         assert metrics["costs/eval/judge"] == pytest.approx(2.0)
         assert metrics["costs/all_cum"] == pytest.approx(3.0)
 
@@ -186,11 +186,11 @@ class TestMetricsBuilder:
     async def test_unique_scenario_count_tracks_exact_ids(self) -> None:
         builder = MetricsBuilder(cost_context="train")
         builder.add_data(scenario_ids=["s1", "s2", "s3"])
-        first = await builder.flush(step=1)
+        first = await builder.flush()
         assert first["data/cum_num_unique_scenarios"] == 3
 
         builder.add_data(scenario_ids=["s2", "s4"])
-        second = await builder.flush(step=2)
+        second = await builder.flush()
         assert second["data/cum_num_unique_scenarios"] == 4
 
     @pytest.mark.asyncio
@@ -200,11 +200,11 @@ class TestMetricsBuilder:
         builder.add_metric("data/step_trainer_tokens", 20.0)
         builder.add_data(scenario_ids=["s1"])
 
-        first = await builder.flush(step=1)
+        first = await builder.flush()
         assert first["throughput/avg_trainer_tok_per_s"] == pytest.approx(10.0)
         assert first["data/cum_num_unique_scenarios"] == 1
 
-        second = await builder.flush(step=2)
+        second = await builder.flush()
         assert second == {}
 
     @pytest.mark.asyncio
@@ -217,7 +217,7 @@ class TestMetricsBuilder:
                 await asyncio.sleep(0)
 
         await asyncio.gather(*(worker() for _ in range(4)))
-        metrics = await builder.flush(step=1)
+        metrics = await builder.flush()
 
         assert metrics["costs/train/gpu"] == pytest.approx(10.0)
         assert metrics["costs/all"] == pytest.approx(10.0)

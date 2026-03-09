@@ -160,13 +160,6 @@ class MetricsBuilder:
         self._shared_state = (
             _shared_state if _shared_state is not None else _new_shared_metrics_state()
         )
-        self._lock = self._shared_state.lock
-        self._step_buffer = self._shared_state.step_buffer
-        self._cum_state = self._shared_state.cum_state
-        self._unique_scenario_ids = self._shared_state.unique_scenario_ids
-        self._pending_scenario_ids = self._shared_state.pending_scenario_ids
-        self._cost_extractors = self._shared_state.cost_extractors
-        self._token_pricing = self._shared_state.token_pricing
 
     def add_cost(self, path: str, usd: float) -> None:
         if not path:
@@ -190,7 +183,7 @@ class MetricsBuilder:
         if step_actor_tokens is not None:
             self.add_metric("data/step_actor_tokens", float(step_actor_tokens))
         if scenario_ids is not None:
-            self._pending_scenario_ids.update(
+            self._shared_state.pending_scenario_ids.update(
                 str(scenario_id) for scenario_id in scenario_ids
             )
 
@@ -228,15 +221,14 @@ class MetricsBuilder:
         finally:
             self.add_metric(key, time.monotonic() - started)
 
-    async def flush(self, step: int) -> dict[str, float]:
-        del step
-        async with self._lock:
+    async def flush(self) -> dict[str, float]:
+        async with self._shared_state.lock:
             self._validate_hierarchy()
 
-            result = dict(self._step_buffer)
+            result = dict(self._shared_state.step_buffer)
             cost_metrics = {
                 key: value
-                for key, value in self._step_buffer.items()
+                for key, value in self._shared_state.step_buffer.items()
                 if key.startswith("costs/")
             }
             result.update(self._compute_rollups(cost_metrics))
@@ -246,19 +238,21 @@ class MetricsBuilder:
                 if section not in _HIERARCHICAL_SECTIONS:
                     continue
                 cum_key = f"{key}_cum"
-                next_value = self._cum_state.get(cum_key, 0.0) + value
-                self._cum_state[cum_key] = next_value
+                next_value = self._shared_state.cum_state.get(cum_key, 0.0) + value
+                self._shared_state.cum_state[cum_key] = next_value
                 result[cum_key] = next_value
 
-            if self._pending_scenario_ids:
-                self._unique_scenario_ids.update(self._pending_scenario_ids)
+            if self._shared_state.pending_scenario_ids:
+                self._shared_state.unique_scenario_ids.update(
+                    self._shared_state.pending_scenario_ids
+                )
                 result["data/cum_num_unique_scenarios"] = float(
-                    len(self._unique_scenario_ids)
+                    len(self._shared_state.unique_scenario_ids)
                 )
 
             self._update_throughput_metrics(result)
-            self._step_buffer.clear()
-            self._pending_scenario_ids.clear()
+            self._shared_state.step_buffer.clear()
+            self._shared_state.pending_scenario_ids.clear()
             return result
 
     def activate(self) -> Token["MetricsBuilder"]:
@@ -293,7 +287,7 @@ class MetricsBuilder:
         normalized_provider = _normalize_provider(provider)
         if normalized_provider is None:
             raise ValueError("provider must be non-empty")
-        self._cost_extractors[normalized_provider] = extractor
+        self._shared_state.cost_extractors[normalized_provider] = extractor
 
     def register_token_pricing(
         self,
@@ -305,15 +299,15 @@ class MetricsBuilder:
         normalized_provider = _normalize_provider(provider)
         if normalized_provider is None:
             raise ValueError("provider must be non-empty")
-        self._token_pricing[normalized_provider] = TokenPricing(
+        self._shared_state.token_pricing[normalized_provider] = TokenPricing(
             prompt_per_million=float(prompt_per_million),
             completion_per_million=float(completion_per_million),
         )
 
     def state_dict(self) -> dict[str, Any]:
         return {
-            "cum_state": dict(self._cum_state),
-            "unique_scenario_ids": list(self._unique_scenario_ids),
+            "cum_state": dict(self._shared_state.cum_state),
+            "unique_scenario_ids": list(self._shared_state.unique_scenario_ids),
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -328,19 +322,13 @@ class MetricsBuilder:
         self._shared_state.unique_scenario_ids.update(restored_unique_ids)
         self._shared_state.pending_scenario_ids.clear()
 
-        # Keep local references aligned with the shared state so derived builders
-        # created before or after resume observe the same cumulative state.
-        self._cum_state = self._shared_state.cum_state
-        self._unique_scenario_ids = self._shared_state.unique_scenario_ids
-        self._pending_scenario_ids = self._shared_state.pending_scenario_ids
-
     def _validate_and_add(self, key: str, value: float) -> None:
         if key.endswith("_cum"):
             raise ValueError(
                 f"Metric key '{key}' ends with '_cum', which is reserved for cumulative metrics."
             )
 
-        for existing_key in self._step_buffer:
+        for existing_key in self._shared_state.step_buffer:
             if existing_key == key:
                 continue
             if existing_key.startswith(f"{key}/"):
@@ -352,10 +340,14 @@ class MetricsBuilder:
                     f"Cannot log '{key}' as a leaf: '{existing_key}' is already a leaf ancestor."
                 )
 
-        self._step_buffer[key] = self._step_buffer.get(key, 0.0) + value
+        self._shared_state.step_buffer[key] = (
+            self._shared_state.step_buffer.get(key, 0.0) + value
+        )
 
     def _validate_hierarchy(self) -> None:
-        keys = sorted(k for k in self._step_buffer if k.startswith("costs/"))
+        keys = sorted(
+            k for k in self._shared_state.step_buffer if k.startswith("costs/")
+        )
         for i, key in enumerate(keys):
             for other in keys[i + 1 :]:
                 if other.startswith(f"{key}/"):
@@ -396,16 +388,22 @@ class MetricsBuilder:
         for step_key, cum_key in _THROUGHPUT_IDLE_MAPPINGS.items():
             if step_key not in result:
                 continue
-            next_value = self._cum_state.get(cum_key, 0.0) + result[step_key]
-            self._cum_state[cum_key] = next_value
+            next_value = (
+                self._shared_state.cum_state.get(cum_key, 0.0) + result[step_key]
+            )
+            self._shared_state.cum_state[cum_key] = next_value
             result[cum_key] = next_value
 
         if (
             "data/step_trainer_tokens" in result
             or "time/step_trainer_s" in result
         ):
-            trainer_tokens = self._cum_state.get("data/step_trainer_tokens_cum")
-            trainer_seconds = self._cum_state.get("time/step_trainer_s_cum")
+            trainer_tokens = self._shared_state.cum_state.get(
+                "data/step_trainer_tokens_cum"
+            )
+            trainer_seconds = self._shared_state.cum_state.get(
+                "time/step_trainer_s_cum"
+            )
             if (
                 trainer_tokens is not None
                 and trainer_seconds is not None
@@ -416,8 +414,10 @@ class MetricsBuilder:
                 )
 
         if "data/step_actor_tokens" in result or "time/step_actor_s" in result:
-            actor_tokens = self._cum_state.get("data/step_actor_tokens_cum")
-            actor_seconds = self._cum_state.get("time/step_actor_s_cum")
+            actor_tokens = self._shared_state.cum_state.get(
+                "data/step_actor_tokens_cum"
+            )
+            actor_seconds = self._shared_state.cum_state.get("time/step_actor_s_cum")
             if (
                 actor_tokens is not None
                 and actor_seconds is not None
@@ -433,9 +433,9 @@ class MetricsBuilder:
         completion_price_per_million: float | None = None,
     ) -> TokenPricing:
         normalized_provider = _normalize_provider(provider) or _DEFAULT_PROVIDER
-        default_pricing = self._token_pricing.get(
+        default_pricing = self._shared_state.token_pricing.get(
             normalized_provider,
-            self._token_pricing[_DEFAULT_PROVIDER],
+            self._shared_state.token_pricing[_DEFAULT_PROVIDER],
         )
         return TokenPricing(
             prompt_per_million=(
@@ -460,7 +460,7 @@ class MetricsBuilder:
     ) -> float | None:
         provider_name = _normalize_provider(provider) or _detect_provider(response)
         if provider_name is not None:
-            custom_extractor = self._cost_extractors.get(provider_name)
+            custom_extractor = self._shared_state.cost_extractors.get(provider_name)
             if custom_extractor is not None:
                 custom_cost = custom_extractor(response)
                 if custom_cost is not None:

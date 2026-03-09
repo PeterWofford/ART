@@ -636,7 +636,7 @@ class Model(
                 metrics_without_costs = self._extract_non_cost_metrics(metrics, split)
                 if metrics_without_costs:
                     self._log_metrics(metrics_without_costs, split, step)
-                costs = await self._metrics_builder.flush(step)
+                costs = await self._metrics_builder.flush()
                 if costs:
                     self._log_metrics(costs, split, step)
                 self._persist_metrics_builder_state()
@@ -742,7 +742,7 @@ class Model(
         self._log_metrics(averages, split, step)
 
         # 4. Log cumulative costs
-        costs = await self._metrics_builder.flush(step)
+        costs = await self._metrics_builder.flush()
         if costs:
             self._log_metrics(costs, split, step)
         self._persist_metrics_builder_state()

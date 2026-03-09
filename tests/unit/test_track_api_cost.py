@@ -52,7 +52,7 @@ class TestTrackApiCost:
         finally:
             token.var.reset(token)
 
-        metrics = await builder.flush(step=1)
+        metrics = await builder.flush()
         assert metrics["costs/train/llm_judge/correctness"] == pytest.approx(0.0002)
 
     @pytest.mark.asyncio
@@ -74,7 +74,7 @@ class TestTrackApiCost:
         finally:
             token.var.reset(token)
 
-        metrics = await builder.flush(step=1)
+        metrics = await builder.flush()
         assert metrics["costs/train/llm_judge/faithfulness"] == pytest.approx(0.00062)
 
     @pytest.mark.asyncio
@@ -97,7 +97,7 @@ class TestTrackApiCost:
         finally:
             token.var.reset(token)
 
-        metrics = await builder.flush(step=1)
+        metrics = await builder.flush()
         assert metrics["costs/train/llm_judge/custom"] == pytest.approx(0.75)
 
     @pytest.mark.asyncio
@@ -129,7 +129,7 @@ class TestTrackApiCost:
         finally:
             token.var.reset(token)
 
-        metrics = await builder.flush(step=1)
+        metrics = await builder.flush()
         assert metrics["costs/eval/llm_judge/correctness"] == pytest.approx(0.0002)
 
 
