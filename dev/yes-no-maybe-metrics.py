@@ -238,19 +238,22 @@ async def main() -> None:
                 train_builder.add_data(
                     step_actor_tokens=total_actor_tokens(train_groups)
                 )
-                await model.train(
+                result = await backend.train(
+                    model,
                     train_groups,
-                    config=art.TrainConfig(learning_rate=learning_rate),
+                    learning_rate=learning_rate,
                 )
 
-            step = await model.get_step()
             await model.log(
-                trajectories=None,
                 split="train",
-                step=step,
-                metrics={"time/step_wall_s": time.monotonic() - step_started},
+                step=result.step,
+                trajectories=train_groups,
+                metrics={
+                    **result.metrics,
+                    "time/step_wall_s": time.monotonic() - step_started,
+                },
             )
-            print(f"step {step} complete")
+            print(f"step {result.step} complete")
 
         print_history_summary(model)
     finally:
