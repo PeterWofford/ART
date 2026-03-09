@@ -112,3 +112,10 @@ class TestMetricRoutingBaseline:
             (("costs/cum/train/prefill",), {"step_metric": "training_step"})
             in define_calls
         )
+        fake_run.log.assert_called_once()
+        logged_metrics = fake_run.log.call_args.args[0]
+        assert logged_metrics["costs/train/sample"] == 0.1
+        assert logged_metrics["costs/cum/train/prefill"] == 0.2
+        assert logged_metrics["training_step"] == 1
+        assert "time/wall_clock_sec" in logged_metrics
+        assert fake_run.log.call_args.kwargs == {"step": 1}

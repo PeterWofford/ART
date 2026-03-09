@@ -479,7 +479,10 @@ class Model(
         if should_log_wandb:
             if run := self._get_wandb_run():
                 self._define_wandb_step_metrics(prefixed.keys())
-                run.log(prefixed)
+                # Keep W&B's internal step aligned with ART's training_step so
+                # multiple log calls for the same training step do not inflate
+                # the run's step count.
+                run.log(prefixed, step=step)
 
     def _define_wandb_step_metrics(self, keys: Iterable[str]) -> None:
         import wandb
