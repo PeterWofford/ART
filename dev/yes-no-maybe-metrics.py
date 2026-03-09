@@ -2,7 +2,8 @@
 
 This keeps the same prompt family, rollout structure, and reward ordering as
 `dev/yes-no-maybe.py` while adding explicit metrics taxonomy instrumentation for
-actor/eval timing and data metrics.
+actor/eval timing and data metrics, while relying on LocalBackend for automatic
+step wall time and GPU cost logging.
 """
 
 from __future__ import annotations
@@ -217,7 +218,6 @@ async def main() -> None:
                 await model.log(val_groups, split="val", step=current_step)
 
             train_builder = model.metrics_builder("train")
-            step_started = time.monotonic()
             with train_builder.activate_context():
                 with train_builder.measure("time/step_actor_s"):
                     train_groups = await art.gather_trajectory_groups(
@@ -248,10 +248,7 @@ async def main() -> None:
                 split="train",
                 step=result.step,
                 trajectories=train_groups,
-                metrics={
-                    **result.metrics,
-                    "time/step_wall_s": time.monotonic() - step_started,
-                },
+                metrics=result.metrics,
             )
             print(f"step {result.step} complete")
 
