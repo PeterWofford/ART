@@ -646,6 +646,36 @@ class TestMetricCalculation:
         assert second["costs/all_cum"] == pytest.approx(1.0)
 
     @pytest.mark.asyncio
+    async def test_metrics_builder_loads_resume_state_before_builder_use(
+        self, tmp_path: Path
+    ):
+        model_1 = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+        model_1.metrics_builder().add_data(scenario_ids=["scenario-a"])
+        await model_1.log(trajectories=None, split="train", step=1, metrics={})
+
+        model_2 = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+        model_2.metrics_builder().add_data(scenario_ids=["scenario-b"])
+        await model_2.log(trajectories=None, split="train", step=2, metrics={})
+
+        history_path = tmp_path / "test/models/test/history.jsonl"
+        with open(history_path) as f:
+            first = json.loads(f.readline())
+            second = json.loads(f.readline())
+
+        assert first["data/cum_num_unique_scenarios"] == pytest.approx(1.0)
+        assert second["data/cum_num_unique_scenarios"] == pytest.approx(2.0)
+
+    @pytest.mark.asyncio
     async def test_direct_time_and_data_metrics_get_cumulative_variants(
         self, tmp_path: Path
     ):

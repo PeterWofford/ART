@@ -554,6 +554,7 @@ class Model(
         }
 
     def metrics_builder(self, cost_context: str | None = None) -> MetricsBuilder:
+        self._load_metrics_builder_state()
         if cost_context is None:
             return self._metrics_builder
         return self._metrics_builder.for_cost_context(cost_context)
