@@ -79,6 +79,23 @@ class TestMetricsBuilder:
         assert metrics["throughput/step_actor_idle_s"] == pytest.approx(3.0)
 
     @pytest.mark.asyncio
+    async def test_throughput_metrics_derive_from_time_and_token_cumulatives(self) -> None:
+        builder = MetricsBuilder(cost_context="train")
+
+        builder.add_metric("time/step_trainer_s", 4.0)
+        builder.add_metric("data/step_trainer_tokens", 40.0)
+        builder.add_metric("time/step_actor_s", 2.0)
+        builder.add_metric("data/step_actor_tokens", 10.0)
+        builder.add_idle_times(step_trainer_idle_s=1.5, step_actor_idle_s=0.5)
+
+        metrics = await builder.flush(step=1)
+
+        assert metrics["throughput/cum_trainer_idle_s"] == pytest.approx(1.5)
+        assert metrics["throughput/cum_actor_idle_s"] == pytest.approx(0.5)
+        assert metrics["throughput/avg_trainer_tok_per_s"] == pytest.approx(10.0)
+        assert metrics["throughput/avg_actor_tok_per_s"] == pytest.approx(5.0)
+
+    @pytest.mark.asyncio
     async def test_costs_all_generated_for_single_and_multiple_children(self) -> None:
         single = MetricsBuilder(cost_context="train")
         single.add_cost("train/gpu", usd=2.0)

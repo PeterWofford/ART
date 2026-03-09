@@ -225,8 +225,9 @@ class TestHistoryJsonlCompatibility:
         history_path = tmp_path / "test-project/models/test-model/history.jsonl"
         df = pl.read_ndjson(str(history_path))
 
-        # Should have 2 entries
-        assert len(df) == 2
+        # Each log call now emits the primary metrics row plus a taxonomy
+        # row for cumulative data/time metrics.
+        assert len(df) == 4
 
         # Check both splits are present
         columns = df.columns
@@ -505,6 +506,62 @@ class TestMetricCalculation:
         assert "train/reward" not in entry
         assert entry["reward/custom_score"] == 1.0
         assert entry["reward/prefixed"] == 2.0
+
+    @pytest.mark.asyncio
+    async def test_train_logs_add_default_data_metrics_from_trajectory_groups(
+        self, tmp_path: Path
+    ):
+        model = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        trajectories = [
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=0.8,
+                        messages_and_choices=[{"role": "user", "content": "a"}],
+                    ),
+                    Trajectory(
+                        reward=0.2,
+                        messages_and_choices=[{"role": "user", "content": "b"}],
+                    ),
+                ],
+                metadata={"scenario_scenario_id": "scenario-1"},
+            ),
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=0.5,
+                        messages_and_choices=[{"role": "user", "content": "c"}],
+                    )
+                ],
+                exceptions=[],
+                metadata={"scenario_scenario_id": "scenario-2"},
+            ),
+        ]
+
+        await model.log(trajectories, split="train", step=1)
+
+        history_path = tmp_path / "test/models/test/history.jsonl"
+        with open(history_path) as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+
+        merged: dict[str, float] = {}
+        for row in rows:
+            merged.update(row)
+
+        assert merged["data/step_num_scenarios"] == pytest.approx(2.0)
+        assert merged["data/step_num_trajectories"] == pytest.approx(3.0)
+        assert merged["data/step_num_groups_submitted"] == pytest.approx(2.0)
+        assert merged["data/step_num_groups_trainable"] == pytest.approx(1.0)
+        assert merged["data/cum_num_unique_scenarios"] == pytest.approx(2.0)
+        assert merged["train/num_groups_submitted"] == pytest.approx(2.0)
+        assert merged["train/num_groups_trainable"] == pytest.approx(1.0)
+        assert merged["train/num_trajectories"] == pytest.approx(3.0)
 
     @pytest.mark.asyncio
     async def test_costs_are_logged_in_hierarchical_taxonomy(self, tmp_path: Path):
@@ -798,13 +855,18 @@ class TestTrainSFTMetricsAggregation:
         with open(history_path) as f:
             lines = f.readlines()
 
-        assert len(lines) == 1, f"Expected 1 log entry, got {len(lines)}"
+        assert len(lines) == 2, f"Expected 2 log entries, got {len(lines)}"
 
-        # Verify metrics are aggregated (averaged)
-        entry = json.loads(lines[0])
-        assert entry["step"] == 1
-        assert entry["loss/train"] == pytest.approx(0.8)  # (1.0 + 0.8 + 0.6) / 3
-        assert entry["loss/grad_norm"] == pytest.approx(0.4)  # (0.5 + 0.4 + 0.3) / 3
+        entries = [json.loads(line) for line in lines]
+        merged: dict[str, float] = {}
+        for entry in entries:
+            merged.update(entry)
+
+        assert all(entry["step"] == 1 for entry in entries)
+        assert merged["loss/train"] == pytest.approx(0.8)  # (1.0 + 0.8 + 0.6) / 3
+        assert merged["loss/grad_norm"] == pytest.approx(0.4)  # (0.5 + 0.4 + 0.3) / 3
+        assert merged["time/step_trainer_s"] >= 0
+        assert merged["time/step_trainer_s_cum"] >= 0
 
     @pytest.mark.asyncio
     async def test_train_sft_single_step_increment(self, tmp_path: Path):
@@ -841,8 +903,8 @@ class TestTrainSFTMetricsAggregation:
         history_path = tmp_path / "test-project/models/test-sft-step/history.jsonl"
         df = pl.read_ndjson(str(history_path))
 
-        assert len(df) == 1, "Should have exactly 1 log entry"
-        assert df["step"][0] == 1, "Step should be 1 (single increment)"
+        assert len(df) == 2, "Should have exactly 2 log entries"
+        assert set(df["step"].to_list()) == {1}, "Step should be 1 (single increment)"
 
     @pytest.mark.asyncio
     async def test_train_sft_no_metrics_when_empty(self, tmp_path: Path):

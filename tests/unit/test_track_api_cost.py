@@ -308,3 +308,4 @@ class TestTrackApiCostIntegration:
             rows = [json.loads(line) for line in f if line.strip()]
 
         assert any("costs/eval/llm_judge/correctness" in row for row in rows)
+        assert any("time/step_eval_s" in row for row in rows)
