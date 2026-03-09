@@ -33,6 +33,7 @@ StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 COSTS_METRIC_PREFIX = "costs_"
 COSTS_TOTAL_KEY = f"{COSTS_METRIC_PREFIX}total"
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
+BUILDER_CUMULATIVE_PREFIXES = ("time/step_", "data/step_")
 METRIC_SECTIONS = frozenset(
     {
         "reward",
@@ -507,6 +508,9 @@ class Model(
                     self._metrics_builder.add_cost(
                         f"{cost_context}/{component}", numeric_value
                     )
+                continue
+            if metric.startswith(BUILDER_CUMULATIVE_PREFIXES):
+                self._metrics_builder.add_metric(metric, numeric_value)
                 continue
             non_cost_metrics[metric] = numeric_value
         return non_cost_metrics

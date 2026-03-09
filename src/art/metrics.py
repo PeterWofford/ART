@@ -164,7 +164,12 @@ class MetricsBuilder:
         if not path:
             raise ValueError("Cost path must be non-empty")
         full_key = f"costs/{path}"
-        self._validate_and_add(full_key, float(usd))
+        self.add_metric(full_key, float(usd))
+
+    def add_metric(self, key: str, value: float) -> None:
+        if "/" not in key:
+            raise ValueError("Metric key must include a section prefix")
+        self._validate_and_add(key, float(value))
 
     def add_data(
         self,
@@ -173,9 +178,9 @@ class MetricsBuilder:
         scenario_ids: list[str] | None = None,
     ) -> None:
         if step_num_scenarios is not None:
-            self._step_buffer["data/step_num_scenarios"] = float(step_num_scenarios)
+            self.add_metric("data/step_num_scenarios", float(step_num_scenarios))
         if step_actor_tokens is not None:
-            self._step_buffer["data/step_actor_tokens"] = float(step_actor_tokens)
+            self.add_metric("data/step_actor_tokens", float(step_actor_tokens))
         if scenario_ids is not None:
             self._unique_scenario_ids.update(scenario_ids)
 
@@ -186,11 +191,11 @@ class MetricsBuilder:
         step_eval_s: float | None = None,
     ) -> None:
         if step_wall_s is not None:
-            self._step_buffer["time/step_wall_s"] = float(step_wall_s)
+            self.add_metric("time/step_wall_s", float(step_wall_s))
         if step_actor_s is not None:
-            self._step_buffer["time/step_actor_s"] = float(step_actor_s)
+            self.add_metric("time/step_actor_s", float(step_actor_s))
         if step_eval_s is not None:
-            self._step_buffer["time/step_eval_s"] = float(step_eval_s)
+            self.add_metric("time/step_eval_s", float(step_eval_s))
 
     def add_idle_times(
         self,
@@ -198,11 +203,12 @@ class MetricsBuilder:
         step_actor_idle_s: float | None = None,
     ) -> None:
         if step_trainer_idle_s is not None:
-            self._step_buffer["throughput/step_trainer_idle_s"] = float(
-                step_trainer_idle_s
+            self.add_metric(
+                "throughput/step_trainer_idle_s",
+                float(step_trainer_idle_s),
             )
         if step_actor_idle_s is not None:
-            self._step_buffer["throughput/step_actor_idle_s"] = float(step_actor_idle_s)
+            self.add_metric("throughput/step_actor_idle_s", float(step_actor_idle_s))
 
     async def flush(self, step: int) -> dict[str, float]:
         del step
@@ -292,8 +298,18 @@ class MetricsBuilder:
     def load_state_dict(self, state: dict[str, Any]) -> None:
         raw_cum_state = state.get("cum_state", {})
         raw_unique_ids = state.get("unique_scenario_ids", [])
-        self._cum_state = {str(k): float(v) for k, v in raw_cum_state.items()}
-        self._unique_scenario_ids = {str(v) for v in raw_unique_ids}
+        restored_cum_state = {str(k): float(v) for k, v in raw_cum_state.items()}
+        restored_unique_ids = {str(v) for v in raw_unique_ids}
+
+        self._shared_state.cum_state.clear()
+        self._shared_state.cum_state.update(restored_cum_state)
+        self._shared_state.unique_scenario_ids.clear()
+        self._shared_state.unique_scenario_ids.update(restored_unique_ids)
+
+        # Keep local references aligned with the shared state so derived builders
+        # created before or after resume observe the same cumulative state.
+        self._cum_state = self._shared_state.cum_state
+        self._unique_scenario_ids = self._shared_state.unique_scenario_ids
 
     def _validate_and_add(self, key: str, value: float) -> None:
         if key.endswith("_cum"):
