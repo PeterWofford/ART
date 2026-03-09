@@ -17,8 +17,15 @@ class _OpenAIUsage:
 
 
 class _OpenAIResponse:
-    def __init__(self, prompt_tokens: int, completion_tokens: int) -> None:
+    def __init__(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        *,
+        model: str | None = None,
+    ) -> None:
         self.usage = _OpenAIUsage(prompt_tokens, completion_tokens)
+        self.model = model
 
 
 class _AnthropicUsage:
@@ -28,8 +35,15 @@ class _AnthropicUsage:
 
 
 class _AnthropicResponse:
-    def __init__(self, input_tokens: int, output_tokens: int) -> None:
+    def __init__(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        model: str | None = None,
+    ) -> None:
         self.usage = _AnthropicUsage(input_tokens, output_tokens)
+        self.model = model
 
 
 class TestTrackApiCost:
@@ -56,15 +70,18 @@ class TestTrackApiCost:
         assert metrics["costs/train/llm_judge/correctness"] == pytest.approx(0.0002)
 
     @pytest.mark.asyncio
-    async def test_anthropic_cost_extraction_uses_registered_pricing(self) -> None:
+    async def test_anthropic_cost_extraction_uses_registered_model_pricing(self) -> None:
         builder = MetricsBuilder(cost_context="train")
-        builder.register_token_pricing(
-            "anthropic",
+        builder.register_model_pricing(
+            "anthropic/test-judge",
             prompt_per_million=5.0,
             completion_per_million=7.0,
         )
 
-        @track_api_cost(source="llm_judge/faithfulness")
+        @track_api_cost(
+            source="llm_judge/faithfulness",
+            model_name="anthropic/test-judge",
+        )
         async def _judge() -> _AnthropicResponse:
             return _AnthropicResponse(input_tokens=40, output_tokens=60)
 
@@ -76,6 +93,21 @@ class TestTrackApiCost:
 
         metrics = await builder.flush()
         assert metrics["costs/train/llm_judge/faithfulness"] == pytest.approx(0.00062)
+
+    @pytest.mark.asyncio
+    async def test_decorator_fails_fast_without_model_aware_pricing(self) -> None:
+        builder = MetricsBuilder(cost_context="train")
+
+        @track_api_cost(source="llm_judge/missing_pricing", provider="openai")
+        async def _judge() -> _OpenAIResponse:
+            return _OpenAIResponse(prompt_tokens=10, completion_tokens=20)
+
+        token = builder.activate()
+        try:
+            with pytest.raises(ValueError, match="model-aware pricing"):
+                await _judge()
+        finally:
+            token.var.reset(token)
 
     @pytest.mark.asyncio
     async def test_custom_extractor_takes_precedence(self) -> None:

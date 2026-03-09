@@ -25,8 +25,7 @@ class _Response:
 @track_api_cost(
     source="llm_judge/decorator_demo",
     provider="openai",
-    prompt_price_per_million=1.0,
-    completion_price_per_million=2.0,
+    model_name="openai/gpt-oss-20b",
 )
 async def _mock_judge_call(step: int) -> _Response:
     return _Response(

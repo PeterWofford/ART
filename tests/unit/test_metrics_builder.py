@@ -183,17 +183,20 @@ class TestMetricsBuilder:
         assert metrics["costs/cum/all"] == pytest.approx(3.0)
 
     @pytest.mark.asyncio
-    async def test_add_response_cost_uses_registered_pricing(self) -> None:
+    async def test_add_response_cost_uses_registered_model_pricing(self) -> None:
         builder = MetricsBuilder(cost_context="eval")
-        builder.register_token_pricing(
-            "anthropic",
+        builder.register_model_pricing(
+            "anthropic/test-judge",
             prompt_per_million=5.0,
             completion_per_million=7.0,
         )
 
         cost = builder.add_response_cost(
             "llm_judge/faithfulness",
-            {"usage": {"input_tokens": 40, "output_tokens": 60}},
+            {
+                "model": "anthropic/test-judge",
+                "usage": {"input_tokens": 40, "output_tokens": 60},
+            },
         )
 
         metrics = await builder.flush()

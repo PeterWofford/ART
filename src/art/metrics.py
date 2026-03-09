@@ -8,8 +8,8 @@ import time
 from typing import Any
 
 from .metrics_api_cost import (
-    DEFAULT_TOKEN_PRICING,
     CostExtractor,
+    ModelNameGetter,
     TokenPricing,
     extract_api_cost,
     normalize_provider,
@@ -51,7 +51,7 @@ class _SharedMetricsState:
     unique_scenario_ids: set[str]
     pending_scenario_ids: set[str]
     cost_extractors: dict[str, CostExtractor]
-    token_pricing: dict[str, TokenPricing]
+    model_pricing: dict[str, TokenPricing]
 
 
 def _new_shared_metrics_state() -> _SharedMetricsState:
@@ -62,7 +62,7 @@ def _new_shared_metrics_state() -> _SharedMetricsState:
         unique_scenario_ids=set(),
         pending_scenario_ids=set(),
         cost_extractors={},
-        token_pricing=dict(DEFAULT_TOKEN_PRICING),
+        model_pricing={},
     )
 
 
@@ -95,6 +95,8 @@ class MetricsBuilder:
         response: Any,
         *,
         provider: str | None = None,
+        model_name: str | None = None,
+        model_name_getter: "ModelNameGetter | None" = None,
         prompt_price_per_million: float | None = None,
         completion_price_per_million: float | None = None,
     ) -> float | None:
@@ -105,10 +107,12 @@ class MetricsBuilder:
         cost = extract_api_cost(
             response,
             provider=provider,
+            model_name=model_name,
+            model_name_getter=model_name_getter,
             prompt_price_per_million=prompt_price_per_million,
             completion_price_per_million=completion_price_per_million,
             cost_extractors=self._shared_state.cost_extractors,
-            token_pricing=self._shared_state.token_pricing,
+            model_pricing=self._shared_state.model_pricing,
         )
         if cost is None:
             return None
@@ -238,17 +242,17 @@ class MetricsBuilder:
             raise ValueError("provider must be non-empty")
         self._shared_state.cost_extractors[normalized_provider] = extractor
 
-    def register_token_pricing(
+    def register_model_pricing(
         self,
-        provider: str,
+        model_name: str,
         *,
         prompt_per_million: float,
         completion_per_million: float,
     ) -> None:
-        normalized_provider = normalize_provider(provider)
-        if normalized_provider is None:
-            raise ValueError("provider must be non-empty")
-        self._shared_state.token_pricing[normalized_provider] = TokenPricing(
+        normalized_model_name = model_name.strip()
+        if not normalized_model_name:
+            raise ValueError("model_name must be non-empty")
+        self._shared_state.model_pricing[normalized_model_name] = TokenPricing(
             prompt_per_million=float(prompt_per_million),
             completion_per_million=float(completion_per_million),
         )

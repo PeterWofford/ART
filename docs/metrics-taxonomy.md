@@ -105,12 +105,11 @@ from art.metrics import track_api_cost
 @track_api_cost(
     source="llm_judge/correctness",
     provider="openai",
-    prompt_price_per_million=1.0,
-    completion_price_per_million=2.0,
+    model_name="openai/gpt-oss-20b",
 )
 async def run_judge(client, messages):
     return await client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-oss-20b",
         messages=messages,
     )
 ```
@@ -137,15 +136,24 @@ The next `model.log(...)` flush for that step will include:
 - hierarchical rollups like `costs/train`, `costs/all`
 - cumulative keys like `costs/cum/all`
 
-Built-in providers:
+Built-in usage extraction:
 
 - OpenAI usage (`prompt_tokens`, `completion_tokens`)
 - Anthropic usage (`input_tokens`, `output_tokens`)
 
-You can override pricing per decorator call or configure builder-level defaults:
+Pricing is model-aware by default. ART will use the configured model pricing from
+`art.costs.MODEL_PRICING` when it can resolve a concrete model name, and it
+raises instead of guessing when pricing is missing.
+
+You can still override pricing per decorator call or register model-specific
+pricing on the builder:
 
 ```python
 builder = model.metrics_builder()
-builder.register_token_pricing("openai", prompt_per_million=1.2, completion_per_million=4.8)
+builder.register_model_pricing(
+    "anthropic/my-custom-judge",
+    prompt_per_million=1.2,
+    completion_per_million=4.8,
+)
 builder.register_cost_extractor("openai", lambda response: 0.001)  # optional custom extractor
 ```
