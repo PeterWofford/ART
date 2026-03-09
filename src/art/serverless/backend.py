@@ -256,7 +256,6 @@ class ServerlessBackend(Backend):
                 k: sum(d.get(k, 0) for d in training_metrics)
                 / sum(1 for d in training_metrics if k in d)
                 for k in {k for d in training_metrics for k in d}
-                if k != TRAIN_GRADIENT_STEPS_KEY
             }
         summary = summarize_trajectory_groups(groups_list)
         avg_metrics.setdefault(

@@ -972,7 +972,6 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
                 k: sum(d.get(k, 0) for d in training_metrics)
                 / sum(1 for d in training_metrics if k in d)
                 for k in {k for d in training_metrics for k in d}
-                if k != TRAIN_GRADIENT_STEPS_KEY
             }
         avg_metrics.setdefault("time/step_trainer_s", trainer_elapsed)
 

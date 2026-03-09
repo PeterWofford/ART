@@ -17,6 +17,8 @@ import polars as pl
 import pytest
 
 from art import Model, TrainableModel, Trajectory, TrajectoryGroup
+from art.local.backend import LocalBackend
+from art.metrics_taxonomy import TRAIN_GRADIENT_STEPS_KEY
 from art.utils.trajectory_logging import read_trajectory_groups_parquet
 
 
@@ -965,3 +967,92 @@ class TestTrainSFTMetricsAggregation:
         assert not history_path.exists(), (
             "No history.jsonl should be created for empty training"
         )
+
+
+class TestGradientStepMetrics:
+    @pytest.mark.asyncio
+    async def test_model_train_logs_gradient_step_count(self, tmp_path: Path):
+        model = TrainableModel(
+            name="test-train",
+            project="test-project",
+            base_model="gpt-4",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        async def mock_train_model(*args, **kwargs):
+            for loss in (1.0, 0.8, 0.6):
+                yield {
+                    "loss/train": loss,
+                    TRAIN_GRADIENT_STEPS_KEY: 3.0,
+                }
+
+        mock_backend = MagicMock()
+        mock_backend._train_model = mock_train_model
+        mock_backend._get_step = AsyncMock(return_value=1)
+        model._backend = mock_backend
+
+        groups = [
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=1.0,
+                        messages_and_choices=[
+                            {"role": "user", "content": "hello"},
+                            {"role": "assistant", "content": "hi"},
+                        ],
+                    )
+                ]
+            )
+        ]
+
+        await model.train(groups)
+
+        history_path = tmp_path / "test-project/models/test-train/history.jsonl"
+        rows = [json.loads(line) for line in history_path.open() if line.strip()]
+        merged: dict[str, float] = {}
+        for row in rows:
+            merged.update(row)
+
+        assert merged[TRAIN_GRADIENT_STEPS_KEY] == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_local_backend_train_returns_gradient_step_count(
+        self, tmp_path: Path
+    ):
+        model = TrainableModel(
+            name="test-backend-train",
+            project="test-project",
+            base_model="gpt-4",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+        backend = LocalBackend(path=str(tmp_path))
+
+        async def mock_train_model(*args, **kwargs):
+            for loss in (1.0, 0.8):
+                yield {
+                    "loss/train": loss,
+                    TRAIN_GRADIENT_STEPS_KEY: 2.0,
+                }
+
+        backend._train_model = mock_train_model  # type: ignore[method-assign]
+        backend._get_step = AsyncMock(return_value=1)  # type: ignore[method-assign]
+
+        groups = [
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=1.0,
+                        messages_and_choices=[
+                            {"role": "user", "content": "hello"},
+                            {"role": "assistant", "content": "hi"},
+                        ],
+                    )
+                ]
+            )
+        ]
+
+        result = await backend.train(model, groups, save_checkpoint=False)
+
+        assert result.metrics[TRAIN_GRADIENT_STEPS_KEY] == pytest.approx(2.0)
