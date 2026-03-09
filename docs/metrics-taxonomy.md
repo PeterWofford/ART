@@ -47,6 +47,44 @@ ART rolls costs up automatically:
 - parent rollups (for example `costs/train`, `costs/all`)
 - cumulative keys with `_cum` suffix (for example `costs/all_cum`)
 
+## Metrics Added By ART
+
+ART now emits the following metrics from library internals where the data is available:
+
+- `reward/*` aggregates from `model.log(..., split="train")`
+- `loss/*` from trainer backends
+- `time/wall_clock_sec` and `training_step` on every logged row
+- `time/step_trainer_s` for training calls
+- `time/step_wall_s`, `time/step_actor_s`, `time/step_eval_s` from `PipelineTrainer`
+- `data/step_num_scenarios`, `data/step_num_trajectories`, `data/step_num_groups_submitted`
+- `data/step_num_groups_trainable` for train splits
+- `data/cum_num_unique_scenarios` when scenario IDs are present in group or trajectory metadata
+- `data/step_trainer_tokens` where the backend knows the trainer token count
+- `throughput/cum_trainer_idle_s`, `throughput/cum_actor_idle_s`
+- `throughput/avg_trainer_tok_per_s`, `throughput/avg_actor_tok_per_s` when both token and time inputs are available
+
+Some metrics remain user-owned because ART cannot infer them reliably for every workflow, especially actor token usage outside the pipeline trainer.
+
+## User Helpers
+
+Use the builder helpers for step-level metrics that only user code can know:
+
+```python
+builder = model.metrics_builder()
+
+with builder.measure("time/step_actor_s"):
+    result = await run_rollouts()
+
+builder.add_data(
+    step_actor_tokens=result.actor_tokens,
+    scenario_ids=result.scenario_ids,
+)
+
+builder.add_idle_times(step_actor_idle_s=result.actor_idle_s)
+```
+
+If these metrics are logged before the next `model.log(...)` flush, ART will also emit the cumulative and derived throughput metrics automatically.
+
 ## End-to-End Smoke Test
 
 Run:
