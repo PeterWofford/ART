@@ -578,6 +578,25 @@ class Model(
             {METRICS_BUILDER_STATE_KEY: self._metrics_builder.state_dict()}
         )
 
+    def _normalize_trajectory_groups(
+        self,
+        trajectories: Iterable[Trajectory | BaseException] | Iterable[TrajectoryGroup],
+    ) -> list[TrajectoryGroup]:
+        items = list(trajectories)
+        if not items:
+            return []
+
+        if all(isinstance(item, TrajectoryGroup) for item in items):
+            return cast(list[TrajectoryGroup], items)
+
+        if all(isinstance(item, (Trajectory, BaseException)) for item in items):
+            return [TrajectoryGroup(cast(Iterable[Trajectory | BaseException], items))]
+
+        raise TypeError(
+            "trajectories must be an iterable of TrajectoryGroup objects or "
+            "an iterable of Trajectory/BaseException items"
+        )
+
     async def log(
         self,
         trajectories: (
@@ -622,17 +641,7 @@ class Model(
                 self._persist_metrics_builder_state()
             return
 
-        # Convert to list[TrajectoryGroup]
-        if any(isinstance(t, Trajectory) for t in trajectories) or any(
-            isinstance(t, BaseException) for t in trajectories
-        ):
-            trajectory_groups = [
-                TrajectoryGroup(
-                    cast(Iterable[Trajectory | BaseException], trajectories)
-                )
-            ]
-        else:
-            trajectory_groups = cast(list[TrajectoryGroup], list(trajectories))
+        trajectory_groups = self._normalize_trajectory_groups(trajectories)
 
         default_train_metrics = self._add_default_step_metrics(
             trajectory_groups,
@@ -676,13 +685,11 @@ class Model(
                     if metric not in group_metrics:
                         group_metrics[metric] = []
                     group_metrics[metric].append(float(value))
-            for trajectory in group:
-                if isinstance(trajectory, BaseException):
-                    all_metrics[exception_rate_key].append(1)
-                    continue
-                else:
-                    all_metrics[exception_rate_key].append(0)
-                # Add reward metric
+
+            all_metrics[exception_rate_key].extend(0.0 for _ in group.trajectories)
+            all_metrics[exception_rate_key].extend(1.0 for _ in group.exceptions)
+
+            for trajectory in group.trajectories:
                 all_metrics[reward_key].append(trajectory.reward)
 
                 # Collect other custom metrics

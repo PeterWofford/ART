@@ -471,6 +471,65 @@ class TestMetricCalculation:
         assert entry["val/exception_rate"] == 0.0
 
     @pytest.mark.asyncio
+    async def test_exception_rate_counts_group_exceptions(self, tmp_path: Path):
+        model = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        trajectory_groups = [
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=0.5,
+                        messages_and_choices=[{"role": "user", "content": "test"}],
+                    )
+                ],
+                exceptions=[ValueError("boom")],
+            )
+        ]
+
+        await model.log(trajectory_groups, split="val")
+
+        history_path = tmp_path / "test/models/test/history.jsonl"
+        with open(history_path) as f:
+            entry = json.loads(f.readline())
+
+        assert entry["val/exception_rate"] == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_generator_of_trajectories_is_consumed_once(self, tmp_path: Path):
+        model = Model(
+            name="test",
+            project="test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        def trajectories():
+            yield Trajectory(
+                reward=1.0,
+                metrics={"custom": 1.0},
+                messages_and_choices=[{"role": "user", "content": "first"}],
+            )
+            yield Trajectory(
+                reward=3.0,
+                metrics={"custom": 3.0},
+                messages_and_choices=[{"role": "user", "content": "second"}],
+            )
+
+        await model.log(trajectories(), split="val")
+
+        history_path = tmp_path / "test/models/test/history.jsonl"
+        with open(history_path) as f:
+            entry = json.loads(f.readline())
+
+        assert entry["val/reward"] == pytest.approx(2.0)
+        assert entry["val/custom"] == pytest.approx(2.0)
+
+    @pytest.mark.asyncio
     async def test_train_trajectory_metrics_default_to_reward_prefix(
         self, tmp_path: Path
     ):
