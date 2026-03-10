@@ -9,9 +9,9 @@ from typing import Any
 
 from .api_costs import (
     CostExtractor,
-    ModelNameGetter,
     TokenPricing,
     extract_api_cost,
+    normalize_model_name,
     normalize_provider,
 )
 
@@ -94,9 +94,8 @@ class MetricsBuilder:
         source: str,
         response: Any,
         *,
-        provider: str | None = None,
-        model_name: str | None = None,
-        model_name_getter: "ModelNameGetter | None" = None,
+        provider: str,
+        model_name: str,
         prompt_price_per_million: float | None = None,
         completion_price_per_million: float | None = None,
         cached_prompt_price_per_million: float | None = None,
@@ -111,7 +110,6 @@ class MetricsBuilder:
             response,
             provider=provider,
             model_name=model_name,
-            model_name_getter=model_name_getter,
             prompt_price_per_million=prompt_price_per_million,
             completion_price_per_million=completion_price_per_million,
             cached_prompt_price_per_million=cached_prompt_price_per_million,
@@ -256,7 +254,7 @@ class MetricsBuilder:
         cache_creation_per_million: float | None = None,
         cache_read_per_million: float | None = None,
     ) -> None:
-        normalized_model_name = model_name.strip()
+        normalized_model_name = normalize_model_name(model_name)
         if not normalized_model_name:
             raise ValueError("model_name must be non-empty")
         self._shared_state.model_pricing[normalized_model_name] = TokenPricing(

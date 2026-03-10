@@ -130,8 +130,10 @@ Built-in usage extraction:
 - Anthropic usage (`input_tokens`, `output_tokens`)
 
 Pricing is model-aware by default. ART will use the configured model pricing from
-`art.costs.MODEL_PRICING` when it can resolve a concrete model name, and it
-raises instead of guessing when pricing is missing.
+`art.costs.MODEL_PRICING` and `art.api_costs.MODEL_TOKEN_PRICING` for an exact
+`model_name` match, and it raises instead of guessing when pricing is missing.
+`provider` and `model_name` are required on `@track_api_cost`; ART no longer
+infers them from the response payload.
 
 You can still override pricing per decorator call or register model-specific
 pricing on the builder:

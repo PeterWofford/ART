@@ -4,7 +4,6 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import wraps
 from inspect import iscoroutinefunction
-import re
 from typing import Any, ParamSpec, TypeVar
 
 from .costs import get_model_pricing, tokens_to_cost
@@ -16,7 +15,6 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 CostExtractor = Callable[[Any], float | None]
-ModelNameGetter = Callable[[Any], str | None]
 ResponseGetter = Callable[[Any], Any]
 
 
@@ -44,7 +42,7 @@ class _AnthropicTokenUsage:
     cache_read_input_tokens: float
 
 
-_DEFAULT_TOKEN_PRICING: dict[str, TokenPricing] = {
+MODEL_TOKEN_PRICING: dict[str, TokenPricing] = {
     "openai/gpt-4.1": TokenPricing(
         prompt_per_million=2.0,
         completion_per_million=8.0,
@@ -59,8 +57,8 @@ _DEFAULT_TOKEN_PRICING: dict[str, TokenPricing] = {
 }
 
 
-def _default_token_pricing(model_name: str) -> TokenPricing | None:
-    explicit = _DEFAULT_TOKEN_PRICING.get(model_name)
+def _configured_token_pricing(model_name: str) -> TokenPricing | None:
+    explicit = MODEL_TOKEN_PRICING.get(model_name)
     if explicit is not None:
         return explicit
 
@@ -71,6 +69,7 @@ def _default_token_pricing(model_name: str) -> TokenPricing | None:
         prompt_per_million=pricing.prefill,
         completion_per_million=pricing.sample,
     )
+
 
 def normalize_provider(provider: str | None) -> str | None:
     if provider is None:
@@ -111,17 +110,6 @@ def _response_usage(response: Any) -> Any:
     if isinstance(response, dict):
         return response.get("usage")
     return getattr(response, "usage", None)
-
-
-def _response_model_name(response: Any) -> str | None:
-    if isinstance(response, dict):
-        value = response.get("model")
-    else:
-        value = getattr(response, "model", None)
-    if value is None:
-        return None
-    normalized = str(value).strip()
-    return normalized or None
 
 
 def _extract_openai_token_counts(response: Any) -> _OpenAITokenUsage | None:
@@ -168,24 +156,6 @@ def _extract_anthropic_token_counts(response: Any) -> _AnthropicTokenUsage | Non
         cache_creation_input_tokens=cache_creation_input_tokens,
         cache_read_input_tokens=cache_read_input_tokens,
     )
-
-
-def _detect_provider(response: Any) -> str | None:
-    usage = _response_usage(response)
-    if usage is None:
-        return None
-
-    if (
-        _read_usage_field(usage, "prompt_tokens") is not None
-        or _read_usage_field(usage, "completion_tokens") is not None
-    ):
-        return OPENAI_PROVIDER
-    if (
-        _read_usage_field(usage, "input_tokens") is not None
-        or _read_usage_field(usage, "output_tokens") is not None
-    ):
-        return ANTHROPIC_PROVIDER
-    return None
 
 
 def _estimate_openai_cost(
@@ -250,7 +220,7 @@ def _estimate_anthropic_cost(
 
 
 def _estimate_provider_cost(
-    provider_name: str | None,
+    provider_name: str,
     response: Any,
     pricing: TokenPricing,
 ) -> float | None:
@@ -260,40 +230,8 @@ def _estimate_provider_cost(
         return _estimate_anthropic_cost(
             _extract_anthropic_token_counts(response),
             pricing,
-        )
+    )
     return None
-
-
-def _strip_snapshot_suffix(model_name: str) -> str:
-    for pattern in (
-        r"^(.*)-\d{4}-\d{2}-\d{2}$",
-        r"^(.*)-\d{8}$",
-    ):
-        match = re.match(pattern, model_name)
-        if match is not None:
-            return match.group(1)
-    return model_name
-
-
-def _candidate_model_names(
-    normalized_model_name: str,
-    *,
-    provider: str | None,
-) -> list[str]:
-    candidates: list[str] = []
-
-    def _append(candidate: str | None) -> None:
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
-
-    _append(normalized_model_name)
-    _append(_strip_snapshot_suffix(normalized_model_name))
-
-    if provider is not None and "/" not in normalized_model_name:
-        _append(f"{provider}/{normalized_model_name}")
-        _append(f"{provider}/{_strip_snapshot_suffix(normalized_model_name)}")
-
-    return candidates
 
 
 def _resolve_registered_or_default_pricing(
@@ -304,7 +242,7 @@ def _resolve_registered_or_default_pricing(
     registered = model_pricing.get(model_name)
     if registered is not None:
         return registered
-    return _default_token_pricing(model_name)
+    return _configured_token_pricing(model_name)
 
 
 def _merge_token_pricing(
@@ -345,52 +283,19 @@ def _merge_token_pricing(
     )
 
 
-def _resolve_model_name(
-    response: Any,
-    *,
-    provider: str | None,
-    model_name: str | None,
-    model_name_getter: ModelNameGetter | None,
-    model_pricing: Mapping[str, TokenPricing],
-) -> str | None:
-    explicit_model_name = model_name.strip() if model_name is not None else None
-    if explicit_model_name:
-        candidate = explicit_model_name
-    elif model_name_getter is not None:
-        candidate = model_name_getter(response)
-    else:
-        candidate = _response_model_name(response)
-
-    if candidate is None:
+def normalize_model_name(model_name: str | None) -> str | None:
+    if model_name is None:
         return None
-
-    normalized_model_name = str(candidate).strip()
-    if not normalized_model_name:
+    normalized = model_name.strip()
+    if not normalized:
         return None
-
-    normalized_provider = normalize_provider(provider)
-    candidates = _candidate_model_names(
-        normalized_model_name,
-        provider=normalized_provider,
-    )
-    for candidate in candidates:
-        if _resolve_registered_or_default_pricing(
-            candidate,
-            model_pricing=model_pricing,
-        ) is not None:
-            return candidate
-
-    if normalized_provider is not None and "/" not in normalized_model_name:
-        return f"{normalized_provider}/{normalized_model_name}"
-    return normalized_model_name
+    return normalized
 
 
 def _resolve_token_pricing(
-    response: Any,
     *,
-    provider: str | None,
-    model_name: str | None,
-    model_name_getter: ModelNameGetter | None,
+    provider: str,
+    model_name: str,
     prompt_price_per_million: float | None,
     completion_price_per_million: float | None,
     cached_prompt_price_per_million: float | None,
@@ -424,36 +329,22 @@ def _resolve_token_pricing(
         else None
     )
 
-    resolved_model_name = _resolve_model_name(
-        response,
-        provider=provider,
-        model_name=model_name,
-        model_name_getter=model_name_getter,
-        model_pricing=model_pricing,
-    )
-    if resolved_model_name is None:
-        if explicit_prompt_price is not None and explicit_completion_price is not None:
-            return TokenPricing(
-                prompt_per_million=explicit_prompt_price,
-                completion_per_million=explicit_completion_price,
-                cached_prompt_per_million=explicit_cached_prompt_price,
-                cache_creation_per_million=explicit_cache_creation_price,
-                cache_read_per_million=explicit_cache_read_price,
-            )
-        raise ValueError(
-            "API cost tracking requires model-aware pricing. "
-            "Provide both explicit token prices or supply a model_name "
-            "(or response.model / model_name_getter) with configured pricing."
-        )
+    if normalize_provider(provider) is None:
+        raise ValueError("provider must be non-empty")
+
+    normalized_model_name = normalize_model_name(model_name)
+    if normalized_model_name is None:
+        raise ValueError("model_name must be non-empty")
 
     configured_pricing = _resolve_registered_or_default_pricing(
-        resolved_model_name,
+        normalized_model_name,
         model_pricing=model_pricing,
     )
     if configured_pricing is None:
         raise ValueError(
-            f"No pricing configured for model '{resolved_model_name}'. "
-            "Provide explicit token prices or register model pricing."
+            f"No pricing configured for model '{normalized_model_name}'. "
+            "Add it to art.api_costs.MODEL_TOKEN_PRICING, art.costs.MODEL_PRICING, "
+            "or register it with MetricsBuilder.register_model_pricing()."
         )
 
     return _merge_token_pricing(
@@ -469,9 +360,8 @@ def _resolve_token_pricing(
 def extract_api_cost(
     response: Any,
     *,
-    provider: str | None,
-    model_name: str | None,
-    model_name_getter: ModelNameGetter | None,
+    provider: str,
+    model_name: str,
     prompt_price_per_million: float | None,
     completion_price_per_million: float | None,
     cached_prompt_price_per_million: float | None,
@@ -480,20 +370,19 @@ def extract_api_cost(
     cost_extractors: Mapping[str, CostExtractor],
     model_pricing: Mapping[str, TokenPricing],
 ) -> float | None:
-    provider_name = normalize_provider(provider) or _detect_provider(response)
-    custom_extractor = (
-        cost_extractors.get(provider_name) if provider_name is not None else None
-    )
+    provider_name = normalize_provider(provider)
+    if provider_name is None:
+        raise ValueError("provider must be non-empty")
+
+    custom_extractor = cost_extractors.get(provider_name)
     if custom_extractor is not None:
         custom_cost = custom_extractor(response)
         if custom_cost is not None:
             return float(custom_cost)
 
     pricing = _resolve_token_pricing(
-        response,
         provider=provider_name,
         model_name=model_name,
-        model_name_getter=model_name_getter,
         prompt_price_per_million=prompt_price_per_million,
         completion_price_per_million=completion_price_per_million,
         cached_prompt_price_per_million=cached_prompt_price_per_million,
@@ -505,21 +394,23 @@ def extract_api_cost(
     if provider_cost is not None:
         return provider_cost
 
-    openai_token_counts = _extract_openai_token_counts(response)
-    if openai_token_counts is not None:
-        return _estimate_openai_cost(openai_token_counts, pricing)
-    anthropic_token_counts = _extract_anthropic_token_counts(response)
-    return _estimate_anthropic_cost(anthropic_token_counts, pricing)
+    if provider_name in {OPENAI_PROVIDER, ANTHROPIC_PROVIDER}:
+        raise ValueError(
+            f"Response usage does not match provider '{provider_name}'. "
+            "Pass the correct provider/model pair or register a custom cost extractor."
+        )
+    raise ValueError(
+        f"No cost extractor registered for provider '{provider_name}'."
+    )
 
 
 def _record_api_cost(
     *,
     result: Any,
     source: str,
-    provider: str | None,
+    provider: str,
     response_getter: ResponseGetter | None,
-    model_name: str | None,
-    model_name_getter: ModelNameGetter | None,
+    model_name: str,
     prompt_price_per_million: float | None,
     completion_price_per_million: float | None,
     cached_prompt_price_per_million: float | None,
@@ -539,7 +430,6 @@ def _record_api_cost(
         response,
         provider=provider,
         model_name=model_name,
-        model_name_getter=model_name_getter,
         prompt_price_per_million=prompt_price_per_million,
         completion_price_per_million=completion_price_per_million,
         cached_prompt_price_per_million=cached_prompt_price_per_million,
@@ -551,9 +441,8 @@ def _record_api_cost(
 def track_api_cost(
     *,
     source: str,
-    provider: str | None = None,
-    model_name: str | None = None,
-    model_name_getter: ModelNameGetter | None = None,
+    provider: str,
+    model_name: str,
     response_getter: ResponseGetter | None = None,
     prompt_price_per_million: float | None = None,
     completion_price_per_million: float | None = None,
@@ -566,6 +455,11 @@ def track_api_cost(
         raise ValueError("source must be non-empty")
 
     normalized_provider = normalize_provider(provider)
+    if normalized_provider is None:
+        raise ValueError("provider must be non-empty")
+    normalized_model_name = normalize_model_name(model_name)
+    if normalized_model_name is None:
+        raise ValueError("model_name must be non-empty")
 
     def _decorate(func: Callable[P, R]) -> Callable[P, R]:
         if iscoroutinefunction(func):
@@ -578,8 +472,7 @@ def track_api_cost(
                     source=normalized_source,
                     provider=normalized_provider,
                     response_getter=response_getter,
-                    model_name=model_name,
-                    model_name_getter=model_name_getter,
+                    model_name=normalized_model_name,
                     prompt_price_per_million=prompt_price_per_million,
                     completion_price_per_million=completion_price_per_million,
                     cached_prompt_price_per_million=cached_prompt_price_per_million,
@@ -598,8 +491,7 @@ def track_api_cost(
                 source=normalized_source,
                 provider=normalized_provider,
                 response_getter=response_getter,
-                model_name=model_name,
-                model_name_getter=model_name_getter,
+                model_name=normalized_model_name,
                 prompt_price_per_million=prompt_price_per_million,
                 completion_price_per_million=completion_price_per_million,
                 cached_prompt_price_per_million=cached_prompt_price_per_million,

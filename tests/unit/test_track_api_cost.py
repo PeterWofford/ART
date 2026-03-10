@@ -87,6 +87,7 @@ class TestTrackApiCost:
         @track_api_cost(
             source="llm_judge/correctness",
             provider="openai",
+            model_name="openai/gpt-4.1",
             prompt_price_per_million=1.0,
             completion_price_per_million=2.0,
         )
@@ -109,6 +110,7 @@ class TestTrackApiCost:
         @track_api_cost(
             source="llm_judge/cached_openai",
             provider="openai",
+            model_name="openai/gpt-4.1",
             prompt_price_per_million=2.0,
             completion_price_per_million=8.0,
             cached_prompt_price_per_million=0.5,
@@ -140,6 +142,7 @@ class TestTrackApiCost:
 
         @track_api_cost(
             source="llm_judge/faithfulness",
+            provider="anthropic",
             model_name="anthropic/test-judge",
         )
         async def _judge() -> _AnthropicResponse:
@@ -190,14 +193,18 @@ class TestTrackApiCost:
         assert metrics["costs/eval/llm_judge/anthropic_cache"] == pytest.approx(0.00495)
 
     @pytest.mark.asyncio
-    async def test_response_model_name_resolves_provider_scoped_global_pricing(
+    async def test_explicit_model_name_uses_global_pricing(
         self,
     ) -> None:
         builder = MetricsBuilder(cost_context="train")
         pricing = get_model_pricing("openai/gpt-oss-20b")
         assert pricing is not None
 
-        @track_api_cost(source="llm_judge/global_pricing", provider="openai")
+        @track_api_cost(
+            source="llm_judge/global_pricing",
+            provider="openai",
+            model_name="openai/gpt-oss-20b",
+        )
         async def _judge() -> _OpenAIResponse:
             return _OpenAIResponse(
                 prompt_tokens=1_000,
@@ -223,7 +230,7 @@ class TestTrackApiCost:
         )
 
     @pytest.mark.asyncio
-    async def test_response_model_name_resolves_provider_scoped_registered_pricing(
+    async def test_explicit_model_name_uses_registered_pricing(
         self,
     ) -> None:
         builder = MetricsBuilder(cost_context="eval")
@@ -233,7 +240,11 @@ class TestTrackApiCost:
             completion_per_million=2.5,
         )
 
-        @track_api_cost(source="llm_judge/provider_resolution", provider="anthropic")
+        @track_api_cost(
+            source="llm_judge/provider_resolution",
+            provider="anthropic",
+            model_name="anthropic/test-judge",
+        )
         async def _judge() -> _AnthropicResponse:
             return _AnthropicResponse(
                 input_tokens=400,
@@ -253,10 +264,14 @@ class TestTrackApiCost:
         )
 
     @pytest.mark.asyncio
-    async def test_snapshot_model_name_resolves_to_global_pricing(self) -> None:
+    async def test_explicit_model_name_does_not_depend_on_response_model(self) -> None:
         builder = MetricsBuilder(cost_context="train")
 
-        @track_api_cost(source="llm_judge/snapshot", provider="openai")
+        @track_api_cost(
+            source="llm_judge/snapshot",
+            provider="openai",
+            model_name="openai/gpt-4.1",
+        )
         async def _judge() -> _OpenAIResponse:
             return _OpenAIResponse(
                 prompt_tokens=1_000,
@@ -279,13 +294,17 @@ class TestTrackApiCost:
     async def test_decorator_fails_fast_without_model_aware_pricing(self) -> None:
         builder = MetricsBuilder(cost_context="train")
 
-        @track_api_cost(source="llm_judge/missing_pricing", provider="openai")
+        @track_api_cost(
+            source="llm_judge/missing_pricing",
+            provider="openai",
+            model_name="openai/missing-pricing-model",
+        )
         async def _judge() -> _OpenAIResponse:
             return _OpenAIResponse(prompt_tokens=10, completion_tokens=20)
 
         token = builder.activate()
         try:
-            with pytest.raises(ValueError, match="model-aware pricing"):
+            with pytest.raises(ValueError, match="No pricing configured"):
                 await _judge()
         finally:
             token.var.reset(token)
@@ -298,6 +317,7 @@ class TestTrackApiCost:
         @track_api_cost(
             source="llm_judge/custom",
             provider="openai",
+            model_name="openai/gpt-4.1",
             prompt_price_per_million=1.0,
             completion_price_per_million=2.0,
         )
@@ -315,7 +335,11 @@ class TestTrackApiCost:
 
     @pytest.mark.asyncio
     async def test_decorator_noops_without_active_builder(self) -> None:
-        @track_api_cost(source="llm_judge/no_context", provider="openai")
+        @track_api_cost(
+            source="llm_judge/no_context",
+            provider="openai",
+            model_name="openai/gpt-4.1",
+        )
         async def _judge() -> _OpenAIResponse:
             return _OpenAIResponse(prompt_tokens=10, completion_tokens=20)
 
@@ -330,6 +354,7 @@ class TestTrackApiCost:
         @track_api_cost(
             source="llm_judge/correctness",
             provider="openai",
+            model_name="openai/gpt-4.1",
             prompt_price_per_million=1.0,
             completion_price_per_million=2.0,
         )
@@ -359,6 +384,7 @@ class TestTrackApiCostIntegration:
         @track_api_cost(
             source="llm_judge/correctness",
             provider="openai",
+            model_name="openai/gpt-4.1",
             prompt_price_per_million=1.0,
             completion_price_per_million=2.0,
         )
@@ -368,6 +394,7 @@ class TestTrackApiCostIntegration:
         @track_api_cost(
             source="llm_judge/factuality",
             provider="anthropic",
+            model_name="anthropic/claude-sonnet-4-6",
             prompt_price_per_million=3.0,
             completion_price_per_million=4.0,
         )
@@ -471,6 +498,7 @@ class TestTrackApiCostIntegration:
         @track_api_cost(
             source="llm_judge/correctness",
             provider="openai",
+            model_name="openai/gpt-4.1",
             prompt_price_per_million=1.0,
             completion_price_per_million=2.0,
         )

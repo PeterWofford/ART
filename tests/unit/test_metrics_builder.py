@@ -197,6 +197,8 @@ class TestMetricsBuilder:
                 "model": "anthropic/test-judge",
                 "usage": {"input_tokens": 40, "output_tokens": 60},
             },
+            provider="anthropic",
+            model_name="anthropic/test-judge",
         )
 
         metrics = await builder.flush()
