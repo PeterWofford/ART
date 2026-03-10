@@ -1,5 +1,6 @@
+from collections.abc import Sequence
 import math
-from typing import Sequence
+from typing import Any, Literal
 
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.core import parallel_state as ps
@@ -9,11 +10,110 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelGroupedLinear,
     TERowParallelLinear,
 )
+from megatron.core.tensor_parallel.mappings import (
+    reduce_from_tensor_model_parallel_region,
+    reduce_scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.moe import grouped_gemm_util
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from pydantic import BaseModel, ConfigDict
 import torch
+
+ShardDomain = Literal["tp", "expert_tp"]
+GradSyncDomain = Literal["tp_default", "expert_tp"]
+GradSyncOp = Literal["none", "avg"]
+
+TP_DEFAULT_GRAD_SYNC_DOMAIN: GradSyncDomain = "tp_default"
+EXPERT_TP_GRAD_SYNC_DOMAIN: GradSyncDomain = "expert_tp"
+GRAD_SYNC_OP_NONE: GradSyncOp = "none"
+GRAD_SYNC_OP_AVG: GradSyncOp = "avg"
+
+
+class LoRAParallelSpec(BaseModel):
+    # This spec only describes TP / expert-TP behavior.
+    # DP/CP vs expert-DP behavior is selected separately via `allreduce`.
+    model_config = ConfigDict(frozen=True)
+
+    shard_domain: ShardDomain = "tp"
+    sharded: bool = False
+    shard_axis: int | None = None
+    grad_sync_domain: GradSyncDomain = TP_DEFAULT_GRAD_SYNC_DOMAIN
+    grad_sync_op: GradSyncOp = GRAD_SYNC_OP_NONE
+
+
+def _distributed_initialized() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _get_shard_world_size(domain: ShardDomain) -> int:
+    if not _distributed_initialized():
+        return 1
+    if domain == "tp":
+        return ps.get_tensor_model_parallel_world_size()
+    group = ps.get_expert_tensor_parallel_group(check_initialized=False)
+    if group is None:
+        return 1
+    return group.size()
+
+
+def _get_shard_rank(domain: ShardDomain) -> int:
+    if not _distributed_initialized():
+        return 0
+    if domain == "tp":
+        return ps.get_tensor_model_parallel_rank()
+    group = ps.get_expert_tensor_parallel_group(check_initialized=False)
+    if group is None:
+        return 0
+    return group.rank()
+
+
+def _get_shard_group(domain: ShardDomain) -> torch.distributed.ProcessGroup | None:
+    if not _distributed_initialized():
+        return None
+    if domain == "tp":
+        return ps.get_tensor_model_parallel_group()
+    return ps.get_expert_tensor_parallel_group(check_initialized=False)
+
+
+def _normalize_axis(axis: int, ndim: int) -> int:
+    if axis < 0:
+        axis += ndim
+    if axis < 0 or axis >= ndim:
+        raise ValueError(f"Invalid shard axis {axis} for tensor ndim={ndim}")
+    return axis
+
+
+def _set_lora_parallel_metadata(
+    param: torch.nn.Parameter,
+    *,
+    parallel_spec: LoRAParallelSpec,
+    allreduce: bool,
+) -> None:
+    replicated = not parallel_spec.sharded
+    setattr(param, "lora_shard_domain", parallel_spec.shard_domain)
+    setattr(param, "lora_tp_sharded", parallel_spec.sharded)
+    setattr(param, "lora_tp_replicated", replicated)
+    setattr(param, "lora_tp_shard_axis", parallel_spec.shard_axis)
+    setattr(param, "grad_sync_domain", parallel_spec.grad_sync_domain)
+    setattr(param, "grad_sync_op", parallel_spec.grad_sync_op)
+    # Megatron DDP routing flag:
+    # - allreduce=True: sync with regular DP/CP replicas.
+    # - allreduce=False: sync with expert-DP replicas.
+    # TP / expert-TP replica handling is controlled by grad_sync_* metadata.
+    setattr(param, "allreduce", allreduce)
+
+    # Megatron's native TP finalize path consumes this attr.
+    setattr(
+        param,
+        "average_gradients_across_tp_domain",
+        (
+            replicated
+            and parallel_spec.grad_sync_domain == TP_DEFAULT_GRAD_SYNC_DOMAIN
+            and parallel_spec.grad_sync_op == GRAD_SYNC_OP_AVG
+        ),
+    )
 
 
 class LoRA(torch.nn.Module):
@@ -27,6 +127,9 @@ class LoRA(torch.nn.Module):
         dtype: torch.dtype,
         device: torch.device,
         num_local_experts: int = 1,
+        a_parallel_spec: LoRAParallelSpec = LoRAParallelSpec(),
+        b_parallel_spec: LoRAParallelSpec = LoRAParallelSpec(),
+        allreduce: bool = True,
     ) -> None:
         super().__init__()
         assert num_local_experts == 1 or "{expert}" in adapter_model_prefix, (
@@ -44,12 +147,37 @@ class LoRA(torch.nn.Module):
                 num_local_experts, rank, out_features, dtype=dtype, device=device
             ).squeeze(0)
         )
+        _set_lora_parallel_metadata(
+            self.A_T,
+            parallel_spec=a_parallel_spec,
+            allreduce=allreduce,
+        )
+        _set_lora_parallel_metadata(
+            self.B_T,
+            parallel_spec=b_parallel_spec,
+            allreduce=allreduce,
+        )
         self._expert_offset = ps.get_expert_model_parallel_rank() * num_local_experts
         self.reset_lora_parameters()
 
     @property
     def num_local_experts(self) -> int:
         return self.A_T.shape[0] if self.A_T.ndim == 3 else 1
+
+    def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
+        if not getattr(param, "lora_tp_replicated", False):
+            return
+        domain = getattr(param, "lora_shard_domain")
+        world_size = _get_shard_world_size(domain)
+        if world_size <= 1:
+            return
+        group = _get_shard_group(domain)
+        if group is None:
+            raise RuntimeError(
+                f"{self.adapter_model_prefix}: missing process group for replicated parameter domain={domain}"
+            )
+        src = torch.distributed.get_global_rank(group, 0)
+        torch.distributed.broadcast(param.data, src=src, group=group)
 
     def reset_lora_parameters(self) -> None:
         """Initialize LoRA weights (A=Kaiming, B=zeros) like PEFT defaults."""
@@ -59,22 +187,38 @@ class LoRA(torch.nn.Module):
         else:
             torch.nn.init.kaiming_uniform_(self.A_T.T, a=math.sqrt(5))
         torch.nn.init.zeros_(self.B_T)
+        self._broadcast_if_replicated(self.A_T)
+        self._broadcast_if_replicated(self.B_T)
+
+    def _expected_weight_keys(self, suffix: str) -> list[str]:
+        if self.num_local_experts > 1:
+            return [
+                f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{suffix}.weight"
+                for expert in range(self.num_local_experts)
+            ]
+        return [f"{self.adapter_model_prefix}.{suffix}.weight"]
 
     def load_lora(self, adapter_model: dict[str, torch.Tensor]) -> None:
-        try:
-            self.load_weights(
-                adapter_model,
-                suffix="lora_A",
-                into=self.A_T,
+        missing_keys = [
+            key
+            for suffix in ("lora_A", "lora_B")
+            for key in self._expected_weight_keys(suffix)
+            if key not in adapter_model
+        ]
+        if missing_keys:
+            raise KeyError(
+                f"Missing LoRA adapter keys for {self.adapter_model_prefix}: {sorted(missing_keys)}"
             )
-            self.load_weights(
-                adapter_model,
-                suffix="lora_B",
-                into=self.B_T,
-            )
-        except KeyError:
-            print("Unable to find LoRA weights for", self.adapter_model_prefix)
-            self.reset_lora_parameters()
+        self.load_weights(
+            adapter_model,
+            suffix="lora_A",
+            into=self.A_T,
+        )
+        self.load_weights(
+            adapter_model,
+            suffix="lora_B",
+            into=self.B_T,
+        )
 
     def load_weights(
         self,
@@ -83,64 +227,110 @@ class LoRA(torch.nn.Module):
         suffix: str,
         into: torch.nn.Parameter,
     ) -> None:
-        self.load_weight(
-            (
-                torch.stack(
-                    [
-                        adapter_model[
-                            f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{suffix}.weight"
-                        ].T
-                        for expert in range(self.num_local_experts)
-                    ]
-                )
-                if self.num_local_experts > 1
-                else adapter_model[f"{self.adapter_model_prefix}.{suffix}.weight"].T
-            ),
-            into=into,
-        )
+        keys = self._expected_weight_keys(suffix)
+        if self.num_local_experts > 1:
+            weight = torch.stack([adapter_model[key].T for key in keys])
+        else:
+            weight = adapter_model[keys[0]].T
+        self.load_weight(weight, into=into)
 
     def load_weight(self, weight: torch.Tensor, *, into: torch.nn.Parameter) -> None:
-        setattr(into, "sharded", False)
-        tp_world_size = ps.get_tensor_model_parallel_world_size()
-        tp_rank = ps.get_tensor_model_parallel_rank()
-        for axis in (-2, -1):
-            if weight.shape[axis] == into.shape[axis]:
-                continue
-            # assume our param is tensor sharded along this axis
-            assert weight.shape[axis] // tp_world_size == into.shape[axis], (
-                f"Weight shape {weight.shape} does not match into shape {into.shape} along axis {axis}"
+        domain = getattr(into, "lora_shard_domain")
+        sharded = bool(getattr(into, "lora_tp_sharded"))
+        if sharded:
+            axis = getattr(into, "lora_tp_shard_axis")
+            if axis is None:
+                raise RuntimeError(
+                    f"{self.adapter_model_prefix}: missing shard axis for sharded parameter"
+                )
+            axis = _normalize_axis(axis, weight.ndim)
+            world_size = _get_shard_world_size(domain)
+            rank = _get_shard_rank(domain)
+            if weight.shape[axis] % world_size != 0:
+                raise ValueError(
+                    f"{self.adapter_model_prefix}: weight shape {tuple(weight.shape)} is not divisible by world size "
+                    f"{world_size} on axis {axis}"
+                )
+            local_size = weight.shape[axis] // world_size
+            if into.shape[axis] != local_size:
+                raise ValueError(
+                    f"{self.adapter_model_prefix}: expected local shard size {into.shape[axis]}, got {local_size}"
+                )
+            weight = weight.narrow(axis, rank * local_size, local_size)
+        elif tuple(weight.shape) != tuple(into.shape):
+            raise ValueError(
+                f"{self.adapter_model_prefix}: unsharded load shape mismatch, got {tuple(weight.shape)} "
+                f"expected {tuple(into.shape)}"
             )
-            s = into.shape[axis]
-            weight = weight.narrow(axis, tp_rank * s, s)
-            setattr(into, "sharded", True)
         into.data.copy_(weight)
         into.requires_grad = True
 
-    def sharded_lora_state_dict(self) -> dict[str, torch.Tensor]:
-        if self.num_local_experts > 1:
+    def _should_export_parameter(self, param: torch.nn.Parameter) -> bool:
+        if self.num_local_experts > 1:  # self is a MoE layer
             if ps.get_expert_data_parallel_rank() != 0:
-                return {}
-            return {
-                f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{key}": param.data[
-                    expert
-                ].T
-                for expert in range(self.num_local_experts)
-                for key, param in (
-                    ("lora_A.weight", self.A_T),
-                    ("lora_B.weight", self.B_T),
-                )
-            }
-        if ps.get_data_parallel_rank() != 0 or torch.all(self.A_T == 0):
-            return {}
+                return False
+        else:  # self is a non-MoE layer
+            if ps.get_data_parallel_rank() != 0:
+                return False
+            # Non-MoE layers are replicated across expert-model-parallel ranks.
+            if (
+                ps.get_expert_model_parallel_world_size() > 1
+                and ps.get_expert_model_parallel_rank() != 0
+            ):
+                return False
+
+        if getattr(param, "lora_tp_sharded", False):
+            # this param is fully sharded, all shard ranks participate
+            return True
+
+        domain = getattr(param, "lora_shard_domain")
+        # param is replicated, tp rank 0 or etp rank 0 participates
+        return _get_shard_rank(domain) == 0
+
+    def _manifest_for_param(self, param: torch.nn.Parameter) -> dict[str, Any]:
+        domain = getattr(param, "lora_shard_domain")
+        sharded = bool(getattr(param, "lora_tp_sharded", False))
+        shard_axis = getattr(param, "lora_tp_shard_axis", None)
         return {
-            f"{self.adapter_model_prefix}.{key}": param.data.T
-            for key, param in (
-                ("lora_A.weight", self.A_T),
-                ("lora_B.weight", self.B_T),
-            )
-            if getattr(param, "sharded", False)
-            or ps.get_tensor_model_parallel_rank() == 0
+            "domain": domain,
+            "sharded": sharded,
+            "shard_axis": shard_axis,
+            "shard_world_size": _get_shard_world_size(domain) if sharded else 1,
+            "shard_rank": _get_shard_rank(domain) if sharded else 0,
         }
+
+    def _lora_params(self) -> list[tuple[str, torch.nn.Parameter]]:
+        return [
+            ("lora_A.weight", self.A_T),
+            ("lora_B.weight", self.B_T),
+        ]
+
+    def _export_items(
+        self,
+    ) -> list[tuple[str, torch.nn.Parameter, int | None]]:
+        export_items: list[tuple[str, torch.nn.Parameter, int | None]] = []
+        for key, param in self._lora_params():
+            if not self._should_export_parameter(param):
+                continue
+            if self.num_local_experts > 1:
+                for expert in range(self.num_local_experts):
+                    full_key = f"{self.adapter_model_prefix.format(expert=expert + self._expert_offset)}.{key}"
+                    export_items.append((full_key, param, expert))
+            else:
+                export_items.append((f"{self.adapter_model_prefix}.{key}", param, None))
+        return export_items
+
+    def sharded_lora_manifest(self) -> dict[str, dict[str, Any]]:
+        return {
+            key: self._manifest_for_param(param)
+            for key, param, _expert in self._export_items()
+        }
+
+    def sharded_lora_state_dict(self) -> dict[str, torch.Tensor]:
+        state: dict[str, torch.Tensor] = {}
+        for key, param, expert in self._export_items():
+            state[key] = param.data[expert].T if expert is not None else param.data.T
+        return state
 
     def forward(
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor | None = None
@@ -152,14 +342,13 @@ class LoRA(torch.nn.Module):
             bsz = tokens_per_expert
             if isinstance(bsz, list):
                 bsz = torch.tensor(bsz, dtype=torch.int64, device="cpu")
-            # If no tokens routed locally, return zeros
+            # If no tokens routed locally, return zeros.
             if isinstance(bsz, torch.Tensor) and int(torch.count_nonzero(bsz)) == 0:
                 return x.new_zeros((x.shape[0], self.B_T.shape[-1]))
             tmp = grouped_gemm_util.ops.gmm(x, self.A_T, bsz, trans_b=False)  # type: ignore[attr-defined]
             out = grouped_gemm_util.ops.gmm(tmp, self.B_T, bsz, trans_b=False)  # type: ignore[attr-defined]
             return out * self.scale
-        else:
-            return ((x @ self.A_T) @ self.B_T) * self.scale
+        return ((x @ self.A_T) @ self.B_T) * self.scale
 
 
 class SelfAttentionLinearProjLoRA(torch.nn.Module):
@@ -175,6 +364,20 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
         self.provider = provider
         self.linear_proj = linear_proj
         assert isinstance(linear_proj.weight, torch.Tensor)
+        a_parallel_spec = LoRAParallelSpec(
+            shard_domain="tp",
+            sharded=True,
+            shard_axis=-2,
+            grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
+            grad_sync_op=GRAD_SYNC_OP_NONE,  # only need DP-type reductions
+        )
+        b_parallel_spec = a_parallel_spec.model_copy(
+            update={
+                "sharded": False,
+                "shard_axis": None,
+                "grad_sync_op": GRAD_SYNC_OP_AVG,  # megatron reduces across TP ranks
+            }
+        )
         self.lora = LoRA(
             adapter_model_prefix=adapter_model_prefix,
             in_features=linear_proj.in_features,
@@ -183,22 +386,23 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
             alpha=alpha,
             dtype=linear_proj.weight.dtype,
             device=linear_proj.weight.device,
+            a_parallel_spec=a_parallel_spec,
+            b_parallel_spec=b_parallel_spec,
+            # Non-expert LoRA params use Megatron's dense DP/CP gradient buckets.
+            allreduce=True,
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_output, bias_output = self.linear_proj(x)
         assert isinstance(base_output, torch.Tensor)
         assert isinstance(bias_output, (torch.Tensor, type(None)))
+
         lora_output = self.lora(x)
-        if (
-            self.provider.sequence_parallel
-            and self.provider.tensor_model_parallel_size > 1
-        ):
-            tp_rank = ps.get_tensor_model_parallel_rank()
-            tokens_per_rank = base_output.shape[0]
-            start = tp_rank * tokens_per_rank
-            end = start + tokens_per_rank
-            lora_output = lora_output[start:end]
+        if self.provider.tensor_model_parallel_size > 1:
+            if self.provider.sequence_parallel:
+                lora_output = reduce_scatter_to_sequence_parallel_region(lora_output)
+            else:
+                lora_output = reduce_from_tensor_model_parallel_region(lora_output)
         return base_output + lora_output, bias_output
 
 
@@ -231,32 +435,64 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         q_out_features_per_rank = q_out_features // tp_world_size
         kv_out_features_per_rank = kv_out_features // tp_world_size
         assert isinstance(linear_qkv.weight, torch.Tensor)
-        self.q_proj_lora = LoRA(
+        self.q_proj_lora = self._build_qkv_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.q_proj",
-            in_features=linear_qkv.in_features,
+            linear_qkv=linear_qkv,
+            rank=rank,
+            alpha=alpha,
             out_features=q_out_features_per_rank,
-            rank=rank,
-            alpha=alpha,
-            dtype=linear_qkv.weight.dtype,
-            device=linear_qkv.weight.device,
         )
-        self.k_proj_lora = LoRA(
+        self.k_proj_lora = self._build_qkv_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.k_proj",
-            in_features=linear_qkv.in_features,
-            out_features=kv_out_features_per_rank,
+            linear_qkv=linear_qkv,
             rank=rank,
             alpha=alpha,
-            dtype=linear_qkv.weight.dtype,
-            device=linear_qkv.weight.device,
+            out_features=kv_out_features_per_rank,
         )
-        self.v_proj_lora = LoRA(
+        self.v_proj_lora = self._build_qkv_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.v_proj",
-            in_features=linear_qkv.in_features,
+            linear_qkv=linear_qkv,
+            rank=rank,
+            alpha=alpha,
             out_features=kv_out_features_per_rank,
+        )
+
+    @staticmethod
+    def _build_qkv_lora(
+        *,
+        adapter_model_prefix: str,
+        linear_qkv: TELayerNormColumnParallelLinear,
+        rank: int,
+        alpha: float,
+        out_features: int,
+    ) -> LoRA:
+        assert isinstance(linear_qkv.weight, torch.Tensor)
+        a_parallel_spec = LoRAParallelSpec(
+            shard_domain="tp",
+            sharded=False,
+            shard_axis=None,
+            grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
+            grad_sync_op=GRAD_SYNC_OP_AVG,  # megatron reduces across TP ranks
+        )
+        b_parallel_spec = a_parallel_spec.model_copy(
+            update={
+                "sharded": True,
+                "shard_axis": -1,
+                "grad_sync_op": GRAD_SYNC_OP_NONE,  # only need DP-type reductions
+            }
+        )
+        return LoRA(
+            adapter_model_prefix=adapter_model_prefix,
+            in_features=linear_qkv.in_features,
+            out_features=out_features,
             rank=rank,
             alpha=alpha,
             dtype=linear_qkv.weight.dtype,
             device=linear_qkv.weight.device,
+            a_parallel_spec=a_parallel_spec,
+            b_parallel_spec=b_parallel_spec,
+            # Non-expert LoRA params use Megatron's dense DP/CP gradient buckets.
+            allreduce=True,
         )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -302,19 +538,48 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         super().__init__()
         assert linear_fc1 is not None
         self.linear_fc1 = linear_fc1
-        assert isinstance(linear_fc1.weight0, torch.Tensor)
-        self.gate_lora = LoRA(
+        self.gate_lora = self._build_fc1_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.gate_proj",
-            in_features=linear_fc1.in_features,
-            out_features=linear_fc1.out_features // 2,
+            linear_fc1=linear_fc1,
             rank=rank,
             alpha=alpha,
-            dtype=linear_fc1.weight0.dtype,
-            device=linear_fc1.weight0.device,
             num_local_experts=num_local_experts,
         )
-        self.up_lora = LoRA(
+        self.up_lora = self._build_fc1_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.up_proj",
+            linear_fc1=linear_fc1,
+            rank=rank,
+            alpha=alpha,
+            num_local_experts=num_local_experts,
+        )
+
+    @staticmethod
+    def _build_fc1_lora(
+        *,
+        adapter_model_prefix: str,
+        linear_fc1: TEColumnParallelGroupedLinear,
+        rank: int,
+        alpha: float,
+        num_local_experts: int,
+    ) -> LoRA:
+        assert isinstance(linear_fc1.weight0, torch.Tensor)
+        a_parallel_spec = LoRAParallelSpec(
+            shard_domain="expert_tp",
+            sharded=False,
+            shard_axis=None,
+            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
+            grad_sync_op=GRAD_SYNC_OP_AVG,  # we handle this with extended finalize_grads
+        )
+        b_parallel_spec = a_parallel_spec.model_copy(
+            update={
+                "sharded": True,
+                "shard_axis": -1,
+                "grad_sync_domain": EXPERT_TP_GRAD_SYNC_DOMAIN,
+                "grad_sync_op": GRAD_SYNC_OP_NONE,  # only need DP-type reductions
+            }
+        )
+        return LoRA(
+            adapter_model_prefix=adapter_model_prefix,
             in_features=linear_fc1.in_features,
             out_features=linear_fc1.out_features // 2,
             rank=rank,
@@ -322,6 +587,10 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             dtype=linear_fc1.weight0.dtype,
             device=linear_fc1.weight0.device,
             num_local_experts=num_local_experts,
+            a_parallel_spec=a_parallel_spec,
+            b_parallel_spec=b_parallel_spec,
+            # Expert LoRA params use Megatron's expert-DP gradient buckets.
+            allreduce=False,
         )
 
     def forward(
@@ -347,6 +616,21 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         assert linear_fc2 is not None
         assert isinstance(linear_fc2.weight0, torch.Tensor)
         self.linear_fc2 = linear_fc2
+        a_parallel_spec = LoRAParallelSpec(
+            shard_domain="expert_tp",
+            sharded=True,
+            shard_axis=-2,
+            grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
+            grad_sync_op=GRAD_SYNC_OP_NONE,  # only need DP-type reductions
+        )
+        b_parallel_spec = a_parallel_spec.model_copy(
+            update={
+                "sharded": False,
+                "shard_axis": None,
+                "grad_sync_domain": EXPERT_TP_GRAD_SYNC_DOMAIN,
+                "grad_sync_op": GRAD_SYNC_OP_AVG,  # we handle this with extended finalize_grads
+            }
+        )
         self.lora = LoRA(
             adapter_model_prefix=f"{adapter_model_prefix}.{{expert}}.down_proj",
             in_features=linear_fc2.in_features,
@@ -356,6 +640,10 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
             dtype=linear_fc2.weight0.dtype,
             device=linear_fc2.weight0.device,
             num_local_experts=num_local_experts,
+            a_parallel_spec=a_parallel_spec,
+            b_parallel_spec=b_parallel_spec,
+            # Expert LoRA params use Megatron's expert-DP gradient buckets.
+            allreduce=False,
         )
 
     def forward(
@@ -369,77 +657,68 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
 def apply_lora_adapters(
     model: Sequence[torch.nn.Module],
     provider: GPTModelProvider,
-) -> None:
-    with torch.no_grad():
-        for chunk in model:
-            for module in chunk.modules():
-                if isinstance(module, TransformerLayer):
-                    adapter_model_prefix = (
-                        f"base_model.model.model.layers.{module.layer_number - 1}"
-                    )
-                    assert isinstance(module.self_attention, SelfAttention)
-                    self_attention_linear_proj = module.self_attention.linear_proj
-                    if not isinstance(self_attention_linear_proj, TERowParallelLinear):
-                        self_attention_linear_proj = (
-                            self_attention_linear_proj.linear_proj
-                        )
-                        assert isinstance(
-                            self_attention_linear_proj, TERowParallelLinear
-                        )
-                    module.self_attention.linear_proj = SelfAttentionLinearProjLoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.self_attn.o_proj",
-                        linear_proj=self_attention_linear_proj,
-                        rank=1,
-                        alpha=32,
-                        provider=provider,
-                    )
-                    self_attention_linear_qkv = module.self_attention.linear_qkv
-                    if not isinstance(
-                        self_attention_linear_qkv, TELayerNormColumnParallelLinear
-                    ):
-                        self_attention_linear_qkv = self_attention_linear_qkv.linear_qkv
-                        assert isinstance(
-                            self_attention_linear_qkv, TELayerNormColumnParallelLinear
-                        )
-                    module.self_attention.linear_qkv = SelfAttentionLinearQKVLoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.self_attn",
-                        linear_qkv=self_attention_linear_qkv,
-                        rank=1,
-                        alpha=32,
-                        provider=provider,
-                    )
-                    assert isinstance(module.mlp.experts, TEGroupedMLP)
-                    mlp_experts_linear_fc1 = module.mlp.experts.linear_fc1
-                    if not isinstance(
-                        mlp_experts_linear_fc1,
-                        TEColumnParallelGroupedLinear,  # type: ignore
-                    ):
-                        mlp_experts_linear_fc1 = mlp_experts_linear_fc1.linear_fc1
-                        assert isinstance(
-                            mlp_experts_linear_fc1,
-                            TEColumnParallelGroupedLinear,  # type: ignore
-                        )
-                    module.mlp.experts.linear_fc1 = MLPExpertsLinearFC1LoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
-                        linear_fc1=mlp_experts_linear_fc1,
-                        rank=1,
-                        alpha=32,
-                        num_local_experts=module.mlp.experts.num_local_experts,
-                    )
-                    mlp_experts_linear_fc2 = module.mlp.experts.linear_fc2
-                    if not isinstance(
-                        mlp_experts_linear_fc2,
-                        TERowParallelGroupedLinear,  # type: ignore
-                    ):
-                        mlp_experts_linear_fc2 = mlp_experts_linear_fc2.linear_fc2
-                        assert isinstance(
-                            mlp_experts_linear_fc2,
-                            TERowParallelGroupedLinear,  # type: ignore
-                        )
-                    module.mlp.experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
-                        adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
-                        linear_fc2=mlp_experts_linear_fc2,
-                        rank=1,
-                        alpha=32,
-                        num_local_experts=module.mlp.experts.num_local_experts,
-                    )
+) -> list[torch.nn.Module]:
+    def _unwrap_attr(value: Any, attr_name: str, expected_type: type[Any]) -> Any:
+        if isinstance(value, expected_type):
+            return value
+        unwrapped = getattr(value, attr_name)
+        assert isinstance(unwrapped, expected_type)
+        return unwrapped
+
+    for chunk in model:
+        for module in chunk.modules():
+            if isinstance(module, TransformerLayer):
+                adapter_model_prefix = (
+                    f"base_model.model.model.layers.{module.layer_number - 1}"
+                )
+                assert isinstance(module.self_attention, SelfAttention)
+                self_attention_linear_proj = _unwrap_attr(
+                    module.self_attention.linear_proj,
+                    "linear_proj",
+                    TERowParallelLinear,
+                )
+                module.self_attention.linear_proj = SelfAttentionLinearProjLoRA(
+                    adapter_model_prefix=f"{adapter_model_prefix}.self_attn.o_proj",
+                    linear_proj=self_attention_linear_proj,
+                    rank=1,
+                    alpha=32,
+                    provider=provider,
+                )
+                self_attention_linear_qkv = _unwrap_attr(
+                    module.self_attention.linear_qkv,
+                    "linear_qkv",
+                    TELayerNormColumnParallelLinear,
+                )
+                module.self_attention.linear_qkv = SelfAttentionLinearQKVLoRA(
+                    adapter_model_prefix=f"{adapter_model_prefix}.self_attn",
+                    linear_qkv=self_attention_linear_qkv,
+                    rank=1,
+                    alpha=32,
+                    provider=provider,
+                )
+                assert isinstance(module.mlp.experts, TEGroupedMLP)
+                mlp_experts_linear_fc1 = _unwrap_attr(
+                    module.mlp.experts.linear_fc1,
+                    "linear_fc1",
+                    TEColumnParallelGroupedLinear,  # type: ignore[arg-type]
+                )
+                module.mlp.experts.linear_fc1 = MLPExpertsLinearFC1LoRA(
+                    adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+                    linear_fc1=mlp_experts_linear_fc1,
+                    rank=1,
+                    alpha=32,
+                    num_local_experts=module.mlp.experts.num_local_experts,
+                )
+                mlp_experts_linear_fc2 = _unwrap_attr(
+                    module.mlp.experts.linear_fc2,
+                    "linear_fc2",
+                    TERowParallelGroupedLinear,  # type: ignore[arg-type]
+                )
+                module.mlp.experts.linear_fc2 = MLPExpertsLinearFC2LoRA(
+                    adapter_model_prefix=f"{adapter_model_prefix}.mlp.experts",
+                    linear_fc2=mlp_experts_linear_fc2,
+                    rank=1,
+                    alpha=32,
+                    num_local_experts=module.mlp.experts.num_local_experts,
+                )
+    return list(model)
