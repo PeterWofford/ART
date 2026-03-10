@@ -296,7 +296,7 @@ def run_training_step(
     attention_mask = torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device)
 
     for chunk in model_chunks:
-        cast(Any, chunk).zero_grad_buffer()
+        chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
 
     new_logprobs: torch.Tensor = -model_chunks[0](
         input_ids=inputs["tokens"],
@@ -307,7 +307,7 @@ def run_training_step(
     )
 
     loss_info = loss_fn(
-        cast(Any, inputs),
+        inputs,  # ty: ignore[invalid-argument-type]
         new_logprobs,
         ref_logprobs,
         None,

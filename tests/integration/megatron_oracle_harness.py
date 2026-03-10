@@ -10,7 +10,7 @@ import random
 import shutil
 import subprocess
 import sys
-from typing import Any, Callable, Literal, cast
+from typing import Any, Callable, Literal, TypeVar, cast
 
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
@@ -160,6 +160,15 @@ class ComparisonFailure(BaseModel):
     abs_tolerance: float
     rel_tolerance: float
     message: str
+
+
+T = TypeVar("T")
+
+
+def _require_not_none(value: T | None, name: str) -> T:
+    if value is None:
+        raise RuntimeError(f"{name} is None")
+    return value
 
 
 PHASE_A_TOPOLOGIES = [
@@ -1114,9 +1123,13 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 raise RuntimeError("Failed to collect current LoRA state on rank 0")
 
             if torch.distributed.get_rank() == 0:
-                assert captured_grads is not None
-                assert initial_lora_state is not None
-                assert current_lora_state is not None
+                grads = _require_not_none(captured_grads, "captured_grads")
+                initial_state = _require_not_none(
+                    initial_lora_state, "initial_lora_state"
+                )
+                current_state = _require_not_none(
+                    current_lora_state, "current_lora_state"
+                )
                 output_rel = Path("traces") / f"output_step_{step_index:03d}.pt"
                 grads_rel = Path("traces") / f"grads_step_{step_index:03d}.safetensors"
                 deltas_rel = (
@@ -1128,10 +1141,10 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     step_result.new_logprobs.detach().cpu().float(),
                     topology_dir / output_rel,
                 )
-                save_file(captured_grads, str(topology_dir / grads_rel))
-                deltas = _delta_state(initial_lora_state, current_lora_state)
+                save_file(grads, str(topology_dir / grads_rel))
+                deltas = _delta_state(initial_state, current_state)
                 save_file(deltas, str(topology_dir / deltas_rel))
-                save_file(current_lora_state, str(topology_dir / lora_rel))
+                save_file(current_state, str(topology_dir / lora_rel))
 
                 step_traces.append(
                     StepTrace(
