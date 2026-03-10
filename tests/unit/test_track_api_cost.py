@@ -215,10 +215,11 @@ class TestTrackApiCost:
         expected = compute_sample_costs(
             prompt_tokens=1_000,
             completion_tokens=2_000,
+            cost_context="train",
             pricing=pricing,
         )
         assert metrics["costs/train/llm_judge/global_pricing"] == pytest.approx(
-            expected["costs_prefill"] + expected["costs_sample"]
+            expected["costs/train/prefill"] + expected["costs/train/sample"]
         )
 
     @pytest.mark.asyncio

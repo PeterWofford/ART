@@ -36,8 +36,6 @@ if TYPE_CHECKING:
 ModelConfig = TypeVar("ModelConfig", bound=BaseModel | None)
 StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 
-COSTS_METRIC_PREFIX = "costs_"
-COSTS_TOTAL_KEY = f"{COSTS_METRIC_PREFIX}total"
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
 METRIC_SECTIONS = frozenset(
     {
@@ -505,24 +503,17 @@ class Model(
         self, metrics: dict[str, float], split: str
     ) -> dict[str, float]:
         non_cost_metrics: dict[str, float] = {}
-        cost_context = "train" if split == "train" else "eval"
         for metric, value in metrics.items():
             numeric_value = float(value)
-            if metric == COSTS_TOTAL_KEY:
-                raise ValueError(
-                    "Do not log 'costs_total' directly. Log costs_* components "
-                    "(e.g., costs_prefill, costs_sample) and totals are derived."
-                )
             if metric.startswith("costs/"):
                 self._metrics_builder.add_cost(metric[len("costs/") :], numeric_value)
                 continue
-            if metric.startswith(COSTS_METRIC_PREFIX):
-                component = metric[len(COSTS_METRIC_PREFIX) :]
-                if component:
-                    self._metrics_builder.add_cost(
-                        f"{cost_context}/{component}", numeric_value
-                    )
-                continue
+            if metric.startswith("costs_"):
+                raise ValueError(
+                    "Legacy cost keys like 'costs_prefill' are no longer supported. "
+                    "Log hierarchical costs like 'costs/train/prefill' or "
+                    "'costs/eval/prefill' instead."
+                )
             if is_builder_managed_metric(metric):
                 self._metrics_builder.add_metric(metric, numeric_value)
                 continue
@@ -878,7 +869,9 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
     @staticmethod
     def _noop_cost_calculator(
-        _prompt_tokens: int | None, _completion_tokens: int | None
+        _prompt_tokens: int | None,
+        _completion_tokens: int | None,
+        _cost_context: str,
     ) -> dict[str, float]:
         return {}
 

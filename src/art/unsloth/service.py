@@ -849,7 +849,6 @@ class UnslothService:
                 "loss/grad_norm": grad_norm,
                 "train/num_trajectories": float(batch.num_trajectories),
                 "train/num_trainable_tokens": float(batch.num_trainable_tokens),
-                "throughput/train_tok_per_sec": tokens_per_second,
             }
 
         # === Cleanup ===

@@ -26,7 +26,6 @@ ART backends emit canonical sectioned keys directly. The canonical training keys
 - `loss/kl_policy_ref`
 - `loss/grad_norm`
 - `loss/learning_rate`
-- `throughput/train_tok_per_sec`
 - `train/num_groups_submitted`
 - `train/num_groups_trainable`
 - `train/num_trajectories`
@@ -37,10 +36,9 @@ ART backends emit canonical sectioned keys directly. The canonical training keys
 
 ## Cost Rollups
 
-Cost leaves can be logged with either:
+Cost leaves can be logged with hierarchical keys, for example:
 
 - hierarchical keys, e.g. `costs/train/llm_judge/correctness`
-- legacy component keys, e.g. `costs_prefill`, `costs_sample`
 
 ART rolls costs up automatically:
 

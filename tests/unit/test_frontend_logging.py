@@ -636,8 +636,8 @@ class TestMetricCalculation:
             split="train",
             step=1,
             metrics={
-                "costs_prefill": 0.2,
-                "costs_sample": 0.3,
+                "costs/train/prefill": 0.2,
+                "costs/train/sample": 0.3,
             },
         )
         await model.log(
@@ -645,7 +645,7 @@ class TestMetricCalculation:
             split="train",
             step=2,
             metrics={
-                "costs_prefill": 0.1,
+                "costs/train/prefill": 0.1,
             },
         )
 
@@ -679,7 +679,7 @@ class TestMetricCalculation:
             trajectories=None,
             split="train",
             step=1,
-            metrics={"costs_prefill": 0.25},
+            metrics={"costs/train/prefill": 0.25},
         )
 
         model_2 = Model(
@@ -692,7 +692,7 @@ class TestMetricCalculation:
             trajectories=None,
             split="train",
             step=2,
-            metrics={"costs_prefill": 0.75},
+            metrics={"costs/train/prefill": 0.75},
         )
 
         history_path = tmp_path / "test/models/test/history.jsonl"

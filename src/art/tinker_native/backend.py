@@ -62,7 +62,6 @@ _UPSTREAM_TRAIN_METRIC_KEYS = {
     "kl_policy_ref": "loss/kl_policy_ref",
     "grad_norm": "loss/grad_norm",
     "learning_rate": "loss/learning_rate",
-    "tokens_per_second": "throughput/train_tok_per_sec",
     "num_groups_submitted": "train/num_groups_submitted",
     "num_groups_trainable": "train/num_groups_trainable",
     "num_trajectories": "train/num_trajectories",
@@ -75,6 +74,8 @@ _UPSTREAM_TRAIN_METRIC_KEYS = {
 def _canonicalize_upstream_metric_key(metric: str) -> str:
     if "/" in metric:
         return metric
+    if metric == "tokens_per_second":
+        return ""
     if metric.startswith("group_metric_"):
         return f"reward/group_{metric[len('group_metric_'):]}"
     return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
@@ -307,12 +308,16 @@ class TinkerNativeBackend(Backend):
             for key, value in forward_output.metrics.items():
                 if value is None:
                     continue
-                metrics[_canonicalize_upstream_metric_key(key)] = float(value)
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
         if optim_output.metrics:
             for key, value in optim_output.metrics.items():
                 if value is None:
                     continue
-                metrics[_canonicalize_upstream_metric_key(key)] = float(value)
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
 
         next_step = state.current_step + 1
         checkpoint_name = f"step_{next_step:06d}"
