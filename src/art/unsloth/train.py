@@ -3,7 +3,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 import gc
 import os
-from typing import TYPE_CHECKING, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 import nest_asyncio
 from peft.peft_model import PeftModel
@@ -220,7 +220,7 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
 
 
 def get_log_fn(
-    trainer: "GRPOTrainer", results_queue: asyncio.Queue[dict[str, float]]
+    trainer: Any, results_queue: asyncio.Queue[dict[str, float]]
 ) -> Callable[..., None]:
     def log(logs: dict[str, float], start_time: float | None = None) -> None:
         metrics = {

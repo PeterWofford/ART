@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import wraps
 from inspect import iscoroutinefunction
-from typing import Any, ParamSpec, TypeVar
+from typing import Any, ParamSpec, TypeVar, cast
 
 from .costs import get_model_pricing, tokens_to_cost
 
@@ -459,10 +459,11 @@ def track_api_cost(
 
     def _decorate(func: Callable[P, R]) -> Callable[P, R]:
         if iscoroutinefunction(func):
+            async_func = cast(Callable[P, Awaitable[Any]], func)
 
             @wraps(func)
-            async def _async_wrapper(*args: P.args, **kwargs: P.kwargs):
-                result = await func(*args, **kwargs)
+            async def _async_wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
+                result = await async_func(*args, **kwargs)
                 _record_api_cost(
                     result=result,
                     source=normalized_source,
@@ -477,10 +478,10 @@ def track_api_cost(
                 )
                 return result
 
-            return _async_wrapper
+            return cast(Callable[P, R], _async_wrapper)
 
         @wraps(func)
-        def _sync_wrapper(*args: P.args, **kwargs: P.kwargs):
+        def _sync_wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
             result = func(*args, **kwargs)
             _record_api_cost(
                 result=result,

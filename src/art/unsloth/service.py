@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Literal, Protocol, cast
 from datasets import Dataset
 import peft
 import torch
+from torch.optim import Optimizer
 from transformers import GenerationMixin, PreTrainedModel
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 from trl import GRPOConfig, GRPOTrainer
@@ -188,6 +189,13 @@ def save_checkpoint(
 
     gc_and_empty_cuda_cache()
     return checkpoint_dir
+
+
+def _get_trainer_optimizer(trainer: GRPOTrainer) -> Optimizer:
+    optimizer = cast(Optimizer | None, getattr(trainer, "optimizer", None))
+    if optimizer is None:
+        raise RuntimeError("Trainer optimizer must be initialized before training")
+    return optimizer
 
 
 # ============================================================================
@@ -541,10 +549,11 @@ class UnslothService:
         mode_changed = (
             self._last_training_mode is not None and self._last_training_mode != mode
         )
+        optimizer = _get_trainer_optimizer(self._state.trainer)
 
         if mode_changed:
             # Clear all optimizer state (exp_avg, exp_avg_sq, step for each param)
-            self._state.trainer.optimizer.state.clear()
+            optimizer.state.clear()
 
         self._last_training_mode = mode
 
@@ -576,9 +585,10 @@ class UnslothService:
     ) -> AsyncIterator[dict[str, float]]:
         """Train in dedicated mode — no sleep/wake, vLLM keeps running on separate GPU."""
         self._reset_optimizer_if_mode_changed("rl")
+        optimizer = _get_trainer_optimizer(self._state.trainer)
 
         rl_weight_decay = 0.1
-        for param_group in self._state.trainer.optimizer.param_groups:
+        for param_group in optimizer.param_groups:
             param_group["weight_decay"] = rl_weight_decay
 
         packed_tensors = packed_tensors_from_dir(**disk_packed_tensors)
@@ -661,10 +671,11 @@ class UnslothService:
 
         # Reset optimizer state if switching from SFT to RL
         self._reset_optimizer_if_mode_changed("rl")
+        optimizer = _get_trainer_optimizer(self._state.trainer)
 
         # Set RL-specific hyperparameters
         rl_weight_decay = 0.1
-        for param_group in self._state.trainer.optimizer.param_groups:
+        for param_group in optimizer.param_groups:
             param_group["weight_decay"] = rl_weight_decay
 
         # Load packed tensors
@@ -794,7 +805,7 @@ class UnslothService:
         # Get model and optimizer
         peft_model = self._state.peft_model
         self._reset_optimizer_if_mode_changed("sft")
-        optimizer = self._state.trainer.optimizer
+        optimizer = _get_trainer_optimizer(self._state.trainer)
 
         # Set SFT-specific hyperparameters
         sft_weight_decay = 0.01
