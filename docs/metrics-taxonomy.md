@@ -12,28 +12,28 @@ Phase 1 introduces sectioned metric namespaces and hierarchical cost rollups.
 - `data/*`
 - `train/*`, `val/*`, `test/*`
 
-## Train Key Mapping
+## Backend Output
 
-Current training code emits the following canonical keys:
+ART backends emit canonical sectioned keys directly. The canonical training keys include:
 
-- `reward` -> `reward/mean`
-- `reward_std_dev` -> `reward/std_dev`
-- `exception_rate` -> `reward/exception_rate`
-- `group_metric_<k>` -> `reward/group_<k>`
-- `policy_loss` / `loss` -> `loss/train`
-- `entropy` -> `loss/entropy`
-- `kl_div` -> `loss/kl_div`
-- `kl_policy_ref` -> `loss/kl_policy_ref`
-- `grad_norm` -> `loss/grad_norm`
-- `learning_rate` -> `loss/learning_rate`
-- `tokens_per_second` -> `throughput/train_tok_per_sec`
-- `num_groups_submitted` -> `train/num_groups_submitted`
-- `num_groups_trainable` -> `train/num_groups_trainable`
-- `num_trajectories` -> `train/num_trajectories`
-- `num_trainable_tokens` -> `train/num_trainable_tokens`
-- `train_tokens` -> `data/step_trainer_tokens`
-- `num_datums` -> `data/step_num_datums`
-- `num_gradient_steps` -> `data/step_num_gradient_steps`
+- `reward/mean`
+- `reward/std_dev`
+- `reward/exception_rate`
+- `reward/group_<k>`
+- `loss/train`
+- `loss/entropy`
+- `loss/kl_div`
+- `loss/kl_policy_ref`
+- `loss/grad_norm`
+- `loss/learning_rate`
+- `throughput/train_tok_per_sec`
+- `train/num_groups_submitted`
+- `train/num_groups_trainable`
+- `train/num_trajectories`
+- `train/num_trainable_tokens`
+- `data/step_trainer_tokens`
+- `data/step_num_datums`
+- `data/step_num_gradient_steps`
 
 ## Cost Rollups
 
@@ -59,7 +59,7 @@ ART now emits the following metrics from library internals where the data is ava
 - `time/step_actor_s`, `time/step_eval_s` from `PipelineTrainer`
 - `data/step_num_scenarios`, `data/step_num_trajectories`, `data/step_num_groups_submitted`
 - `data/step_num_groups_trainable` for train splits
-- `data/cum/num_unique_scenarios` when scenario IDs are present in group or trajectory metadata
+- `data/cum/num_unique_scenarios` when `scenario_id` is present in group or trajectory metadata
 - `data/step_trainer_tokens` where the backend knows the trainer token count
 - `costs/gpu` on `LocalBackend` train-step logs when ART can resolve GPU pricing
 - `throughput/cum/trainer_idle_s`, `throughput/cum/actor_idle_s`

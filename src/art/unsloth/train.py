@@ -12,13 +12,47 @@ from trl import GRPOTrainer
 
 from .. import dev
 from ..loss import loss_fn, shift_tensor
-from ..metrics_taxonomy import rename_train_metric_key, rename_train_metrics
 from ..types import TrainConfig
 
 if TYPE_CHECKING:
     from .service import TrainInputs
 
 nest_asyncio.apply()
+
+_UPSTREAM_TRAIN_METRIC_KEYS = {
+    "reward": "reward/mean",
+    "reward_std_dev": "reward/std_dev",
+    "exception_rate": "reward/exception_rate",
+    "policy_loss": "loss/train",
+    "loss": "loss/train",
+    "entropy": "loss/entropy",
+    "kl_div": "loss/kl_div",
+    "kl_policy_ref": "loss/kl_policy_ref",
+    "grad_norm": "loss/grad_norm",
+    "learning_rate": "loss/learning_rate",
+    "tokens_per_second": "throughput/train_tok_per_sec",
+    "num_groups_submitted": "train/num_groups_submitted",
+    "num_groups_trainable": "train/num_groups_trainable",
+    "num_trajectories": "train/num_trajectories",
+    "num_trainable_tokens": "train/num_trainable_tokens",
+    "train_tokens": "data/step_trainer_tokens",
+    "num_datums": "data/step_num_datums",
+}
+
+
+def _canonicalize_upstream_metric_key(metric: str) -> str:
+    if "/" in metric:
+        return metric
+    if metric.startswith("group_metric_"):
+        return f"reward/group_{metric[len('group_metric_'):]}"
+    return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
+
+
+def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    return {
+        _canonicalize_upstream_metric_key(key): float(value)
+        for key, value in metrics.items()
+    }
 
 
 async def train(
@@ -198,12 +232,12 @@ def get_log_fn(
         if next(iter(logs.keys())).startswith("eval_"):
             normalized_metrics = {f"val/{key}": val for key, val in metrics.items()}
             normalized_logs = {
-                f"val/{rename_train_metric_key(key[len('eval_') :])}": val
+                f"val/{_canonicalize_upstream_metric_key(key[len('eval_') :])}": val
                 for key, val in logs.items()
             }
             results_queue.put_nowait({**normalized_metrics, **normalized_logs})
         else:
-            results_queue.put_nowait({**rename_train_metrics(logs), **metrics})
+            results_queue.put_nowait({**_canonicalize_upstream_metrics(logs), **metrics})
         trainer._metrics["train"].clear()
 
     return log

@@ -48,7 +48,6 @@ from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     average_metric_samples,
     build_training_summary_metrics,
-    rename_train_metrics,
     summarize_trajectory_groups,
 )
 from ..model import Model, TrainableModel
@@ -789,7 +788,6 @@ class LocalBackend(Backend):
         async for result in service.train(
             disk_packed_tensors, config, dev_config, verbose
         ):
-            result = rename_train_metrics(result)
             num_gradient_steps = int(
                 result.pop(TRAIN_GRADIENT_STEPS_KEY, estimated_gradient_steps)
             )

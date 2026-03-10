@@ -312,7 +312,7 @@ async def main() -> None:
     async def scenario_iter():
         for i in range(scenario_count):
             scenario = build_scenario()
-            scenario["metadata"] = {"scenario_idx": i}
+            scenario["metadata"] = {"scenario_id": str(i)}
             yield scenario
 
     config = PipelineConfig(

@@ -589,7 +589,7 @@ class TestMetricCalculation:
                         messages_and_choices=[{"role": "user", "content": "b"}],
                     ),
                 ],
-                metadata={"scenario_scenario_id": "scenario-1"},
+                metadata={"scenario_id": "scenario-1"},
             ),
             TrajectoryGroup(
                 trajectories=[
@@ -599,7 +599,7 @@ class TestMetricCalculation:
                     )
                 ],
                 exceptions=[],
-                metadata={"scenario_scenario_id": "scenario-2"},
+                metadata={"scenario_id": "scenario-2"},
             ),
         ]
 

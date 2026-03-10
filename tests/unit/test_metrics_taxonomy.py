@@ -1,10 +1,12 @@
 import pytest
 
+from art import Trajectory, TrajectoryGroup
 from art.metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     TrajectoryBatchSummary,
     average_metric_samples,
     build_training_summary_metrics,
+    summarize_trajectory_groups,
 )
 
 
@@ -49,3 +51,30 @@ def test_average_metric_samples_requires_invariant_gradient_step_count() -> None
                 {TRAIN_GRADIENT_STEPS_KEY: 3.0},
             ]
         )
+
+
+def test_summarize_trajectory_groups_only_counts_explicit_scenario_id() -> None:
+    summary = summarize_trajectory_groups(
+        [
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=1.0,
+                        messages_and_choices=[{"role": "user", "content": "a"}],
+                    )
+                ],
+                metadata={"scenario_id": "scenario-1"},
+            ),
+            TrajectoryGroup(
+                trajectories=[
+                    Trajectory(
+                        reward=0.0,
+                        messages_and_choices=[{"role": "user", "content": "b"}],
+                    )
+                ],
+                metadata={"scenario_scenario_id": "legacy-scenario"},
+            ),
+        ]
+    )
+
+    assert summary.scenario_ids == ["scenario-1"]
