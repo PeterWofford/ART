@@ -249,6 +249,21 @@ def _estimate_anthropic_cost(
     )
 
 
+def _estimate_provider_cost(
+    provider_name: str | None,
+    response: Any,
+    pricing: TokenPricing,
+) -> float | None:
+    if provider_name == OPENAI_PROVIDER:
+        return _estimate_openai_cost(_extract_openai_token_counts(response), pricing)
+    if provider_name == ANTHROPIC_PROVIDER:
+        return _estimate_anthropic_cost(
+            _extract_anthropic_token_counts(response),
+            pricing,
+        )
+    return None
+
+
 def _strip_snapshot_suffix(model_name: str) -> str:
     for pattern in (
         r"^(.*)-\d{4}-\d{2}-\d{2}$",
@@ -466,32 +481,13 @@ def extract_api_cost(
     model_pricing: Mapping[str, TokenPricing],
 ) -> float | None:
     provider_name = normalize_provider(provider) or _detect_provider(response)
-    if provider_name is not None:
-        custom_extractor = cost_extractors.get(provider_name)
-        if custom_extractor is not None:
-            custom_cost = custom_extractor(response)
-            if custom_cost is not None:
-                return float(custom_cost)
-
-        pricing = _resolve_token_pricing(
-            response,
-            provider=provider_name,
-            model_name=model_name,
-            model_name_getter=model_name_getter,
-            prompt_price_per_million=prompt_price_per_million,
-            completion_price_per_million=completion_price_per_million,
-            cached_prompt_price_per_million=cached_prompt_price_per_million,
-            cache_creation_price_per_million=cache_creation_price_per_million,
-            cache_read_price_per_million=cache_read_price_per_million,
-            model_pricing=model_pricing,
-        )
-        if provider_name == OPENAI_PROVIDER:
-            return _estimate_openai_cost(_extract_openai_token_counts(response), pricing)
-        if provider_name == ANTHROPIC_PROVIDER:
-            return _estimate_anthropic_cost(
-                _extract_anthropic_token_counts(response),
-                pricing,
-            )
+    custom_extractor = (
+        cost_extractors.get(provider_name) if provider_name is not None else None
+    )
+    if custom_extractor is not None:
+        custom_cost = custom_extractor(response)
+        if custom_cost is not None:
+            return float(custom_cost)
 
     pricing = _resolve_token_pricing(
         response,
@@ -505,6 +501,10 @@ def extract_api_cost(
         cache_read_price_per_million=cache_read_price_per_million,
         model_pricing=model_pricing,
     )
+    provider_cost = _estimate_provider_cost(provider_name, response, pricing)
+    if provider_cost is not None:
+        return provider_cost
+
     openai_token_counts = _extract_openai_token_counts(response)
     if openai_token_counts is not None:
         return _estimate_openai_cost(openai_token_counts, pricing)

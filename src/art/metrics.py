@@ -182,8 +182,6 @@ class MetricsBuilder:
 
     async def flush(self) -> dict[str, float]:
         async with self._shared_state.lock:
-            self._validate_hierarchy()
-
             result = dict(self._shared_state.step_buffer)
             cost_metrics = {
                 key: value
@@ -320,17 +318,6 @@ class MetricsBuilder:
         self._shared_state.step_buffer[key] = (
             self._shared_state.step_buffer.get(key, 0.0) + value
         )
-
-    def _validate_hierarchy(self) -> None:
-        keys = sorted(
-            k for k in self._shared_state.step_buffer if k.startswith("costs/")
-        )
-        for i, key in enumerate(keys):
-            for other in keys[i + 1 :]:
-                if other.startswith(f"{key}/"):
-                    raise ValueError(
-                        f"Leaf/parent conflict: '{key}' and '{other}' cannot coexist."
-                    )
 
     def _compute_rollups(self, cost_metrics: dict[str, float]) -> dict[str, float]:
         if not cost_metrics:
