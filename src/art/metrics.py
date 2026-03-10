@@ -236,9 +236,7 @@ class MetricsBuilder:
             _shared_state=self._shared_state,
         )
 
-    def register_cost_extractor(
-        self, provider: str, extractor: CostExtractor
-    ) -> None:
+    def register_cost_extractor(self, provider: str, extractor: CostExtractor) -> None:
         normalized_provider = normalize_provider(provider)
         if normalized_provider is None:
             raise ValueError("provider must be non-empty")
@@ -356,16 +354,9 @@ class MetricsBuilder:
             self._shared_state.cum_state[cum_key] = next_value
             result[cum_key] = next_value
 
-        if (
-            "data/step_trainer_tokens" in result
-            or "time/step_trainer_s" in result
-        ):
-            trainer_tokens = self._shared_state.cum_state.get(
-                "data/cum/trainer_tokens"
-            )
-            trainer_seconds = self._shared_state.cum_state.get(
-                "time/cum/trainer_s"
-            )
+        if "data/step_trainer_tokens" in result or "time/step_trainer_s" in result:
+            trainer_tokens = self._shared_state.cum_state.get("data/cum/trainer_tokens")
+            trainer_seconds = self._shared_state.cum_state.get("time/cum/trainer_s")
             if (
                 trainer_tokens is not None
                 and trainer_seconds is not None
@@ -376,9 +367,7 @@ class MetricsBuilder:
                 )
 
         if "data/step_actor_tokens" in result or "time/step_actor_s" in result:
-            actor_tokens = self._shared_state.cum_state.get(
-                "data/cum/actor_tokens"
-            )
+            actor_tokens = self._shared_state.cum_state.get("data/cum/actor_tokens")
             actor_seconds = self._shared_state.cum_state.get("time/cum/actor_s")
             if (
                 actor_tokens is not None

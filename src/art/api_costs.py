@@ -140,9 +140,7 @@ def _extract_anthropic_token_counts(response: Any) -> _AnthropicTokenUsage | Non
     cache_creation_input_tokens = (
         _read_usage_field(usage, "cache_creation_input_tokens") or 0.0
     )
-    cache_read_input_tokens = (
-        _read_usage_field(usage, "cache_read_input_tokens") or 0.0
-    )
+    cache_read_input_tokens = _read_usage_field(usage, "cache_read_input_tokens") or 0.0
     if (
         input_tokens is None
         and output_tokens is None
@@ -230,7 +228,7 @@ def _estimate_provider_cost(
         return _estimate_anthropic_cost(
             _extract_anthropic_token_counts(response),
             pricing,
-    )
+        )
     return None
 
 
@@ -399,9 +397,7 @@ def extract_api_cost(
             f"Response usage does not match provider '{provider_name}'. "
             "Pass the correct provider/model pair or register a custom cost extractor."
         )
-    raise ValueError(
-        f"No cost extractor registered for provider '{provider_name}'."
-    )
+    raise ValueError(f"No cost extractor registered for provider '{provider_name}'.")
 
 
 def _record_api_cost(

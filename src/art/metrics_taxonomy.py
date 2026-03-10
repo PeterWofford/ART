@@ -9,7 +9,9 @@ TRAIN_GRADIENT_STEPS_KEY = "data/step_num_gradient_steps"
 _INVARIANT_METRIC_KEYS = frozenset({TRAIN_GRADIENT_STEPS_KEY})
 
 
-def average_metric_samples(metric_samples: Iterable[dict[str, float]]) -> dict[str, float]:
+def average_metric_samples(
+    metric_samples: Iterable[dict[str, float]],
+) -> dict[str, float]:
     totals: dict[str, float] = {}
     counts: dict[str, int] = {}
     invariant_values: dict[str, float] = {}
@@ -65,7 +67,9 @@ def summarize_trajectory_groups(
 
     return TrajectoryBatchSummary(
         num_scenarios=len(groups),
-        num_trajectories=sum(len(group.trajectories) + len(group.exceptions) for group in groups),
+        num_trajectories=sum(
+            len(group.trajectories) + len(group.exceptions) for group in groups
+        ),
         num_groups_submitted=len(groups),
         num_groups_trainable=sum(1 for group in groups if _group_is_trainable(group)),
         scenario_ids=scenario_ids,
@@ -117,7 +121,10 @@ def _group_is_trainable(group: TrajectoryGroup) -> bool:
 
 
 def _extract_scenario_id(group: TrajectoryGroup) -> str | None:
-    for metadata in [group.metadata, *(trajectory.metadata for trajectory in group.trajectories)]:
+    for metadata in [
+        group.metadata,
+        *(trajectory.metadata for trajectory in group.trajectories),
+    ]:
         scenario_id = _extract_scenario_id_from_metadata(metadata)
         if scenario_id is not None:
             return scenario_id

@@ -132,7 +132,9 @@ class TestTrackApiCost:
         assert metrics["costs/train/llm_judge/cached_openai"] == pytest.approx(0.00255)
 
     @pytest.mark.asyncio
-    async def test_anthropic_cost_extraction_uses_registered_model_pricing(self) -> None:
+    async def test_anthropic_cost_extraction_uses_registered_model_pricing(
+        self,
+    ) -> None:
         builder = MetricsBuilder(cost_context="train")
         builder.register_model_pricing(
             "anthropic/test-judge",

@@ -216,9 +216,9 @@ class TestLiveApiCost:
         )
         first_row, second_row = _history_rows(history_path)
 
-        assert first_row["costs/eval/llm_judge/anthropic_prompt_cache"] == pytest.approx(
-            first_expected_cost
-        )
+        assert first_row[
+            "costs/eval/llm_judge/anthropic_prompt_cache"
+        ] == pytest.approx(first_expected_cost)
         assert second_row[
             "costs/eval/llm_judge/anthropic_prompt_cache"
         ] == pytest.approx(second_expected_cost)

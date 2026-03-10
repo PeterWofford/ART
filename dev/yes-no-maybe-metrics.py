@@ -173,9 +173,7 @@ async def main() -> None:
     base_model = os.environ.get("BASE_MODEL", "Qwen/Qwen3-30B-A3B-Instruct-2507")
     project = os.environ.get("PROJECT", "yes-no-maybe-metrics")
     model = art.TrainableModel(
-        name=os.environ.get(
-            "MODEL_NAME", f"yes-no-maybe-metrics-{int(time.time())}"
-        ),
+        name=os.environ.get("MODEL_NAME", f"yes-no-maybe-metrics-{int(time.time())}"),
         project=project,
         base_model=base_model,
         report_metrics=["wandb"],

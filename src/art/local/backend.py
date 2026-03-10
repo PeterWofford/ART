@@ -96,9 +96,7 @@ class LocalBackend(Backend):
         self._in_process = in_process
         self._path = path or get_default_art_path()
         self._gpu_cost_per_hour_usd = (
-            float(gpu_cost_per_hour_usd)
-            if gpu_cost_per_hour_usd is not None
-            else None
+            float(gpu_cost_per_hour_usd) if gpu_cost_per_hour_usd is not None else None
         )
         os.makedirs(self._path, exist_ok=True)
 

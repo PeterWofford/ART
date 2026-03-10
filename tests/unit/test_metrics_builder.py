@@ -79,7 +79,9 @@ class TestMetricsBuilder:
         assert metrics["throughput/step_actor_idle_s"] == pytest.approx(3.0)
 
     @pytest.mark.asyncio
-    async def test_throughput_metrics_derive_from_time_and_token_cumulatives(self) -> None:
+    async def test_throughput_metrics_derive_from_time_and_token_cumulatives(
+        self,
+    ) -> None:
         builder = MetricsBuilder(cost_context="train")
 
         builder.add_metric("time/step_trainer_s", 4.0)

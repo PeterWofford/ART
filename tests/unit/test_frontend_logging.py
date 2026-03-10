@@ -349,9 +349,9 @@ class TestMetricCalculation:
                 "time/wall_clock_sec",
             ]
         ]
-        assert all(
-            k.startswith(("val/", "data/")) for k in metric_keys
-        ), f"Not all metrics routed into taxonomy namespaces: {metric_keys}"
+        assert all(k.startswith(("val/", "data/")) for k in metric_keys), (
+            f"Not all metrics routed into taxonomy namespaces: {metric_keys}"
+        )
         assert entry["training_step"] == 0
         assert entry["time/wall_clock_sec"] >= 0
 

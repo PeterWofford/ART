@@ -153,9 +153,13 @@ class Model(
         object.__setattr__(self, "_wandb_defined_metrics", set())
         object.__setattr__(self, "_run_start_time", time.time())
         object.__setattr__(self, "_run_start_monotonic", time.monotonic())
-        object.__setattr__(self, "_last_local_train_log_monotonic", self._run_start_monotonic)
+        object.__setattr__(
+            self, "_last_local_train_log_monotonic", self._run_start_monotonic
+        )
         object.__setattr__(self, "_last_local_train_step", None)
-        object.__setattr__(self, "_metrics_builder", MetricsBuilder(cost_context="train"))
+        object.__setattr__(
+            self, "_metrics_builder", MetricsBuilder(cost_context="train")
+        )
         object.__setattr__(self, "_metrics_builder_state_loaded", False)
 
     @overload
@@ -548,7 +552,9 @@ class Model(
         if "time/step_wall_s" not in provided_metric_keys:
             automatic_metrics["time/step_wall_s"] = step_wall_s
 
-        gpu_cost_getter = getattr(self._backend, "automatic_gpu_cost_per_hour_usd", None)
+        gpu_cost_getter = getattr(
+            self._backend, "automatic_gpu_cost_per_hour_usd", None
+        )
         if callable(gpu_cost_getter) and "costs/gpu" not in provided_metric_keys:
             gpu_cost_per_hour_usd = gpu_cost_getter(self)
             if gpu_cost_per_hour_usd is not None:
@@ -597,9 +603,7 @@ class Model(
             return self._metrics_builder
         return self._metrics_builder.for_cost_context(cost_context)
 
-    def activate_metrics_context(
-        self, cost_context: str
-    ) -> Token[MetricsBuilder]:
+    def activate_metrics_context(self, cost_context: str) -> Token[MetricsBuilder]:
         return self.metrics_builder(cost_context).activate()
 
     def _load_metrics_builder_state(self) -> None:
@@ -777,7 +781,9 @@ class Model(
         for metric, values in group_metrics.items():
             if len(values) > 0:
                 group_key = (
-                    f"reward/group_{metric}" if split == "train" else f"group_metric_{metric}"
+                    f"reward/group_{metric}"
+                    if split == "train"
+                    else f"group_metric_{metric}"
                 )
                 averages[group_key] = sum(values) / len(values)
 
@@ -1080,4 +1086,6 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             avg_metrics["time/step_trainer_s"] = trainer_elapsed
             # Get the current step after training
             step = await self.get_step()
-            await self.log(trajectories=None, split="train", metrics=avg_metrics, step=step)
+            await self.log(
+                trajectories=None, split="train", metrics=avg_metrics, step=step
+            )

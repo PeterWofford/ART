@@ -45,7 +45,7 @@ def _canonicalize_upstream_metric_key(metric: str) -> str:
     if metric == "tokens_per_second":
         return ""
     if metric.startswith("group_metric_"):
-        return f"reward/group_{metric[len('group_metric_'):]}"
+        return f"reward/group_{metric[len('group_metric_') :]}"
     return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
 
 
@@ -237,7 +237,9 @@ def get_log_fn(
             }
             results_queue.put_nowait({**normalized_metrics, **normalized_logs})
         else:
-            results_queue.put_nowait({**_canonicalize_upstream_metrics(logs), **metrics})
+            results_queue.put_nowait(
+                {**_canonicalize_upstream_metrics(logs), **metrics}
+            )
         trainer._metrics["train"].clear()
 
     return log
