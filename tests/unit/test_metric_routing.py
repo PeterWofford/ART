@@ -118,4 +118,4 @@ class TestMetricRoutingBaseline:
         assert logged_metrics["costs/cum/train/prefill"] == 0.2
         assert logged_metrics["training_step"] == 1
         assert "time/wall_clock_sec" in logged_metrics
-        assert fake_run.log.call_args.kwargs == {"step": 1}
+        assert fake_run.log.call_args.kwargs == {}
