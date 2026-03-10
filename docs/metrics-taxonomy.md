@@ -91,16 +91,6 @@ builder.add_idle_times(step_actor_idle_s=result.actor_idle_s)
 
 If these metrics are logged before the next `model.log(...)` flush, ART will also emit the cumulative and derived throughput metrics automatically.
 
-## End-to-End Smoke Test
-
-Run:
-
-```bash
-uv run python examples/metrics_taxonomy_smoke.py
-```
-
-This writes a local history file and, if `WANDB_API_KEY` is set, logs the same metrics to W&B.
-
 ## API Cost Decorator (Phase 2/3)
 
 Use `@track_api_cost` to automatically write judge/API spend into `costs/{train|eval}/...`.
@@ -123,17 +113,11 @@ async def run_judge(client, messages):
 Activate metric cost context while running train/eval logic:
 
 ```python
-train_token = model.activate_metrics_context("train")
-try:
+with model.metrics_builder("train").activate_context():
     await run_judge(client, train_messages)
-finally:
-    train_token.var.reset(train_token)
 
-eval_token = model.activate_metrics_context("eval")
-try:
+with model.metrics_builder("eval").activate_context():
     await run_judge(client, eval_messages)
-finally:
-    eval_token.var.reset(eval_token)
 ```
 
 The next `model.log(...)` flush for that step will include:
