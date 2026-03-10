@@ -38,7 +38,7 @@ backend = [
     "pytest>=8.4.1",
     "nbmake>=1.5.5",
     "gql<4",
-    "vllm==0.15.1 ; sys_platform == 'linux'",
+    "vllm==0.17.0 ; sys_platform == 'linux'",
 ]
 megatron = [
     "torch>=2.8.0",
@@ -120,8 +120,8 @@ asyncio_mode = "auto"
 [tool.uv]
 required-version = ">=0.6.15"
 # Override numpy to <2.0 for compatibility with megatron-core in the training
-# environment. vLLM 0.15.1 pulls opencv-python-headless>=4.13 which wants
-# numpy>=2 on Python 3.9+, but megatron-core requires numpy<2.
+# environment. vLLM pulls opencv-python-headless>=4.13 which wants numpy>=2 on
+# Python 3.9+, but megatron-core requires numpy<2.
 override-dependencies = ["transformer-engine>=2.11.0", "numpy<2"]
 # Keep apex build isolation enabled so uv can inject torch from
 # `extra-build-dependencies` during lock/sync on non-GPU client machines.
