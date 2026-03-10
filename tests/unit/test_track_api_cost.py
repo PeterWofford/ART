@@ -6,14 +6,26 @@ from unittest.mock import MagicMock
 import pytest
 
 from art import Model, TrainableModel, Trajectory, TrajectoryGroup
+from art.costs import compute_sample_costs, get_model_pricing
 from art.metrics import MetricsBuilder, track_api_cost
 from art.pipeline_trainer.trainer import PipelineTrainer
 
 
 class _OpenAIUsage:
-    def __init__(self, prompt_tokens: int, completion_tokens: int) -> None:
+    def __init__(
+        self,
+        prompt_tokens: int,
+        completion_tokens: int,
+        *,
+        cached_tokens: int = 0,
+    ) -> None:
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
+        self.prompt_tokens_details = type(
+            "PromptTokensDetails",
+            (),
+            {"cached_tokens": cached_tokens},
+        )()
 
 
 class _OpenAIResponse:
@@ -22,16 +34,30 @@ class _OpenAIResponse:
         prompt_tokens: int,
         completion_tokens: int,
         *,
+        cached_tokens: int = 0,
         model: str | None = None,
     ) -> None:
-        self.usage = _OpenAIUsage(prompt_tokens, completion_tokens)
+        self.usage = _OpenAIUsage(
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens=cached_tokens,
+        )
         self.model = model
 
 
 class _AnthropicUsage:
-    def __init__(self, input_tokens: int, output_tokens: int) -> None:
+    def __init__(
+        self,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        cache_creation_input_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
+    ) -> None:
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
+        self.cache_creation_input_tokens = cache_creation_input_tokens
+        self.cache_read_input_tokens = cache_read_input_tokens
 
 
 class _AnthropicResponse:
@@ -40,9 +66,16 @@ class _AnthropicResponse:
         input_tokens: int,
         output_tokens: int,
         *,
+        cache_creation_input_tokens: int = 0,
+        cache_read_input_tokens: int = 0,
         model: str | None = None,
     ) -> None:
-        self.usage = _AnthropicUsage(input_tokens, output_tokens)
+        self.usage = _AnthropicUsage(
+            input_tokens,
+            output_tokens,
+            cache_creation_input_tokens=cache_creation_input_tokens,
+            cache_read_input_tokens=cache_read_input_tokens,
+        )
         self.model = model
 
 
@@ -70,6 +103,33 @@ class TestTrackApiCost:
         assert metrics["costs/train/llm_judge/correctness"] == pytest.approx(0.0002)
 
     @pytest.mark.asyncio
+    async def test_openai_cost_extraction_accounts_for_cached_tokens(self) -> None:
+        builder = MetricsBuilder(cost_context="train")
+
+        @track_api_cost(
+            source="llm_judge/cached_openai",
+            provider="openai",
+            prompt_price_per_million=2.0,
+            completion_price_per_million=8.0,
+            cached_prompt_price_per_million=0.5,
+        )
+        async def _judge() -> _OpenAIResponse:
+            return _OpenAIResponse(
+                prompt_tokens=2_000,
+                completion_tokens=100,
+                cached_tokens=1_500,
+            )
+
+        token = builder.activate()
+        try:
+            await _judge()
+        finally:
+            token.var.reset(token)
+
+        metrics = await builder.flush()
+        assert metrics["costs/train/llm_judge/cached_openai"] == pytest.approx(0.00255)
+
+    @pytest.mark.asyncio
     async def test_anthropic_cost_extraction_uses_registered_model_pricing(self) -> None:
         builder = MetricsBuilder(cost_context="train")
         builder.register_model_pricing(
@@ -93,6 +153,126 @@ class TestTrackApiCost:
 
         metrics = await builder.flush()
         assert metrics["costs/train/llm_judge/faithfulness"] == pytest.approx(0.00062)
+
+    @pytest.mark.asyncio
+    async def test_anthropic_cost_extraction_accounts_for_cache_write_and_read(
+        self,
+    ) -> None:
+        builder = MetricsBuilder(cost_context="eval")
+        builder.register_model_pricing(
+            "anthropic/claude-sonnet-4-6",
+            prompt_per_million=3.0,
+            completion_per_million=15.0,
+            cache_creation_per_million=3.75,
+            cache_read_per_million=0.30,
+        )
+
+        @track_api_cost(
+            source="llm_judge/anthropic_cache",
+            provider="anthropic",
+            model_name="anthropic/claude-sonnet-4-6",
+        )
+        async def _judge() -> _AnthropicResponse:
+            return _AnthropicResponse(
+                input_tokens=100,
+                output_tokens=50,
+                cache_creation_input_tokens=1_000,
+                cache_read_input_tokens=500,
+            )
+
+        token = builder.activate()
+        try:
+            await _judge()
+        finally:
+            token.var.reset(token)
+
+        metrics = await builder.flush()
+        assert metrics["costs/eval/llm_judge/anthropic_cache"] == pytest.approx(0.00495)
+
+    @pytest.mark.asyncio
+    async def test_response_model_name_resolves_provider_scoped_global_pricing(
+        self,
+    ) -> None:
+        builder = MetricsBuilder(cost_context="train")
+        pricing = get_model_pricing("openai/gpt-oss-20b")
+        assert pricing is not None
+
+        @track_api_cost(source="llm_judge/global_pricing", provider="openai")
+        async def _judge() -> _OpenAIResponse:
+            return _OpenAIResponse(
+                prompt_tokens=1_000,
+                completion_tokens=2_000,
+                model="gpt-oss-20b",
+            )
+
+        token = builder.activate()
+        try:
+            await _judge()
+        finally:
+            token.var.reset(token)
+
+        metrics = await builder.flush()
+        expected = compute_sample_costs(
+            prompt_tokens=1_000,
+            completion_tokens=2_000,
+            pricing=pricing,
+        )
+        assert metrics["costs/train/llm_judge/global_pricing"] == pytest.approx(
+            expected["costs_prefill"] + expected["costs_sample"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_response_model_name_resolves_provider_scoped_registered_pricing(
+        self,
+    ) -> None:
+        builder = MetricsBuilder(cost_context="eval")
+        builder.register_model_pricing(
+            "anthropic/test-judge",
+            prompt_per_million=1.5,
+            completion_per_million=2.5,
+        )
+
+        @track_api_cost(source="llm_judge/provider_resolution", provider="anthropic")
+        async def _judge() -> _AnthropicResponse:
+            return _AnthropicResponse(
+                input_tokens=400,
+                output_tokens=600,
+                model="test-judge",
+            )
+
+        token = builder.activate()
+        try:
+            await _judge()
+        finally:
+            token.var.reset(token)
+
+        metrics = await builder.flush()
+        assert metrics["costs/eval/llm_judge/provider_resolution"] == pytest.approx(
+            0.0021
+        )
+
+    @pytest.mark.asyncio
+    async def test_snapshot_model_name_resolves_to_global_pricing(self) -> None:
+        builder = MetricsBuilder(cost_context="train")
+
+        @track_api_cost(source="llm_judge/snapshot", provider="openai")
+        async def _judge() -> _OpenAIResponse:
+            return _OpenAIResponse(
+                prompt_tokens=1_000,
+                completion_tokens=100,
+                cached_tokens=800,
+                model="gpt-4.1-2025-04-14",
+            )
+
+        token = builder.activate()
+        try:
+            await _judge()
+        finally:
+            token.var.reset(token)
+
+        metrics = await builder.flush()
+        expected = ((200 * 2.0) + (800 * 0.5) + (100 * 8.0)) / 1_000_000
+        assert metrics["costs/train/llm_judge/snapshot"] == pytest.approx(expected)
 
     @pytest.mark.asyncio
     async def test_decorator_fails_fast_without_model_aware_pricing(self) -> None:

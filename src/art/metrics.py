@@ -99,6 +99,9 @@ class MetricsBuilder:
         model_name_getter: "ModelNameGetter | None" = None,
         prompt_price_per_million: float | None = None,
         completion_price_per_million: float | None = None,
+        cached_prompt_price_per_million: float | None = None,
+        cache_creation_price_per_million: float | None = None,
+        cache_read_price_per_million: float | None = None,
     ) -> float | None:
         normalized_source = source.strip("/")
         if not normalized_source:
@@ -111,6 +114,9 @@ class MetricsBuilder:
             model_name_getter=model_name_getter,
             prompt_price_per_million=prompt_price_per_million,
             completion_price_per_million=completion_price_per_million,
+            cached_prompt_price_per_million=cached_prompt_price_per_million,
+            cache_creation_price_per_million=cache_creation_price_per_million,
+            cache_read_price_per_million=cache_read_price_per_million,
             cost_extractors=self._shared_state.cost_extractors,
             model_pricing=self._shared_state.model_pricing,
         )
@@ -248,6 +254,9 @@ class MetricsBuilder:
         *,
         prompt_per_million: float,
         completion_per_million: float,
+        cached_prompt_per_million: float | None = None,
+        cache_creation_per_million: float | None = None,
+        cache_read_per_million: float | None = None,
     ) -> None:
         normalized_model_name = model_name.strip()
         if not normalized_model_name:
@@ -255,6 +264,21 @@ class MetricsBuilder:
         self._shared_state.model_pricing[normalized_model_name] = TokenPricing(
             prompt_per_million=float(prompt_per_million),
             completion_per_million=float(completion_per_million),
+            cached_prompt_per_million=(
+                float(cached_prompt_per_million)
+                if cached_prompt_per_million is not None
+                else None
+            ),
+            cache_creation_per_million=(
+                float(cache_creation_per_million)
+                if cache_creation_per_million is not None
+                else None
+            ),
+            cache_read_per_million=(
+                float(cache_read_per_million)
+                if cache_read_per_million is not None
+                else None
+            ),
         )
 
     def state_dict(self) -> dict[str, Any]:
