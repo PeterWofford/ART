@@ -80,15 +80,13 @@ async def test_pipeline_trainer_logs_explicit_stale_and_zero_variance_metrics(
     with open(history_path) as f:
         rows = [json.loads(line) for line in f if line.strip()]
 
-    train_row = next(row for row in rows if "reward/mean" in row)
+    train_row = next(row for row in rows if "train/reward" in row)
     zero_variance_row = next(
         row
         for row in rows
-        if any(key.startswith("discarded") for key in row)
-        or any(key.startswith("discarded_zero_variance") for key in row)
+        if any(key.startswith("discarded/") for key in row)
     )
 
     assert "train/discarded_stale_groups" in train_row
     assert "train/discarded_stale_samples" not in train_row
-    assert "discarded_zero_variance/reward" in zero_variance_row
-    assert not any(key.startswith("discarded/") for key in zero_variance_row)
+    assert "discarded/reward" in zero_variance_row

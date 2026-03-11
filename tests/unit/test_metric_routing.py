@@ -72,6 +72,7 @@ class TestMetricRoutingBaseline:
             (("train/*",), {"step_metric": "training_step"}),
             (("val/*",), {"step_metric": "training_step"}),
             (("test/*",), {"step_metric": "training_step"}),
+            (("discarded/*",), {"step_metric": "training_step"}),
         ]
 
     def test_log_metrics_defines_nested_cost_keys_with_training_step(

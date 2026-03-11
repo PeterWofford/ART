@@ -726,7 +726,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         if not self._discard_queue:
             return
         discarded = list(self._discard_queue)
-        await self.model.log(discarded, split="discarded_zero_variance", step=step)
+        await self.model.log(discarded, split="discarded", step=step)
         self._discard_queue.clear()
 
     @staticmethod

@@ -20,9 +20,9 @@ if TYPE_CHECKING:
 nest_asyncio.apply()
 
 _UPSTREAM_TRAIN_METRIC_KEYS = {
-    "reward": "reward/mean",
-    "reward_std_dev": "reward/std_dev",
-    "exception_rate": "reward/exception_rate",
+    "reward": "reward",
+    "reward_std_dev": "reward_std_dev",
+    "exception_rate": "exception_rate",
     "policy_loss": "loss/train",
     "loss": "loss/train",
     "entropy": "loss/entropy",
@@ -45,7 +45,7 @@ def _canonicalize_upstream_metric_key(metric: str) -> str:
     if metric == "tokens_per_second":
         return ""
     if metric.startswith("group_metric_"):
-        return f"reward/group_{metric[len('group_metric_') :]}"
+        return f"group_{metric[len('group_metric_') :]}"
     return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
 
 

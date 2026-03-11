@@ -21,7 +21,7 @@ ART already logs most of the metrics you need to monitor a run.
 
 | Type | Examples |
 | --- | --- |
-| Reward | `reward/mean`, `reward/std_dev`, `reward/exception_rate` |
+| Reward | `train/reward`, `train/reward_std_dev`, `train/exception_rate`, `val/reward` |
 | Loss | `loss/train`, `loss/entropy`, `loss/kl_div`, `loss/grad_norm`, `loss/learning_rate` |
 | Data | `data/step_num_scenarios`, `data/step_num_trajectories`, `data/step_num_groups_submitted`, `data/step_num_groups_trainable` |
 | Time | `time/wall_clock_sec`, `time/step_wall_s`, `time/step_trainer_s` |
@@ -68,11 +68,11 @@ async def rollout(model: art.Model, scenario: Scenario) -> art.Trajectory:
 ```
 
 On train steps, ART averages those rollout metrics and logs them under the
-`reward/` namespace, such as `reward/correct` and `reward/tool_calls`.
+`train/` namespace, such as `train/correct` and `train/tool_calls`.
 
 If you want to record one value per `TrajectoryGroup` instead of one per
 trajectory, pass `metrics={...}` when you build the group. ART logs those once
-per group, using keys like `reward/group_difficulty` on train steps.
+per group, using keys like `train/group_difficulty` on train steps.
 
 ## Add step-level metrics ART cannot infer
 

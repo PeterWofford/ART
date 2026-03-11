@@ -232,7 +232,7 @@ class TestHistoryJsonlCompatibility:
         # Check both splits are present
         columns = df.columns
         assert any("val/" in col for col in columns)
-        assert any("reward/" in col for col in columns)
+        assert any("train/" in col for col in columns)
 
 
 class TestPathStructure:
@@ -433,7 +433,7 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["val/group_metric_judge_score"] == 0.4
+        assert entry["val/group_judge_score"] == 0.4
 
     @pytest.mark.asyncio
     async def test_exception_rate_calculation(self, tmp_path: Path):
@@ -528,7 +528,7 @@ class TestMetricCalculation:
         assert entry["val/custom"] == pytest.approx(2.0)
 
     @pytest.mark.asyncio
-    async def test_train_trajectory_metrics_default_to_reward_prefix(
+    async def test_train_trajectory_metrics_default_to_train_prefix(
         self, tmp_path: Path
     ):
         model = Model(
@@ -560,10 +560,9 @@ class TestMetricCalculation:
         with open(history_path) as f:
             entry = json.loads(f.readline())
 
-        assert entry["reward/mean"] == 0.7
-        assert entry["reward/exception_rate"] == 0.0
-        assert "train/reward" not in entry
-        assert entry["reward/custom_score"] == 1.0
+        assert entry["train/reward"] == 0.7
+        assert entry["train/exception_rate"] == 0.0
+        assert entry["train/custom_score"] == 1.0
         assert entry["reward/prefixed"] == 2.0
 
     @pytest.mark.asyncio

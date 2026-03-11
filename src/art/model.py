@@ -435,6 +435,7 @@ class Model(
             wandb.define_metric("train/*", step_metric="training_step")
             wandb.define_metric("val/*", step_metric="training_step")
             wandb.define_metric("test/*", step_metric="training_step")
+            wandb.define_metric("discarded/*", step_metric="training_step")
         return self._wandb_run
 
     def _log_metrics(
@@ -722,11 +723,9 @@ class Model(
         )
 
         # 2. Calculate aggregate metrics (excluding additive costs)
-        reward_key = "reward/mean" if split == "train" else "reward"
-        exception_rate_key = (
-            "reward/exception_rate" if split == "train" else "exception_rate"
-        )
-        reward_std_dev_key = "reward/std_dev" if split == "train" else "reward_std_dev"
+        reward_key = "reward"
+        exception_rate_key = "exception_rate"
+        reward_std_dev_key = "reward_std_dev"
 
         all_metrics: dict[str, list[float]] = {
             reward_key: [],
@@ -756,10 +755,7 @@ class Model(
                 # Collect other custom metrics
                 trajectory_metrics: dict[str, float] = {}
                 for metric, value in trajectory.metrics.items():
-                    routed_metric = metric
-                    if split == "train" and "/" not in routed_metric:
-                        routed_metric = f"reward/{routed_metric}"
-                    trajectory_metrics[routed_metric] = float(value)
+                    trajectory_metrics[metric] = float(value)
 
                 non_cost_trajectory_metrics = self._route_metrics_and_collect_non_costs(
                     trajectory_metrics,
@@ -781,11 +777,7 @@ class Model(
         # Aggregate group-level metrics once per group
         for metric, values in group_metrics.items():
             if len(values) > 0:
-                group_key = (
-                    f"reward/group_{metric}"
-                    if split == "train"
-                    else f"group_metric_{metric}"
-                )
+                group_key = f"group_{metric}"
                 averages[group_key] = sum(values) / len(values)
 
         # Calculate average standard deviation of rewards within groups
