@@ -25,6 +25,7 @@ from openai.types.completion_usage import CompletionUsage
 from pydantic import SkipValidation
 import tinker
 from tinker.lib.public_interfaces.rest_client import RestClient as TinkerRestClient
+from transformers.tokenization_utils_base import BatchEncoding
 import uvicorn
 
 from art.tinker.cookbook_v import renderers
@@ -60,14 +61,15 @@ class OpenAICompatibleTinkerServer:
             messages: list[ChatCompletionMessageParam],
             tools: list[ChatCompletionToolUnionParam] | None,
         ) -> list[int]:
-            return cast(
-                list[int],
-                self._get_renderer(base_model).tokenizer.apply_chat_template(
-                    messages,  # type: ignore
-                    tools=tools,  # type: ignore
-                    add_generation_prompt=True,
-                ),
+            encoding = self._get_renderer(base_model).tokenizer.apply_chat_template(
+                messages,  # type: ignore
+                tools=tools,  # type: ignore
+                add_generation_prompt=True,
             )
+            if isinstance(encoding, BatchEncoding):
+                return encoding.input_ids
+            else:
+                return encoding  # type: ignore
 
         async def chat_completion_and_token_discrepancies(
             self,
