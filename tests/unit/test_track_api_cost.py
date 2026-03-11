@@ -88,6 +88,22 @@ class _AnthropicResponse:
 
 
 class TestTrackApiCost:
+    def test_compute_sample_costs_uses_tinker_leaf_names(self) -> None:
+        pricing = get_model_pricing("openai/gpt-oss-20b")
+        assert pricing is not None
+
+        metrics = compute_sample_costs(
+            prompt_tokens=1_000,
+            completion_tokens=2_000,
+            cost_context="train",
+            pricing=pricing,
+        )
+
+        assert metrics == {
+            "costs/train/tinker_prefill": pytest.approx(0.00012),
+            "costs/train/tinker_sample": pytest.approx(0.0006),
+        }
+
     @pytest.mark.asyncio
     async def test_openai_cost_extraction_with_explicit_pricing(self) -> None:
         builder = MetricsBuilder(cost_context="train")
@@ -292,7 +308,8 @@ class TestTrackApiCost:
             pricing=pricing,
         )
         assert metrics["costs/train/llm_judge/global_pricing"] == pytest.approx(
-            expected["costs/train/prefill"] + expected["costs/train/sample"]
+            expected["costs/train/tinker_prefill"]
+            + expected["costs/train/tinker_sample"]
         )
 
     @pytest.mark.asyncio

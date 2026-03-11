@@ -516,8 +516,8 @@ class Model(
             if metric.startswith("costs_"):
                 raise ValueError(
                     "Legacy cost keys like 'costs_prefill' are no longer supported. "
-                    "Log hierarchical costs like 'costs/train/prefill' or "
-                    "'costs/eval/prefill' instead."
+                    "Log explicit cost keys like 'costs/train/tinker_prefill' or "
+                    "'costs/eval/judge/ruler' instead."
                 )
             if is_builder_managed_metric(metric):
                 builder.add_metric(metric, numeric_value)

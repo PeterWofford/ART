@@ -1,4 +1,4 @@
-"""Cost utilities for ART training and evaluation."""
+"""Cost utilities for ART training and Tinker inference."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def compute_sample_costs(
     cost_context: str,
     pricing: ModelPricing,
 ) -> dict[str, float]:
-    """Compute prompt+completion costs for a single API call."""
+    """Compute Tinker prompt+completion costs for a single inference call."""
     normalized_context = cost_context.strip("/")
     if not normalized_context:
         raise ValueError("cost_context must be non-empty")
@@ -100,13 +100,13 @@ def compute_sample_costs(
     prefill_cost = tokens_to_cost(prompt_value, pricing.prefill)
     sample_cost = tokens_to_cost(completion_value, pricing.sample)
     return {
-        f"costs/{normalized_context}/prefill": prefill_cost,
-        f"costs/{normalized_context}/sample": sample_cost,
+        f"costs/{normalized_context}/tinker_prefill": prefill_cost,
+        f"costs/{normalized_context}/tinker_sample": sample_cost,
     }
 
 
 def build_cost_calculator(pricing: ModelPricing) -> CostCalculator:
-    """Return a callable that computes prompt+completion costs for a request."""
+    """Return a callable that computes split-scoped Tinker inference costs."""
 
     def _calculator(
         prompt_tokens: int | None,
