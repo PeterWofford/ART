@@ -506,11 +506,12 @@ class Model(
     def _route_metrics_and_collect_non_costs(
         self, metrics: dict[str, float], split: str
     ) -> dict[str, float]:
+        builder = self._metrics_builder_for_split(split)
         non_cost_metrics: dict[str, float] = {}
         for metric, value in metrics.items():
             numeric_value = float(value)
             if metric.startswith("costs/"):
-                self._metrics_builder.add_cost(metric[len("costs/") :], numeric_value)
+                builder.add_cost(metric[len("costs/") :], numeric_value)
                 continue
             if metric.startswith("costs_"):
                 raise ValueError(
@@ -519,7 +520,7 @@ class Model(
                     "'costs/eval/prefill' instead."
                 )
             if is_builder_managed_metric(metric):
-                self._metrics_builder.add_metric(metric, numeric_value)
+                builder.add_metric(metric, numeric_value)
                 continue
             non_cost_metrics[metric] = numeric_value
         return non_cost_metrics
@@ -574,6 +575,7 @@ class Model(
         if split not in METRIC_SPLITS:
             return {}
 
+        builder = self._metrics_builder_for_split(split)
         summary = summarize_trajectory_groups(trajectory_groups)
         default_data_metrics = build_data_metrics_from_summary(
             summary,
@@ -582,10 +584,10 @@ class Model(
         for key, value in default_data_metrics.items():
             if key in provided_metric_keys:
                 continue
-            self._metrics_builder.add_metric(key, value)
+            builder.add_metric(key, value)
 
         if summary.scenario_ids:
-            self._metrics_builder.add_data(scenario_ids=summary.scenario_ids)
+            builder.add_data(scenario_ids=summary.scenario_ids)
 
         if split != "train":
             return {}
@@ -605,6 +607,13 @@ class Model(
 
     def activate_metrics_context(self, cost_context: str) -> Token[MetricsBuilder]:
         return self.metrics_builder(cost_context).activate()
+
+    def _metrics_builder_for_split(self, split: str) -> MetricsBuilder:
+        if split == "train":
+            return self._metrics_builder.for_cost_context("train", buffer_scope="train")
+        if split in {"val", "test"}:
+            return self._metrics_builder.for_cost_context("eval", buffer_scope="eval")
+        return self._metrics_builder.for_cost_context(split, buffer_scope=split)
 
     def _load_metrics_builder_state(self) -> None:
         if self._metrics_builder_state_loaded:
@@ -670,6 +679,7 @@ class Model(
             step = await self.get_step() if self.trainable else 0
 
         self._load_metrics_builder_state()
+        builder = self._metrics_builder_for_split(split)
 
         # If only metrics provided (no trajectories), just log them and return
         if trajectories is None:
@@ -685,7 +695,7 @@ class Model(
                 metrics_without_costs = self._route_metrics_and_collect_non_costs(
                     metrics, split
                 )
-                builder_metrics = await self._metrics_builder.flush()
+                builder_metrics = await builder.flush()
                 merged_metrics = {**metrics_without_costs, **builder_metrics}
                 if merged_metrics:
                     self._log_metrics(merged_metrics, split, step)
@@ -802,7 +812,7 @@ class Model(
             averages.update(metrics_without_costs)
 
         # 3. Merge in any builder-managed metrics and log a single row.
-        builder_metrics = await self._metrics_builder.flush()
+        builder_metrics = await builder.flush()
         merged_metrics = {**averages, **builder_metrics}
         if merged_metrics:
             self._log_metrics(merged_metrics, split, step)

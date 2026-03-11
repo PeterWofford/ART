@@ -44,23 +44,31 @@ def to_cumulative_metric_key(key: str) -> str:
 
 
 @dataclass
+class _PendingMetricsState:
+    step_buffer: dict[str, float]
+    pending_scenario_ids: set[str]
+
+
+@dataclass
 class _SharedMetricsState:
     lock: asyncio.Lock
-    step_buffer: dict[str, float]
+    pending_by_scope: dict[str, _PendingMetricsState]
     cum_state: dict[str, float]
     unique_scenario_ids: set[str]
-    pending_scenario_ids: set[str]
     cost_extractors: dict[str, CostExtractor]
     model_pricing: dict[str, TokenPricing]
+
+
+def _new_pending_metrics_state() -> _PendingMetricsState:
+    return _PendingMetricsState(step_buffer={}, pending_scenario_ids=set())
 
 
 def _new_shared_metrics_state() -> _SharedMetricsState:
     return _SharedMetricsState(
         lock=asyncio.Lock(),
-        step_buffer={},
+        pending_by_scope={},
         cum_state={},
         unique_scenario_ids=set(),
-        pending_scenario_ids=set(),
         cost_extractors={},
         model_pricing={},
     )
@@ -74,11 +82,13 @@ class MetricsBuilder:
         cost_context: str,
         *,
         _shared_state: _SharedMetricsState | None = None,
+        _buffer_scope: str | None = None,
     ) -> None:
         if not cost_context:
             raise ValueError("cost_context must be non-empty")
 
         self.cost_context = cost_context
+        self._buffer_scope = _buffer_scope if _buffer_scope is not None else cost_context
         self._shared_state = (
             _shared_state if _shared_state is not None else _new_shared_metrics_state()
         )
@@ -140,7 +150,7 @@ class MetricsBuilder:
         if step_actor_tokens is not None:
             self.add_metric("data/step_actor_tokens", float(step_actor_tokens))
         if scenario_ids is not None:
-            self._shared_state.pending_scenario_ids.update(
+            self._pending_state().pending_scenario_ids.update(
                 str(scenario_id) for scenario_id in scenario_ids
             )
 
@@ -180,10 +190,12 @@ class MetricsBuilder:
 
     async def flush(self) -> dict[str, float]:
         async with self._shared_state.lock:
-            result = dict(self._shared_state.step_buffer)
+            pending_state = self._pending_state()
+            result = dict(pending_state.step_buffer)
+            pending_scenario_ids = set(pending_state.pending_scenario_ids)
             cost_metrics = {
                 key: value
-                for key, value in self._shared_state.step_buffer.items()
+                for key, value in result.items()
                 if key.startswith("costs/")
             }
             result.update(self._compute_rollups(cost_metrics))
@@ -197,17 +209,15 @@ class MetricsBuilder:
                 self._shared_state.cum_state[cum_key] = next_value
                 result[cum_key] = next_value
 
-            if self._shared_state.pending_scenario_ids:
-                self._shared_state.unique_scenario_ids.update(
-                    self._shared_state.pending_scenario_ids
-                )
+            if pending_scenario_ids:
+                self._shared_state.unique_scenario_ids.update(pending_scenario_ids)
                 result["data/cum/num_unique_scenarios"] = float(
                     len(self._shared_state.unique_scenario_ids)
                 )
 
             self._update_throughput_metrics(result)
-            self._shared_state.step_buffer.clear()
-            self._shared_state.pending_scenario_ids.clear()
+            pending_state.step_buffer.clear()
+            pending_state.pending_scenario_ids.clear()
             return result
 
     def activate(self) -> Token["MetricsBuilder"]:
@@ -225,15 +235,28 @@ class MetricsBuilder:
     def get_active() -> "MetricsBuilder":
         return _active_builder.get()
 
-    def for_cost_context(self, cost_context: str) -> "MetricsBuilder":
+    def for_cost_context(
+        self, cost_context: str, *, buffer_scope: str | None = None
+    ) -> "MetricsBuilder":
         normalized_cost_context = cost_context.strip()
         if not normalized_cost_context:
             raise ValueError("cost_context must be non-empty")
-        if normalized_cost_context == self.cost_context:
+        normalized_buffer_scope = (
+            buffer_scope.strip()
+            if buffer_scope is not None
+            else normalized_cost_context
+        )
+        if not normalized_buffer_scope:
+            raise ValueError("buffer_scope must be non-empty")
+        if (
+            normalized_cost_context == self.cost_context
+            and normalized_buffer_scope == self._buffer_scope
+        ):
             return self
         return MetricsBuilder(
             cost_context=normalized_cost_context,
             _shared_state=self._shared_state,
+            _buffer_scope=normalized_buffer_scope,
         )
 
     def register_cost_extractor(self, provider: str, extractor: CostExtractor) -> None:
@@ -291,7 +314,7 @@ class MetricsBuilder:
         self._shared_state.cum_state.update(restored_cum_state)
         self._shared_state.unique_scenario_ids.clear()
         self._shared_state.unique_scenario_ids.update(restored_unique_ids)
-        self._shared_state.pending_scenario_ids.clear()
+        self._shared_state.pending_by_scope.clear()
 
     def _validate_and_add(self, key: str, value: float) -> None:
         if is_cumulative_metric_key(key):
@@ -299,7 +322,8 @@ class MetricsBuilder:
                 f"Metric key '{key}' uses the reserved cumulative namespace."
             )
 
-        for existing_key in self._shared_state.step_buffer:
+        pending_state = self._pending_state()
+        for existing_key in pending_state.step_buffer:
             if existing_key == key:
                 continue
             if existing_key.startswith(f"{key}/"):
@@ -311,9 +335,14 @@ class MetricsBuilder:
                     f"Cannot log '{key}' as a leaf: '{existing_key}' is already a leaf ancestor."
                 )
 
-        self._shared_state.step_buffer[key] = (
-            self._shared_state.step_buffer.get(key, 0.0) + value
-        )
+        pending_state.step_buffer[key] = pending_state.step_buffer.get(key, 0.0) + value
+
+    def _pending_state(self) -> _PendingMetricsState:
+        pending_state = self._shared_state.pending_by_scope.get(self._buffer_scope)
+        if pending_state is None:
+            pending_state = _new_pending_metrics_state()
+            self._shared_state.pending_by_scope[self._buffer_scope] = pending_state
+        return pending_state
 
     def _compute_rollups(self, cost_metrics: dict[str, float]) -> dict[str, float]:
         if not cost_metrics:

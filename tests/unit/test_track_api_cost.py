@@ -433,7 +433,7 @@ class TestTrackApiCost:
         finally:
             token.var.reset(token)
 
-        metrics = await builder.flush()
+        metrics = await eval_builder.flush()
         assert metrics["costs/eval/llm_judge/correctness"] == pytest.approx(0.0002)
 
 
