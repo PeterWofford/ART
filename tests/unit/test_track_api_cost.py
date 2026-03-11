@@ -499,6 +499,71 @@ class TestTrackApiCostIntegration:
         assert second["costs/cum/all"] == pytest.approx(0.00036)
 
     @pytest.mark.asyncio
+    async def test_model_log_keeps_pending_train_and_eval_costs_isolated(
+        self, tmp_path: Path
+    ) -> None:
+        model = Model(
+            name="metrics-cost-isolation-test",
+            project="metrics-cost-isolation-test",
+            base_path=str(tmp_path),
+            report_metrics=[],
+        )
+
+        @track_api_cost(
+            source="llm_judge/correctness",
+            provider="openai",
+            model_name="openai/gpt-4.1",
+            prompt_price_per_million=1.0,
+            completion_price_per_million=2.0,
+        )
+        async def _train_judge() -> _OpenAIResponse:
+            return _OpenAIResponse(prompt_tokens=100, completion_tokens=50)
+
+        @track_api_cost(
+            source="llm_judge/factuality",
+            provider="anthropic",
+            model_name="anthropic/claude-sonnet-4-6",
+            prompt_price_per_million=3.0,
+            completion_price_per_million=4.0,
+        )
+        async def _eval_judge() -> _AnthropicResponse:
+            return _AnthropicResponse(input_tokens=40, output_tokens=10)
+
+        train_token = model.activate_metrics_context("train")
+        try:
+            await _train_judge()
+        finally:
+            train_token.var.reset(train_token)
+
+        eval_token = model.activate_metrics_context("eval")
+        try:
+            await _eval_judge()
+        finally:
+            eval_token.var.reset(eval_token)
+
+        await model.log(trajectories=None, split="val", step=1, metrics={})
+        await model.log(trajectories=None, split="train", step=1, metrics={})
+
+        history_path = (
+            tmp_path
+            / "metrics-cost-isolation-test"
+            / "models"
+            / "metrics-cost-isolation-test"
+            / "history.jsonl"
+        )
+        with open(history_path) as f:
+            first = json.loads(f.readline())
+            second = json.loads(f.readline())
+
+        assert "costs/eval/llm_judge/factuality" in first
+        assert "costs/train/llm_judge/correctness" not in first
+        assert first["costs/cum/all"] == pytest.approx(0.00016)
+
+        assert "costs/train/llm_judge/correctness" in second
+        assert "costs/eval/llm_judge/factuality" not in second
+        assert second["costs/cum/all"] == pytest.approx(0.00036)
+
+    @pytest.mark.asyncio
     async def test_pipeline_trainer_activates_train_context_for_rollouts(
         self, tmp_path: Path
     ) -> None:
