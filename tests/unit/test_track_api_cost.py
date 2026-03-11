@@ -18,6 +18,8 @@ class _OpenAIUsage:
         completion_tokens: int,
         *,
         cached_tokens: int = 0,
+        cost: float | None = None,
+        model_extra: dict[str, float] | None = None,
     ) -> None:
         self.prompt_tokens = prompt_tokens
         self.completion_tokens = completion_tokens
@@ -26,6 +28,8 @@ class _OpenAIUsage:
             (),
             {"cached_tokens": cached_tokens},
         )()
+        self.cost = cost
+        self.model_extra = model_extra
 
 
 class _OpenAIResponse:
@@ -35,12 +39,16 @@ class _OpenAIResponse:
         completion_tokens: int,
         *,
         cached_tokens: int = 0,
+        cost: float | None = None,
+        model_extra: dict[str, float] | None = None,
         model: str | None = None,
     ) -> None:
         self.usage = _OpenAIUsage(
             prompt_tokens,
             completion_tokens,
             cached_tokens=cached_tokens,
+            cost=cost,
+            model_extra=model_extra,
         )
         self.model = model
 
@@ -193,6 +201,62 @@ class TestTrackApiCost:
 
         metrics = await builder.flush()
         assert metrics["costs/eval/llm_judge/anthropic_cache"] == pytest.approx(0.00495)
+
+    @pytest.mark.asyncio
+    async def test_direct_usage_cost_is_used_before_provider_estimation(self) -> None:
+        builder = MetricsBuilder(cost_context="train")
+
+        @track_api_cost(
+            source="llm_judge/openrouter_usage_cost",
+            provider="openrouter",
+            model_name="openrouter/openai/gpt-4.1-mini",
+        )
+        async def _judge() -> _OpenAIResponse:
+            return _OpenAIResponse(
+                prompt_tokens=100,
+                completion_tokens=50,
+                cost=1.68e-05,
+            )
+
+        token = builder.activate()
+        try:
+            await _judge()
+        finally:
+            token.var.reset(token)
+
+        metrics = await builder.flush()
+        assert metrics["costs/train/llm_judge/openrouter_usage_cost"] == pytest.approx(
+            1.68e-05
+        )
+
+    @pytest.mark.asyncio
+    async def test_direct_model_extra_cost_is_used_when_usage_cost_missing(
+        self,
+    ) -> None:
+        builder = MetricsBuilder(cost_context="train")
+
+        @track_api_cost(
+            source="llm_judge/openrouter_model_extra_cost",
+            provider="openrouter",
+            model_name="openrouter/openai/gpt-4.1-mini",
+        )
+        async def _judge() -> _OpenAIResponse:
+            return _OpenAIResponse(
+                prompt_tokens=100,
+                completion_tokens=50,
+                model_extra={"cost": 1.68e-05},
+            )
+
+        token = builder.activate()
+        try:
+            await _judge()
+        finally:
+            token.var.reset(token)
+
+        metrics = await builder.flush()
+        assert metrics[
+            "costs/train/llm_judge/openrouter_model_extra_cost"
+        ] == pytest.approx(1.68e-05)
 
     @pytest.mark.asyncio
     async def test_explicit_model_name_uses_global_pricing(

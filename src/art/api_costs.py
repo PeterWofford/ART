@@ -83,7 +83,7 @@ def normalize_provider(provider: str | None) -> str | None:
 def _read_usage_field(usage: Any, field: str) -> float | None:
     if usage is None:
         return None
-    if isinstance(usage, dict):
+    if isinstance(usage, Mapping):
         value = usage.get(field)
     else:
         value = getattr(usage, field, None)
@@ -97,7 +97,7 @@ def _read_usage_nested_field(usage: Any, *fields: str) -> float | None:
     for field in fields:
         if current is None:
             return None
-        if isinstance(current, dict):
+        if isinstance(current, Mapping):
             current = current.get(field)
         else:
             current = getattr(current, field, None)
@@ -106,10 +106,52 @@ def _read_usage_nested_field(usage: Any, *fields: str) -> float | None:
     return float(current)
 
 
+def _read_field(container: Any, field: str) -> Any:
+    if container is None:
+        return None
+    if isinstance(container, Mapping):
+        return container.get(field)
+    return getattr(container, field, None)
+
+
+def _coerce_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_cost_value(value: Any) -> float | None:
+    direct_cost = _coerce_float(value)
+    if direct_cost is not None:
+        return direct_cost
+    return _coerce_float(_read_field(value, "total_cost"))
+
+
 def _response_usage(response: Any) -> Any:
-    if isinstance(response, dict):
+    if isinstance(response, Mapping):
         return response.get("usage")
     return getattr(response, "usage", None)
+
+
+def _extract_direct_response_cost(response: Any) -> float | None:
+    usage = _response_usage(response)
+    direct_usage_cost = _extract_cost_value(_read_field(usage, "cost"))
+    if direct_usage_cost is not None:
+        return direct_usage_cost
+
+    model_extra = _read_field(usage, "model_extra")
+    model_extra_cost = _extract_cost_value(_read_field(model_extra, "cost"))
+    if model_extra_cost is not None:
+        return model_extra_cost
+
+    hidden_params = _read_field(response, "_hidden_params")
+    additional_headers = _read_field(hidden_params, "additional_headers")
+    return _extract_cost_value(
+        _read_field(additional_headers, "llm_provider-x-litellm-response-cost")
+    )
 
 
 def _extract_openai_token_counts(response: Any) -> _OpenAITokenUsage | None:
@@ -371,6 +413,10 @@ def extract_api_cost(
     provider_name = normalize_provider(provider)
     if provider_name is None:
         raise ValueError("provider must be non-empty")
+
+    direct_response_cost = _extract_direct_response_cost(response)
+    if direct_response_cost is not None:
+        return direct_response_cost
 
     custom_extractor = cost_extractors.get(provider_name)
     if custom_extractor is not None:
