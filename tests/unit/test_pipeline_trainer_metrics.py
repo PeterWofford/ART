@@ -60,12 +60,8 @@ async def test_pipeline_trainer_logs_explicit_stale_and_zero_variance_metrics(
     await trainer._output_queue.put(
         _make_group([0.25, 0.75], initial_policy_version=-1)
     )
-    await trainer._output_queue.put(
-        _make_group([1.0, 1.0], initial_policy_version=0)
-    )
-    await trainer._output_queue.put(
-        _make_group([0.0, 1.0], initial_policy_version=0)
-    )
+    await trainer._output_queue.put(_make_group([1.0, 1.0], initial_policy_version=0))
+    await trainer._output_queue.put(_make_group([0.0, 1.0], initial_policy_version=0))
     await trainer._output_queue.put(None)
 
     await trainer._training_stage()
@@ -82,9 +78,7 @@ async def test_pipeline_trainer_logs_explicit_stale_and_zero_variance_metrics(
 
     train_row = next(row for row in rows if "train/reward" in row)
     zero_variance_row = next(
-        row
-        for row in rows
-        if any(key.startswith("discarded/") for key in row)
+        row for row in rows if any(key.startswith("discarded/") for key in row)
     )
 
     assert "train/discarded_stale_groups" in train_row

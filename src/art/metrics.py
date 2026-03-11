@@ -88,7 +88,9 @@ class MetricsBuilder:
             raise ValueError("cost_context must be non-empty")
 
         self.cost_context = cost_context
-        self._buffer_scope = _buffer_scope if _buffer_scope is not None else cost_context
+        self._buffer_scope = (
+            _buffer_scope if _buffer_scope is not None else cost_context
+        )
         self._shared_state = (
             _shared_state if _shared_state is not None else _new_shared_metrics_state()
         )
@@ -194,9 +196,7 @@ class MetricsBuilder:
             result = dict(pending_state.step_buffer)
             pending_scenario_ids = set(pending_state.pending_scenario_ids)
             cost_metrics = {
-                key: value
-                for key, value in result.items()
-                if key.startswith("costs/")
+                key: value for key, value in result.items() if key.startswith("costs/")
             }
             result.update(self._compute_rollups(cost_metrics))
 

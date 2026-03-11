@@ -448,9 +448,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
                 steps_off_policy = self._average_steps_off_policy(current_step, batch)
                 metrics = {
-                    "discarded_stale_groups": float(
-                        self.state.discarded_stale_groups
-                    ),
+                    "discarded_stale_groups": float(self.state.discarded_stale_groups),
                     "steps_off_policy": steps_off_policy,
                     "time/step_wall_s": step_seconds,
                     "throughput/step_trainer_idle_s": trainer_idle_s,
