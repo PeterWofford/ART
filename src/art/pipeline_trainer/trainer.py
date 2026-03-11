@@ -394,7 +394,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             collect_started = time.monotonic()
             batch, discarded, saw_sentinel = await self._collect_batch(current_step)
             trainer_idle_s = time.monotonic() - collect_started
-            self.state.discarded_stale_samples += discarded
+            self.state.discarded_stale_groups += discarded
             if discarded:
                 self._status.note_stale(discarded)
             if not batch:
@@ -448,8 +448,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
                 steps_off_policy = self._average_steps_off_policy(current_step, batch)
                 metrics = {
-                    "discarded_stale_samples": float(
-                        self.state.discarded_stale_samples
+                    "discarded_stale_groups": float(
+                        self.state.discarded_stale_groups
                     ),
                     "steps_off_policy": steps_off_policy,
                     "num_groups": float(len(batch)),
@@ -469,7 +469,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     step=current_step,
                     metrics=metrics,
                 )
-                await self._log_discarded_groups(current_step)
+                await self._log_zero_variance_groups(current_step)
 
                 if self.eval_fn is not None and should_eval_step:
                     if self._eval_queue is not None:
@@ -723,11 +723,11 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             "\n"
         )
 
-    async def _log_discarded_groups(self, step: int) -> None:
+    async def _log_zero_variance_groups(self, step: int) -> None:
         if not self._discard_queue:
             return
         discarded = list(self._discard_queue)
-        await self.model.log(discarded, split="discarded", step=step)
+        await self.model.log(discarded, split="discarded_zero_variance", step=step)
         self._discard_queue.clear()
 
     @staticmethod

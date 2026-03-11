@@ -165,7 +165,7 @@ def print_history_summary(model: art.TrainableModel, tail: int = 5) -> None:
         step = row["step"]
         reward = row["reward/mean"]
         std_dev = row["reward/std_dev"]
-        discarded = row["train/discarded_stale_samples"]
+        discarded = row["train/discarded_stale_groups"]
         off_policy = row["train/steps_off_policy"]
         print(
             f"  step={step} reward={reward} std={std_dev} "

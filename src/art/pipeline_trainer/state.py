@@ -18,7 +18,7 @@ class PipelineState:
     last_eval_step: int = 0
 
     # Metrics
-    discarded_stale_samples: int = 0
+    discarded_stale_groups: int = 0
 
     # Synchronization
     policy_updated: asyncio.Condition = field(default_factory=asyncio.Condition)
