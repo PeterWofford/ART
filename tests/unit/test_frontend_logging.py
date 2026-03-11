@@ -618,9 +618,9 @@ class TestMetricCalculation:
         assert merged["data/step_num_groups_submitted"] == pytest.approx(2.0)
         assert merged["data/step_num_groups_trainable"] == pytest.approx(1.0)
         assert merged["data/cum/num_unique_scenarios"] == pytest.approx(2.0)
-        assert merged["train/num_groups_submitted"] == pytest.approx(2.0)
-        assert merged["train/num_groups_trainable"] == pytest.approx(1.0)
-        assert merged["train/num_trajectories"] == pytest.approx(3.0)
+        assert "train/num_groups_submitted" not in merged
+        assert "train/num_groups_trainable" not in merged
+        assert "train/num_trajectories" not in merged
 
     @pytest.mark.asyncio
     async def test_costs_are_logged_in_hierarchical_taxonomy(self, tmp_path: Path):

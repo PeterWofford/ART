@@ -91,28 +91,15 @@ def build_data_metrics_from_summary(
     return metrics
 
 
-def build_train_metrics_from_summary(
-    summary: TrajectoryBatchSummary,
-) -> dict[str, float]:
-    return {
-        "train/num_groups_submitted": float(summary.num_groups_submitted),
-        "train/num_groups_trainable": float(summary.num_groups_trainable),
-        "train/num_trajectories": float(summary.num_trajectories),
-    }
-
-
 def build_training_summary_metrics(
     summary: TrajectoryBatchSummary,
     *,
     include_trainable_groups: bool,
 ) -> dict[str, float]:
-    return {
-        **build_data_metrics_from_summary(
-            summary,
-            include_trainable_groups=include_trainable_groups,
-        ),
-        **build_train_metrics_from_summary(summary),
-    }
+    return build_data_metrics_from_summary(
+        summary,
+        include_trainable_groups=include_trainable_groups,
+    )
 
 
 def _group_is_trainable(group: TrajectoryGroup) -> bool:

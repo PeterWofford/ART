@@ -20,7 +20,6 @@ from .metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     average_metric_samples,
     build_data_metrics_from_summary,
-    build_train_metrics_from_summary,
     summarize_trajectory_groups,
 )
 from .trajectories import Trajectory, TrajectoryGroup
@@ -589,15 +588,7 @@ class Model(
         if summary.scenario_ids:
             builder.add_data(scenario_ids=summary.scenario_ids)
 
-        if split != "train":
-            return {}
-
-        default_train_metrics = build_train_metrics_from_summary(summary)
-        return {
-            key: value
-            for key, value in default_train_metrics.items()
-            if key not in provided_metric_keys
-        }
+        return {}
 
     def metrics_builder(self, cost_context: str | None = None) -> MetricsBuilder:
         self._load_metrics_builder_state()

@@ -23,7 +23,7 @@ def test_average_metric_samples_handles_sparse_keys() -> None:
     assert averaged["loss/grad_norm"] == pytest.approx(0.75)
 
 
-def test_build_training_summary_metrics_includes_data_and_train_sections() -> None:
+def test_build_training_summary_metrics_only_includes_data_section() -> None:
     summary = TrajectoryBatchSummary(
         num_scenarios=2,
         num_trajectories=5,
@@ -39,8 +39,8 @@ def test_build_training_summary_metrics_includes_data_and_train_sections() -> No
 
     assert metrics["data/step_num_scenarios"] == pytest.approx(2.0)
     assert metrics["data/step_num_groups_trainable"] == pytest.approx(1.0)
-    assert metrics["train/num_groups_submitted"] == pytest.approx(2.0)
-    assert metrics["train/num_trajectories"] == pytest.approx(5.0)
+    assert metrics["data/step_num_groups_submitted"] == pytest.approx(2.0)
+    assert metrics["data/step_num_trajectories"] == pytest.approx(5.0)
 
 
 def test_average_metric_samples_requires_invariant_gradient_step_count() -> None:

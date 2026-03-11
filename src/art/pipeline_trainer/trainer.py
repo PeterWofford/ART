@@ -452,7 +452,6 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                         self.state.discarded_stale_groups
                     ),
                     "steps_off_policy": steps_off_policy,
-                    "num_groups": float(len(batch)),
                     "time/step_wall_s": step_seconds,
                     "throughput/step_trainer_idle_s": trainer_idle_s,
                 }

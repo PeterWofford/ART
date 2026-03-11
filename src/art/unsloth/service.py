@@ -887,8 +887,6 @@ class UnslothService:
                 "loss/train": batch_loss,
                 "loss/learning_rate": batch.learning_rate,
                 "loss/grad_norm": grad_norm,
-                "train/num_trajectories": float(batch.num_trajectories),
-                "train/num_trainable_tokens": float(batch.num_trainable_tokens),
             }
 
         # === Cleanup ===

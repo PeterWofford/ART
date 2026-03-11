@@ -48,10 +48,10 @@ _UPSTREAM_TRAIN_METRIC_KEYS = {
     "kl_policy_ref": "loss/kl_policy_ref",
     "grad_norm": "loss/grad_norm",
     "learning_rate": "loss/learning_rate",
-    "num_groups_submitted": "train/num_groups_submitted",
-    "num_groups_trainable": "train/num_groups_trainable",
-    "num_trajectories": "train/num_trajectories",
-    "num_trainable_tokens": "train/num_trainable_tokens",
+    "num_groups_submitted": "data/step_num_groups_submitted",
+    "num_groups_trainable": "data/step_num_groups_trainable",
+    "num_trajectories": "data/step_num_trajectories",
+    "num_trainable_tokens": "data/step_trainer_tokens",
     "train_tokens": "data/step_trainer_tokens",
     "num_datums": "data/step_num_datums",
 }
@@ -541,7 +541,6 @@ class ServerlessBackend(Backend):
                     yield {
                         **metrics,
                         "data/step_num_trajectories": float(num_trajectories),
-                        "train/num_trajectories": float(num_trajectories),
                         TRAIN_GRADIENT_STEPS_KEY: float(num_batches),
                     }
                 elif event.type == "training_started":

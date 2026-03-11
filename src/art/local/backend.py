@@ -767,7 +767,6 @@ class LocalBackend(Backend):
             yield {
                 **base_metrics,
                 "data/step_num_groups_trainable": 0.0,
-                "train/num_groups_trainable": 0.0,
                 "data/step_trainer_tokens": 0.0,
                 TRAIN_GRADIENT_STEPS_KEY: 0.0,
             }
@@ -894,8 +893,6 @@ class LocalBackend(Backend):
                 "data/step_num_trajectories": float(total_trajectories),
                 "data/step_trainer_tokens": float(total_trainable_tokens),
                 TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
-                "train/num_trajectories": float(total_trajectories),
-                "train/num_trainable_tokens": float(total_trainable_tokens),
             }
 
         pbar.close()
