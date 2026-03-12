@@ -1,11 +1,13 @@
 import asyncio
+from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from itertools import cycle
 import json
 import os
 import socket
 import time
-from typing import Annotated, Literal
+from typing import Annotated, AsyncGenerator, Literal
 import uuid
 
 from fastapi import FastAPI, HTTPException, Request
@@ -50,6 +52,7 @@ class OpenAICompatibleTinkerServer:
     host: str | None = None
     port: int | None = None
     num_workers: int | None = None
+    max_concurrent_sampling_clients: int | None = None
     _prefix_cache: LRUTrieCache = field(default_factory=LRUTrieCache)
     _task: asyncio.Task[None] | None = None
     _tenants: dict[str, "OpenAICompatibleTinkerServerTenant"] = field(
@@ -61,13 +64,13 @@ class OpenAICompatibleTinkerServer:
     def models(self) -> dict[str, str]:
         if "TINKER_API_KEY" not in os.environ:
             raise ValueError("TINKER_API_KEY is not set")
-        return self._get_tenant(os.environ["TINKER_API_KEY"])._models
+        return self._get_tenant(os.environ["TINKER_API_KEY"]).models
 
     @models.setter
     def models(self, models: dict[str, str]) -> None:
         if "TINKER_API_KEY" not in os.environ:
             raise ValueError("TINKER_API_KEY is not set")
-        self._get_tenant(os.environ["TINKER_API_KEY"])._models = models
+        self._get_tenant(os.environ["TINKER_API_KEY"]).models = models
 
     async def start(self) -> tuple[str, int]:
         host = self.host or "0.0.0.0"
@@ -139,25 +142,25 @@ class OpenAICompatibleTinkerServer:
                 data=[
                     Model(
                         id=model,
-                        created=tenant._model_timestamps.get(model, 0),
+                        created=tenant.model_timestamps.get(model, 0),
                         object="model",
                         owned_by="tinker",
                     )
-                    for model in tenant._models
+                    for model in tenant.models
                 ],
             )
 
         @app.get("/v1/models/{model}")
         async def get_model(request: Request, model: str) -> Model:
             tenant = self._get_request_tenant(request)
-            if model not in tenant._models:
+            if model not in tenant.models:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Model not found: {model}",
                 )
             return Model(
                 id=model,
-                created=tenant._model_timestamps.get(model, 0),
+                created=tenant.model_timestamps.get(model, 0),
                 object="model",
                 owned_by="tinker",
             )
@@ -169,11 +172,11 @@ class OpenAICompatibleTinkerServer:
             body: ModelUpsert,
         ) -> Model:
             tenant = self._get_request_tenant(request)
-            tenant._models[model] = body.target
-            tenant._model_timestamps.setdefault(model, int(time.time()))
+            tenant.models[model] = body.target
+            tenant.model_timestamps.setdefault(model, int(time.time()))
             return Model(
                 id=model,
-                created=tenant._model_timestamps[model],
+                created=tenant.model_timestamps[model],
                 object="model",
                 owned_by="tinker",
             )
@@ -181,13 +184,13 @@ class OpenAICompatibleTinkerServer:
         @app.delete("/v1/models/{model}")
         async def delete_model(request: Request, model: str) -> ModelDeleted:
             tenant = self._get_request_tenant(request)
-            if model not in tenant._models:
+            if model not in tenant.models:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Model not found: {model}",
                 )
-            tenant._models.pop(model)
-            tenant._model_timestamps.pop(model, None)
+            tenant.models.pop(model)
+            tenant.model_timestamps.pop(model, None)
             return ModelDeleted(
                 id=model,
                 deleted=True,
@@ -200,7 +203,7 @@ class OpenAICompatibleTinkerServer:
         ) -> ChatCompletion:
             worker = next(workers)
             tenant = self._get_request_tenant(request)
-            samplable_model = await tenant._get_samplable_model(body["model"])
+            samplable_model = await tenant.get_samplable_model(body["model"])
             rendered_prompt_tokens = await worker.prompt_tokens(
                 base_model=samplable_model.base_model,
                 messages=list(body["messages"]),
@@ -216,20 +219,21 @@ class OpenAICompatibleTinkerServer:
                     + rendered_prompt_tokens[prefix_entry.rendered_len :]
                 )
             try:
-                sample_response = await samplable_model.sampling_client.sample_async(
-                    prompt=tinker.ModelInput.from_ints(tokens=prompt_tokens),
-                    num_samples=body.get("n") or 1,
-                    sampling_params=tinker.SamplingParams(
-                        max_tokens=body.get("max_completion_tokens")
-                        or body.get("max_tokens"),
-                        seed=body.get("seed"),
-                        temperature=(
-                            t if (t := body.get("temperature")) is not None else 1.0
+                async with samplable_model.sampling_client() as sampling_client:
+                    sample_response = await sampling_client.sample_async(
+                        prompt=tinker.ModelInput.from_ints(tokens=prompt_tokens),
+                        num_samples=body.get("n") or 1,
+                        sampling_params=tinker.SamplingParams(
+                            max_tokens=body.get("max_completion_tokens")
+                            or body.get("max_tokens"),
+                            seed=body.get("seed"),
+                            temperature=(
+                                t if (t := body.get("temperature")) is not None else 1.0
+                            ),
+                            top_k=body.get("top_k") or -1,
+                            top_p=body.get("top_p") or 1.0,
                         ),
-                        top_k=body.get("top_k") or -1,
-                        top_p=body.get("top_p") or 1.0,
-                    ),
-                )
+                    )
             except tinker.APIStatusError as e:
                 error_body = e.body
                 if isinstance(error_body, dict) and "detail" in error_body:
@@ -272,30 +276,52 @@ class OpenAICompatibleTinkerServer:
 
     def _get_tenant(self, api_key: str) -> "OpenAICompatibleTinkerServerTenant":
         if api_key not in self._tenants:
-            self._tenants[api_key] = OpenAICompatibleTinkerServerTenant(api_key)
+            self._tenants[api_key] = OpenAICompatibleTinkerServerTenant(
+                api_key, self.max_concurrent_sampling_clients or 32
+            )
         return self._tenants[api_key]
 
 
 @dataclass
 class OpenAICompatibleTinkerServerSamplableModel:
-    sampling_client: tinker.SamplingClient
     base_model: str
+    _sampling_client: tinker.SamplingClient
+    _concurrent_sampling_client_semaphore: asyncio.Semaphore
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    _yields: int = 0
+
+    @asynccontextmanager
+    async def sampling_client(self) -> AsyncGenerator[tinker.SamplingClient, None]:
+        async with self._lock:
+            if self._yields == 0:
+                await self._concurrent_sampling_client_semaphore.acquire()
+            self._yields += 1
+        try:
+            yield self._sampling_client
+        finally:
+            async with self._lock:
+                self._yields -= 1
+                if self._yields == 0:
+                    self._concurrent_sampling_client_semaphore.release()
 
 
 class OpenAICompatibleTinkerServerTenant:
-    def __init__(self, api_key: str) -> None:
-        self._models: dict[str, str] = {}
-        self._model_timestamps: dict[str, int] = {}
+    def __init__(self, api_key: str, max_concurrent_sampling_clients: int) -> None:
+        self.models: dict[str, str] = {}
+        self.model_timestamps: dict[str, int] = {}
         self._service_client = tinker.ServiceClient(api_key=api_key)
         self._rest_client = self._service_client.create_rest_client()
         self._samplable_models: dict[
             str, asyncio.Task[OpenAICompatibleTinkerServerSamplableModel]
         ] = dict()
+        self._concurrent_sampling_client_semaphores: defaultdict[
+            str, asyncio.Semaphore
+        ] = defaultdict(lambda: asyncio.Semaphore(max_concurrent_sampling_clients))
 
-    async def _get_samplable_model(
+    async def get_samplable_model(
         self, model: str
     ) -> OpenAICompatibleTinkerServerSamplableModel:
-        model_path_or_base_model = self._models.get(model, model)
+        model_path_or_base_model = self.models.get(model, model)
         if not model_path_or_base_model.startswith("tinker://"):
             try:
                 get_renderer_name(model_path_or_base_model)
@@ -331,9 +357,25 @@ class OpenAICompatibleTinkerServerTenant:
             base_model = sampler_response.base_model
         else:
             base_model = model_path_or_base_model
+        # on_queue_state_change = sampling_client.on_queue_state_change
+
+        # def patched_on_queue_state_change(
+        #     queue_state: TinkerQueueState, queue_state_reason: str | None
+        # ) -> None:
+        #     on_queue_state_change(queue_state, queue_state_reason)
+        #     if queue_state == TinkerQueueState.PAUSED_RATE_LIMIT:
+        #         # implicit upper-bound on the number of concurrent sampling clients found
+        #         # do not allow this number of concurrent sampling clients again
+        #         semaphore = self._concurrent_sampling_client_semaphores[base_model]
+        #         semaphore._value = max(semaphore._value - 1, -4)
+
+        # sampling_client.on_queue_state_change = patched_on_queue_state_change
         return OpenAICompatibleTinkerServerSamplableModel(
-            sampling_client=sampling_client,
             base_model=base_model,
+            _sampling_client=sampling_client,
+            _concurrent_sampling_client_semaphore=self._concurrent_sampling_client_semaphores[
+                base_model
+            ],
         )
 
 
