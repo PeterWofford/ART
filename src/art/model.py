@@ -1,7 +1,9 @@
 import asyncio
+from contextvars import Token
 from datetime import datetime
 import json
 import os
+import time
 from typing import TYPE_CHECKING, Any, Generic, Iterable, Optional, cast, overload
 import warnings
 
@@ -13,6 +15,13 @@ from typing_extensions import Never, TypeVar
 
 from . import dev
 from .costs import CostCalculator
+from .metrics import MetricsBuilder, is_builder_managed_metric
+from .metrics_taxonomy import (
+    TRAIN_GRADIENT_STEPS_KEY,
+    average_metric_samples,
+    build_data_metrics_from_summary,
+    summarize_trajectory_groups,
+)
 from .trajectories import Trajectory, TrajectoryGroup
 from .types import TrainConfig, TrainSFTConfig
 from .utils.trajectory_logging import write_trajectory_groups_parquet
@@ -26,9 +35,20 @@ if TYPE_CHECKING:
 ModelConfig = TypeVar("ModelConfig", bound=BaseModel | None)
 StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 
-COSTS_STATE_KEY = "_costs"
-COSTS_METRIC_PREFIX = "costs_"
-COSTS_TOTAL_KEY = f"{COSTS_METRIC_PREFIX}total"
+METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
+METRIC_SECTIONS = frozenset(
+    {
+        "reward",
+        "loss",
+        "offpolicy",
+        "pipeline",
+        "throughput",
+        "costs",
+        "time",
+        "data",
+    }
+)
+METRIC_SPLITS = frozenset({"train", "val", "test"})
 
 
 class Model(
@@ -93,7 +113,13 @@ class Model(
     _s3_prefix: str | None = None
     _openai_client: AsyncOpenAI | None = None
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
-    _costs_lock: asyncio.Lock
+    _wandb_defined_metrics: set[str]
+    _run_start_time: float
+    _run_start_monotonic: float
+    _last_local_train_log_monotonic: float
+    _last_local_train_step: int | None
+    _metrics_builder: MetricsBuilder
+    _metrics_builder_state_loaded: bool
     _cost_calculator: CostCalculator
 
     def __init__(
@@ -123,6 +149,17 @@ class Model(
             report_metrics=report_metrics,
             **kwargs,
         )
+        object.__setattr__(self, "_wandb_defined_metrics", set())
+        object.__setattr__(self, "_run_start_time", time.time())
+        object.__setattr__(self, "_run_start_monotonic", time.monotonic())
+        object.__setattr__(
+            self, "_last_local_train_log_monotonic", self._run_start_monotonic
+        )
+        object.__setattr__(self, "_last_local_train_step", None)
+        object.__setattr__(
+            self, "_metrics_builder", MetricsBuilder(cost_context="train")
+        )
+        object.__setattr__(self, "_metrics_builder_state_loaded", False)
 
     @overload
     def __new__(
@@ -376,13 +413,29 @@ class Model(
                 ),
             )
             self._wandb_run = run
+            object.__setattr__(
+                self,
+                "_wandb_defined_metrics",
+                {
+                    "training_step",
+                    "time/wall_clock_sec",
+                },
+            )
 
             # Define training_step as the x-axis for all metrics.
             # This allows out-of-order logging (e.g., async validation for previous steps).
             wandb.define_metric("training_step")
+            wandb.define_metric("time/wall_clock_sec")
+            wandb.define_metric("reward/*", step_metric="training_step")
+            wandb.define_metric("loss/*", step_metric="training_step")
+            wandb.define_metric("throughput/*", step_metric="training_step")
+            wandb.define_metric("costs/*", step_metric="training_step")
+            wandb.define_metric("time/*", step_metric="training_step")
+            wandb.define_metric("data/*", step_metric="training_step")
             wandb.define_metric("train/*", step_metric="training_step")
             wandb.define_metric("val/*", step_metric="training_step")
-            wandb.define_metric("costs/*", step_metric="training_step")
+            wandb.define_metric("test/*", step_metric="training_step")
+            wandb.define_metric("discarded/*", step_metric="training_step")
         return self._wandb_run
 
     def _log_metrics(
@@ -392,7 +445,24 @@ class Model(
         step: int,
     ) -> None:
         """Log metrics to history.jsonl and optionally wandb."""
-        prefixed = {f"{split}/{k}": v for k, v in metrics.items()}
+        if split in METRIC_SPLITS:
+            prefixed = {}
+            for key, value in metrics.items():
+                first_component = key.split("/", 1)[0]
+                has_prefix_component = "/" in key
+                if has_prefix_component and (
+                    first_component in METRIC_SECTIONS
+                    or first_component in METRIC_SPLITS
+                ):
+                    prefixed[key] = value
+                else:
+                    prefixed[f"{split}/{key}"] = value
+        else:
+            prefixed = {f"{split}/{k}": v for k, v in metrics.items()}
+
+        prefixed["training_step"] = step
+        prefixed["time/wall_clock_sec"] = time.time() - self._run_start_time
+
         output_dir = self._get_output_dir()
 
         # Ensure output directory exists
@@ -416,65 +486,159 @@ class Model(
         ) or (self.report_metrics is not None and "wandb" in self.report_metrics)
         if should_log_wandb:
             if run := self._get_wandb_run():
-                run.log({"training_step": step, **prefixed})
+                self._define_wandb_step_metrics(prefixed.keys())
+                # Let W&B use its own monotonically increasing history step.
+                # ART's `training_step` remains the x-axis via define_metric,
+                # which preserves out-of-order eval logging.
+                run.log(prefixed)
 
-    async def _record_costs(
+    def _define_wandb_step_metrics(self, keys: Iterable[str]) -> None:
+        import wandb
+
+        for key in keys:
+            if not key.startswith("costs/"):
+                continue
+            if key in self._wandb_defined_metrics:
+                continue
+            wandb.define_metric(key, step_metric="training_step")
+            self._wandb_defined_metrics.add(key)
+
+    def _route_metrics_and_collect_non_costs(
+        self, metrics: dict[str, float], split: str
+    ) -> dict[str, float]:
+        builder = self._metrics_builder_for_split(split)
+        non_cost_metrics: dict[str, float] = {}
+        for metric, value in metrics.items():
+            numeric_value = float(value)
+            if metric.startswith("costs/"):
+                builder.add_cost(metric[len("costs/") :], numeric_value)
+                continue
+            if metric.startswith("costs_"):
+                raise ValueError(
+                    "Legacy cost keys like 'costs_prefill' are no longer supported. "
+                    "Log explicit cost keys like 'costs/train/tinker_prefill' or "
+                    "'costs/eval/judge/ruler' instead."
+                )
+            if is_builder_managed_metric(metric):
+                builder.add_metric(metric, numeric_value)
+                continue
+            non_cost_metrics[metric] = numeric_value
+        return non_cost_metrics
+
+    def _collect_automatic_backend_metrics(
         self,
+        *,
         split: str,
         step: int,
+        provided_metric_keys: set[str],
+    ) -> dict[str, float]:
+        if split != "train" or self._backend is None:
+            return {}
+
+        supports_step_metrics = getattr(
+            self._backend, "supports_automatic_train_step_metrics", None
+        )
+        if not callable(supports_step_metrics) or not supports_step_metrics():
+            return {}
+
+        if self._last_local_train_step == step:
+            return {}
+
+        now = time.monotonic()
+        step_wall_s = max(0.0, now - self._last_local_train_log_monotonic)
+        object.__setattr__(self, "_last_local_train_log_monotonic", now)
+        object.__setattr__(self, "_last_local_train_step", step)
+
+        automatic_metrics: dict[str, float] = {}
+        if "time/step_wall_s" not in provided_metric_keys:
+            automatic_metrics["time/step_wall_s"] = step_wall_s
+
+        gpu_cost_getter = getattr(
+            self._backend, "automatic_gpu_cost_per_hour_usd", None
+        )
+        if callable(gpu_cost_getter) and "costs/gpu" not in provided_metric_keys:
+            gpu_cost_per_hour_usd = gpu_cost_getter(self)
+            if gpu_cost_per_hour_usd is not None:
+                automatic_metrics["costs/gpu"] = (
+                    step_wall_s * float(gpu_cost_per_hour_usd) / 3600.0
+                )
+
+        return automatic_metrics
+
+    def _add_default_step_metrics(
+        self,
+        trajectory_groups: list[TrajectoryGroup],
         *,
-        cost_components: dict[str, float],
-        cost_total_direct: float,
-        cost_seen: bool,
-    ) -> None:
-        component_total = sum(cost_components.values())
-        step_total = component_total if component_total > 0 else cost_total_direct
-        if not cost_seen or step_total <= 0:
+        split: str,
+        provided_metric_keys: set[str],
+    ) -> dict[str, float]:
+        if split not in METRIC_SPLITS:
+            return {}
+
+        builder = self._metrics_builder_for_split(split)
+        summary = summarize_trajectory_groups(trajectory_groups)
+        default_data_metrics = build_data_metrics_from_summary(
+            summary,
+            include_trainable_groups=split == "train",
+        )
+        for key, value in default_data_metrics.items():
+            if key in provided_metric_keys:
+                continue
+            builder.add_metric(key, value)
+
+        if summary.scenario_ids:
+            builder.add_data(scenario_ids=summary.scenario_ids)
+
+        return {}
+
+    def metrics_builder(self, cost_context: str | None = None) -> MetricsBuilder:
+        self._load_metrics_builder_state()
+        if cost_context is None:
+            return self._metrics_builder
+        return self._metrics_builder.for_cost_context(cost_context)
+
+    def activate_metrics_context(self, cost_context: str) -> Token[MetricsBuilder]:
+        return self.metrics_builder(cost_context).activate()
+
+    def _metrics_builder_for_split(self, split: str) -> MetricsBuilder:
+        if split == "train":
+            return self._metrics_builder.for_cost_context("train", buffer_scope="train")
+        if split in {"val", "test"}:
+            return self._metrics_builder.for_cost_context("eval", buffer_scope="eval")
+        return self._metrics_builder.for_cost_context(split, buffer_scope=split)
+
+    def _load_metrics_builder_state(self) -> None:
+        if self._metrics_builder_state_loaded:
             return
+        state = self.read_state() or {}
+        metrics_state = state.get(METRICS_BUILDER_STATE_KEY)
+        if isinstance(metrics_state, dict):
+            self._metrics_builder.load_state_dict(metrics_state)
+        object.__setattr__(self, "_metrics_builder_state_loaded", True)
 
-        async with self._costs_lock:
-            existing_state = self.read_state() or {}
-            raw_costs = existing_state.get(COSTS_STATE_KEY) or {}
-            cumulative = {
-                key: float(value)
-                for key, value in raw_costs.items()
-                if isinstance(value, (int, float))
-            }
-            last_steps = raw_costs.get("_last_steps")
-            if not isinstance(last_steps, dict):
-                last_steps = {}
-            last_step = last_steps.get(split)
+    def _persist_metrics_builder_state(self) -> None:
+        self.merge_state(
+            {METRICS_BUILDER_STATE_KEY: self._metrics_builder.state_dict()}
+        )
 
-            if isinstance(last_step, (int, float)) and int(last_step) >= step:
-                for component, value in cost_components.items():
-                    if value == 0:
-                        continue
-                    cumulative_key = f"{split}_{component}"
-                    cumulative[cumulative_key] = max(
-                        cumulative.get(cumulative_key, 0.0), value
-                    )
-                cumulative[split] = max(cumulative.get(split, 0.0), step_total)
-                cumulative["total"] = max(
-                    cumulative.get("total", 0.0), cumulative.get(split, 0.0)
-                )
-                self.merge_state(
-                    {COSTS_STATE_KEY: {**cumulative, "_last_steps": last_steps}}
-                )
-                self._log_metrics(cumulative, "costs", step)
-                return
+    def _normalize_trajectory_groups(
+        self,
+        trajectories: Iterable[Trajectory | BaseException] | Iterable[TrajectoryGroup],
+    ) -> list[TrajectoryGroup]:
+        items = list(trajectories)
+        if not items:
+            return []
 
-            for component, value in cost_components.items():
-                if value == 0:
-                    continue
-                cumulative_key = f"{split}_{component}"
-                cumulative[cumulative_key] = cumulative.get(cumulative_key, 0.0) + value
-            cumulative[split] = cumulative.get(split, 0.0) + step_total
-            cumulative["total"] = cumulative.get("total", 0.0) + step_total
-            last_steps[split] = step
-            self.merge_state(
-                {COSTS_STATE_KEY: {**cumulative, "_last_steps": last_steps}}
-            )
-            self._log_metrics(cumulative, "costs", step)
+        if all(isinstance(item, TrajectoryGroup) for item in items):
+            return cast(list[TrajectoryGroup], items)
+
+        if all(isinstance(item, (Trajectory, BaseException)) for item in items):
+            return [TrajectoryGroup(cast(Iterable[Trajectory | BaseException], items))]
+
+        raise TypeError(
+            "trajectories must be an iterable of TrajectoryGroup objects or "
+            "an iterable of Trajectory/BaseException items"
+        )
 
     async def log(
         self,
@@ -506,58 +670,46 @@ class Model(
         if step is None:
             step = await self.get_step() if self.trainable else 0
 
+        self._load_metrics_builder_state()
+        builder = self._metrics_builder_for_split(split)
+
         # If only metrics provided (no trajectories), just log them and return
         if trajectories is None:
             if metrics is not None:
-                cost_step = await self.get_step()
-                cost_components: dict[str, float] = {}
-                cost_total_direct = 0.0
-                cost_seen = False
-
-                for metric, value in metrics.items():
-                    if not isinstance(value, (int, float)):
-                        continue
-                    if metric == COSTS_TOTAL_KEY:
-                        raise ValueError(
-                            "Do not log 'costs_total' directly. Log costs_* components "
-                            "(e.g., costs_prefill, costs_sample) and totals are derived."
-                        )
-                    elif metric.startswith(COSTS_METRIC_PREFIX):
-                        component = metric[len(COSTS_METRIC_PREFIX) :]
-                        if component:
-                            cost_components[component] = cost_components.get(
-                                component, 0.0
-                            ) + float(value)
-                            cost_seen = True
-
-                metrics_without_costs = {
-                    key: value
-                    for key, value in metrics.items()
-                    if not key.startswith(COSTS_METRIC_PREFIX)
-                }
-                if metrics_without_costs:
-                    self._log_metrics(metrics_without_costs, split, step)
-
-                await self._record_costs(
-                    split,
-                    cost_step,
-                    cost_components=cost_components,
-                    cost_total_direct=cost_total_direct,
-                    cost_seen=cost_seen,
+                provided_metric_keys = set(metrics)
+                automatic_metrics = self._collect_automatic_backend_metrics(
+                    split=split,
+                    step=step,
+                    provided_metric_keys=provided_metric_keys,
                 )
+                if automatic_metrics:
+                    self._route_metrics_and_collect_non_costs(automatic_metrics, split)
+                metrics_without_costs = self._route_metrics_and_collect_non_costs(
+                    metrics, split
+                )
+                builder_metrics = await builder.flush()
+                merged_metrics = {**metrics_without_costs, **builder_metrics}
+                if merged_metrics:
+                    self._log_metrics(merged_metrics, split, step)
+                self._persist_metrics_builder_state()
             return
 
-        # Convert to list[TrajectoryGroup]
-        if any(isinstance(t, Trajectory) for t in trajectories) or any(
-            isinstance(t, BaseException) for t in trajectories
-        ):
-            trajectory_groups = [
-                TrajectoryGroup(
-                    cast(Iterable[Trajectory | BaseException], trajectories)
-                )
-            ]
-        else:
-            trajectory_groups = cast(list[TrajectoryGroup], list(trajectories))
+        trajectory_groups = self._normalize_trajectory_groups(trajectories)
+        provided_metric_keys = set(metrics or {})
+
+        automatic_metrics = self._collect_automatic_backend_metrics(
+            split=split,
+            step=step,
+            provided_metric_keys=provided_metric_keys,
+        )
+        if automatic_metrics:
+            self._route_metrics_and_collect_non_costs(automatic_metrics, split)
+
+        default_train_metrics = self._add_default_step_metrics(
+            trajectory_groups,
+            split=split,
+            provided_metric_keys=provided_metric_keys,
+        )
 
         # Ensure output directories exist
         output_dir = self._get_output_dir()
@@ -571,59 +723,48 @@ class Model(
         )
 
         # 2. Calculate aggregate metrics (excluding additive costs)
-        cost_step = await self.get_step()
-        all_metrics: dict[str, list[float]] = {"reward": [], "exception_rate": []}
-        group_metrics: dict[str, list[float]] = {}
-        cost_components: dict[str, float] = {}
-        cost_total_direct = 0.0
-        cost_seen = False
+        reward_key = "reward"
+        exception_rate_key = "exception_rate"
+        reward_std_dev_key = "reward_std_dev"
 
-        def _add_costs(metrics_dict: dict[str, float | int | bool]) -> None:
-            nonlocal cost_total_direct, cost_seen
-            for metric, value in metrics_dict.items():
-                if not isinstance(value, (int, float)):
-                    continue
-                if metric == COSTS_TOTAL_KEY:
-                    raise ValueError(
-                        "Do not log 'costs_total' directly. Log costs_* components "
-                        "(e.g., costs_prefill, costs_sample) and totals are derived."
-                    )
-                elif metric.startswith(COSTS_METRIC_PREFIX):
-                    component = metric[len(COSTS_METRIC_PREFIX) :]
-                    if component:
-                        cost_components[component] = cost_components.get(
-                            component, 0.0
-                        ) + float(value)
-                        cost_seen = True
+        all_metrics: dict[str, list[float]] = {
+            reward_key: [],
+            exception_rate_key: [],
+        }
+        group_metrics: dict[str, list[float]] = {}
 
         for group in trajectory_groups:
             if group.metrics:
-                _add_costs(group.metrics)
+                group_non_cost = self._route_metrics_and_collect_non_costs(
+                    cast(dict[str, float], group.metrics), split
+                )
+            else:
+                group_non_cost = {}
             if group.trajectories:
-                for metric, value in group.metrics.items():
-                    if metric.startswith(COSTS_METRIC_PREFIX):
-                        continue
+                for metric, value in group_non_cost.items():
                     if metric not in group_metrics:
                         group_metrics[metric] = []
                     group_metrics[metric].append(float(value))
-            for trajectory in group:
-                if isinstance(trajectory, BaseException):
-                    all_metrics["exception_rate"].append(1)
-                    continue
-                else:
-                    all_metrics["exception_rate"].append(0)
-                # Add reward metric
-                all_metrics["reward"].append(trajectory.reward)
+
+            all_metrics[exception_rate_key].extend(0.0 for _ in group.trajectories)
+            all_metrics[exception_rate_key].extend(1.0 for _ in group.exceptions)
+
+            for trajectory in group.trajectories:
+                all_metrics[reward_key].append(trajectory.reward)
 
                 # Collect other custom metrics
+                trajectory_metrics: dict[str, float] = {}
                 for metric, value in trajectory.metrics.items():
-                    if metric.startswith(COSTS_METRIC_PREFIX):
-                        continue
+                    trajectory_metrics[metric] = float(value)
+
+                non_cost_trajectory_metrics = self._route_metrics_and_collect_non_costs(
+                    trajectory_metrics,
+                    split,
+                )
+                for metric, value in non_cost_trajectory_metrics.items():
                     if metric not in all_metrics:
                         all_metrics[metric] = []
                     all_metrics[metric].append(float(value))
-                if trajectory.metrics:
-                    _add_costs(trajectory.metrics)
 
         # Calculate averages for all metrics
         averages: dict[str, float] = {}
@@ -631,39 +772,34 @@ class Model(
             if len(values) > 0:
                 averages[metric] = sum(values) / len(values)
 
+        averages.update(default_train_metrics)
+
         # Aggregate group-level metrics once per group
         for metric, values in group_metrics.items():
             if len(values) > 0:
-                averages[f"group_metric_{metric}"] = sum(values) / len(values)
+                group_key = f"group_{metric}"
+                averages[group_key] = sum(values) / len(values)
 
         # Calculate average standard deviation of rewards within groups
         from .utils.old_benchmarking.calculate_step_metrics import (
             calculate_step_std_dev,
         )
 
-        averages["reward_std_dev"] = calculate_step_std_dev(trajectory_groups)
+        averages[reward_std_dev_key] = calculate_step_std_dev(trajectory_groups)
 
         # Merge in any additional metrics passed directly
         if metrics is not None:
-            _add_costs(metrics)
-            metrics_without_costs = {
-                key: value
-                for key, value in metrics.items()
-                if not key.startswith(COSTS_METRIC_PREFIX)
-            }
+            metrics_without_costs = self._route_metrics_and_collect_non_costs(
+                metrics, split
+            )
             averages.update(metrics_without_costs)
 
-        # 3. Log metrics (writes to history.jsonl and wandb)
-        self._log_metrics(averages, split, step)
-
-        # 4. Log cumulative costs (additive)
-        await self._record_costs(
-            split,
-            cost_step,
-            cost_components=cost_components,
-            cost_total_direct=cost_total_direct,
-            cost_seen=cost_seen,
-        )
+        # 3. Merge in any builder-managed metrics and log a single row.
+        builder_metrics = await builder.flush()
+        merged_metrics = {**averages, **builder_metrics}
+        if merged_metrics:
+            self._log_metrics(merged_metrics, split, step)
+        self._persist_metrics_builder_state()
 
     async def get_step(self) -> int:
         """
@@ -714,7 +850,6 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             report_metrics=report_metrics,
             **kwargs,
         )
-        object.__setattr__(self, "_costs_lock", asyncio.Lock())
         object.__setattr__(self, "_cost_calculator", self._noop_cost_calculator)
         if _internal_config is not None:
             # Bypass BaseModel __setattr__ to allow setting private attr
@@ -733,7 +868,9 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
     @staticmethod
     def _noop_cost_calculator(
-        _prompt_tokens: int | None, _completion_tokens: int | None
+        _prompt_tokens: int | None,
+        _completion_tokens: int | None,
+        _cost_context: str,
     ) -> dict[str, float]:
         return {}
 
@@ -881,6 +1018,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
 
         # 1. Train (backend no longer logs internally)
         training_metrics: list[dict[str, float]] = []
+        trainer_started = time.monotonic()
         async for metrics in self.backend()._train_model(
             self,
             groups_list,
@@ -889,16 +1027,11 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             verbose,
         ):
             training_metrics.append(metrics)
+        trainer_elapsed = time.monotonic() - trainer_started
 
         # 2. Calculate aggregated training metrics
-        avg_metrics: dict[str, float] = {}
-        if training_metrics:
-            avg_metrics = {
-                k: sum(d.get(k, 0) for d in training_metrics)
-                / sum(1 for d in training_metrics if k in d)
-                for k in {k for d in training_metrics for k in d}
-                if k != "num_gradient_steps"
-            }
+        avg_metrics = average_metric_samples(training_metrics)
+        avg_metrics.setdefault("time/step_trainer_s", trainer_elapsed)
 
         # 3. Log trajectories and training metrics together (single wandb log call)
         step = await self.get_step()
@@ -929,6 +1062,7 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         # Collect all metrics and aggregate them at the end (same as RL)
         _config = _config or {}  # ty:ignore[invalid-assignment]
         training_metrics: list[dict[str, float]] = []
+        trainer_started = time.monotonic()
         async for metrics in self.backend()._train_sft(
             self,
             trajectories,
@@ -937,14 +1071,14 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
             verbose,
         ):
             training_metrics.append(metrics)
+        trainer_elapsed = time.monotonic() - trainer_started
 
         # Log aggregated training metrics once (same as RL)
         if training_metrics:
-            avg_metrics = {
-                k: sum(d.get(k, 0) for d in training_metrics)
-                / sum(1 for d in training_metrics if k in d)
-                for k in {k for d in training_metrics for k in d}
-            }
+            avg_metrics = average_metric_samples(training_metrics)
+            avg_metrics["time/step_trainer_s"] = trainer_elapsed
             # Get the current step after training
             step = await self.get_step()
-            self._log_metrics(avg_metrics, "train", step)
+            await self.log(
+                trajectories=None, split="train", metrics=avg_metrics, step=step
+            )

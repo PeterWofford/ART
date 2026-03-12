@@ -30,6 +30,10 @@ from art.tinker.cookbook_v import renderers, tokenizer_utils
 from .. import dev
 from ..backend import Backend
 from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
+from ..metrics_taxonomy import (
+    build_training_summary_metrics,
+    summarize_trajectory_groups,
+)
 from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
@@ -46,6 +50,35 @@ from .data import (
 STATE_KEY_RUN_IDS = "tinker_run_ids"
 STATE_KEY_LATEST_STEP = "latest_step"
 T = TypeVar("T")
+
+_UPSTREAM_TRAIN_METRIC_KEYS = {
+    "reward": "reward",
+    "reward_std_dev": "reward_std_dev",
+    "exception_rate": "exception_rate",
+    "policy_loss": "loss/train",
+    "loss": "loss/train",
+    "entropy": "loss/entropy",
+    "kl_div": "loss/kl_div",
+    "kl_policy_ref": "loss/kl_policy_ref",
+    "grad_norm": "loss/grad_norm",
+    "learning_rate": "loss/learning_rate",
+    "num_groups_submitted": "data/step_num_groups_submitted",
+    "num_groups_trainable": "data/step_num_groups_trainable",
+    "num_trajectories": "data/step_num_trajectories",
+    "num_trainable_tokens": "data/step_trainer_tokens",
+    "train_tokens": "data/step_trainer_tokens",
+    "num_datums": "data/step_num_datums",
+}
+
+
+def _canonicalize_upstream_metric_key(metric: str) -> str:
+    if "/" in metric:
+        return metric
+    if metric == "tokens_per_second":
+        return ""
+    if metric.startswith("group_metric_"):
+        return f"group_{metric[len('group_metric_') :]}"
+    return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
 
 
 @dataclass
@@ -208,6 +241,7 @@ class TinkerNativeBackend(Backend):
     ) -> TrainResult:
         state = self._model_state[model.name]
         groups_list = list(trajectory_groups)
+        summary = summarize_trajectory_groups(groups_list)
 
         datums = trajectory_groups_to_datums(
             groups_list,
@@ -217,8 +251,11 @@ class TinkerNativeBackend(Backend):
         )
 
         metrics: dict[str, float] = {
-            "num_groups_submitted": float(len(groups_list)),
-            "num_datums": float(len(datums)),
+            **build_training_summary_metrics(
+                summary,
+                include_trainable_groups=True,
+            ),
+            "data/step_num_datums": float(len(datums)),
         }
 
         if not datums:
@@ -227,10 +264,13 @@ class TinkerNativeBackend(Backend):
         train_tokens = 0
         for datum in datums:
             train_tokens += len(datum.model_input.to_ints())
-        metrics["train_tokens"] = float(train_tokens)
+        metrics["data/step_trainer_tokens"] = float(train_tokens)
         pricing = get_model_pricing(model.base_model)
         if pricing is not None:
-            metrics["costs_train"] = compute_train_cost(train_tokens, pricing)
+            metrics["costs/train/tinker_train"] = compute_train_cost(
+                train_tokens, pricing
+            )
+        trainer_started = time.monotonic()
 
         if adam_params is None:
             adam_params = tinker.AdamParams(
@@ -268,12 +308,16 @@ class TinkerNativeBackend(Backend):
             for key, value in forward_output.metrics.items():
                 if value is None:
                     continue
-                metrics[key] = float(value)
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
         if optim_output.metrics:
             for key, value in optim_output.metrics.items():
                 if value is None:
                     continue
-                metrics[key] = float(value)
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
 
         next_step = state.current_step + 1
         checkpoint_name = f"step_{next_step:06d}"
@@ -298,6 +342,7 @@ class TinkerNativeBackend(Backend):
 
         state.current_step = next_step
         self._persist_model_state(model, state)
+        metrics["time/step_trainer_s"] = time.monotonic() - trainer_started
 
         return TrainResult(step=state.current_step, metrics=metrics)
 

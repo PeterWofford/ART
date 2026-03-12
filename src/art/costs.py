@@ -1,4 +1,4 @@
-"""Cost utilities for ART training and evaluation."""
+"""Cost utilities for ART training and Tinker inference."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ class ModelPricing:
 
 
 TokenCount: TypeAlias = int | None
-CostCalculator: TypeAlias = Callable[[TokenCount, TokenCount], dict[str, float]]
+CostCalculator: TypeAlias = Callable[[TokenCount, TokenCount, str], dict[str, float]]
 
 # Pricing per model ($/1M tokens). Keep in sync with infra pricing.
 MODEL_PRICING: dict[str, ModelPricing] = {
@@ -88,28 +88,35 @@ def compute_sample_costs(
     *,
     prompt_tokens: int | None,
     completion_tokens: int | None,
+    cost_context: str,
     pricing: ModelPricing,
 ) -> dict[str, float]:
-    """Compute prompt+completion costs for a single API call."""
+    """Compute Tinker prompt+completion costs for a single inference call."""
+    normalized_context = cost_context.strip("/")
+    if not normalized_context:
+        raise ValueError("cost_context must be non-empty")
     prompt_value = float(prompt_tokens or 0)
     completion_value = float(completion_tokens or 0)
     prefill_cost = tokens_to_cost(prompt_value, pricing.prefill)
     sample_cost = tokens_to_cost(completion_value, pricing.sample)
     return {
-        "costs_prefill": prefill_cost,
-        "costs_sample": sample_cost,
+        f"costs/{normalized_context}/tinker_prefill": prefill_cost,
+        f"costs/{normalized_context}/tinker_sample": sample_cost,
     }
 
 
 def build_cost_calculator(pricing: ModelPricing) -> CostCalculator:
-    """Return a callable that computes prompt+completion costs for a request."""
+    """Return a callable that computes split-scoped Tinker inference costs."""
 
     def _calculator(
-        prompt_tokens: int | None, completion_tokens: int | None
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        cost_context: str,
     ) -> dict[str, float]:
         return compute_sample_costs(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            cost_context=cost_context,
             pricing=pricing,
         )
 

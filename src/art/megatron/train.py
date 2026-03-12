@@ -282,8 +282,8 @@ while True:
             with open("/tmp/megatron_training_log.jsonl", "a+") as log_file:
                 log_msg = json.dumps(
                     {
-                        "loss": loss.item(),
-                        "grad_norm": grad_norm,
+                        "loss/train": loss.item(),
+                        "loss/grad_norm": grad_norm,
                         "probs_corr": probs_corr,
                     }
                 )

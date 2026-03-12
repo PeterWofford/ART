@@ -3,7 +3,7 @@ from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 import gc
 import os
-from typing import TYPE_CHECKING, Callable, cast
+from typing import TYPE_CHECKING, Any, Callable, cast
 
 import nest_asyncio
 from peft.peft_model import PeftModel
@@ -18,6 +18,43 @@ if TYPE_CHECKING:
     from .service import TrainInputs
 
 nest_asyncio.apply()
+
+_UPSTREAM_TRAIN_METRIC_KEYS = {
+    "reward": "reward",
+    "reward_std_dev": "reward_std_dev",
+    "exception_rate": "exception_rate",
+    "policy_loss": "loss/train",
+    "loss": "loss/train",
+    "entropy": "loss/entropy",
+    "kl_div": "loss/kl_div",
+    "kl_policy_ref": "loss/kl_policy_ref",
+    "grad_norm": "loss/grad_norm",
+    "learning_rate": "loss/learning_rate",
+    "num_groups_submitted": "data/step_num_groups_submitted",
+    "num_groups_trainable": "data/step_num_groups_trainable",
+    "num_trajectories": "data/step_num_trajectories",
+    "num_trainable_tokens": "data/step_trainer_tokens",
+    "train_tokens": "data/step_trainer_tokens",
+    "num_datums": "data/step_num_datums",
+}
+
+
+def _canonicalize_upstream_metric_key(metric: str) -> str:
+    if "/" in metric:
+        return metric
+    if metric == "tokens_per_second":
+        return ""
+    if metric.startswith("group_metric_"):
+        return f"group_{metric[len('group_metric_') :]}"
+    return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
+
+
+def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    return {
+        canonical_key: float(value)
+        for key, value in metrics.items()
+        if (canonical_key := _canonicalize_upstream_metric_key(key))
+    }
 
 
 async def train(
@@ -169,19 +206,21 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
             _config,
         )
 
-        trainer._metrics["train"]["learning_rate"].append(config.learning_rate)
-        trainer._metrics["train"]["policy_loss"].append(loss.mean_policy_loss.item())
+        trainer._metrics["train"]["loss/learning_rate"].append(config.learning_rate)
+        trainer._metrics["train"]["loss/train"].append(loss.mean_policy_loss.item())
         if loss.mean_entropy is not None:
-            trainer._metrics["train"]["entropy"].append(loss.mean_entropy.item())
+            trainer._metrics["train"]["loss/entropy"].append(loss.mean_entropy.item())
         if loss.kl_policy_ref is not None:
-            trainer._metrics["train"]["kl_policy_ref"].append(loss.kl_policy_ref.item())
+            trainer._metrics["train"]["loss/kl_policy_ref"].append(
+                loss.kl_policy_ref.item()
+            )
         return loss.mean_policy_loss
 
     return compute_loss
 
 
 def get_log_fn(
-    trainer: "GRPOTrainer", results_queue: asyncio.Queue[dict[str, float]]
+    trainer: Any, results_queue: asyncio.Queue[dict[str, float]]
 ) -> Callable[..., None]:
     def log(logs: dict[str, float], start_time: float | None = None) -> None:
         metrics = {
@@ -189,13 +228,18 @@ def get_log_fn(
         }  # average the metrics
 
         # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
-        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
+        # start with "eval_". Normalize them into the `val/...` taxonomy instead.
         if next(iter(logs.keys())).startswith("eval_"):
-            metrics = {f"eval_{key}": val for key, val in metrics.items()}
-
-        logs = {**logs, **metrics}
-        logs.pop("learning_rate", None)
-        results_queue.put_nowait(logs)
+            normalized_metrics = {f"val/{key}": val for key, val in metrics.items()}
+            normalized_logs = {
+                f"val/{_canonicalize_upstream_metric_key(key[len('eval_') :])}": val
+                for key, val in logs.items()
+            }
+            results_queue.put_nowait({**normalized_metrics, **normalized_logs})
+        else:
+            results_queue.put_nowait(
+                {**_canonicalize_upstream_metrics(logs), **metrics}
+            )
         trainer._metrics["train"].clear()
 
     return log

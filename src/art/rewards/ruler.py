@@ -50,6 +50,40 @@ DEFAULT_RUBRIC = dedent(
 as RULER extracts task understanding from the system prompts in the trajectories."""
 
 
+def _judge_provider(judge_model: str) -> str | None:
+    provider, separator, _ = judge_model.partition("/")
+    if not separator:
+        return None
+    normalized_provider = provider.strip().lower()
+    if not normalized_provider:
+        return None
+    return normalized_provider
+
+
+def _record_ruler_cost(judge_model: str, response: ModelResponse) -> None:
+    provider = _judge_provider(judge_model)
+    if provider is None:
+        return
+
+    try:
+        from art.metrics import MetricsBuilder
+
+        builder = MetricsBuilder.get_active()
+    except LookupError:
+        return
+
+    try:
+        builder.add_response_cost(
+            "judge/ruler",
+            response,
+            provider=provider,
+            model_name=judge_model,
+        )
+    except ValueError:
+        # RULER supports local and custom LiteLLM models that may not have pricing.
+        return
+
+
 async def ruler(
     message_lists: list[list[ChatCompletionMessageParam]],
     judge_model: str = "openai/o3",
@@ -189,6 +223,7 @@ async def ruler(
         **extra_litellm_params if extra_litellm_params else {},
     )
     assert isinstance(response, ModelResponse)
+    _record_ruler_cost(judge_model, response)
 
     if len(response.choices) == 0:
         raise ValueError(f"No choices in response: {response}")
