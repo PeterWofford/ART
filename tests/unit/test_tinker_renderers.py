@@ -180,3 +180,11 @@ def test_convert_openai_messages_to_renderer_format_stringifies_dict_arguments()
         "city": "San Francisco",
         "days": 3,
     }
+
+
+def test_get_renderer_supports_kimi_k25_factory() -> None:
+    tokenizer = FakeTokenizer()
+
+    renderer = renderers.get_renderer("kimi_k25", tokenizer)
+
+    assert renderer.__class__.__name__ == "KimiK25Renderer"

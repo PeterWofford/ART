@@ -167,6 +167,7 @@ class OpenAICompatibleTinkerServer:
                 self._renderers[base_model] = renderers.get_renderer(
                     name=get_renderer_name(base_model),
                     tokenizer=get_tokenizer(base_model),
+                    model_name=base_model,
                 )
             return self._renderers[base_model]
 
