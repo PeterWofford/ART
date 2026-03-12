@@ -12,7 +12,7 @@ Tool calling differences from Qwen3:
 Unlike Qwen3, the Qwen3.5 HF template:
 - Always adds <think>...</think> blocks to assistant messages after the last user
   message (empty if no reasoning content).
-- Always adds <think>\n to the generation prompt.
+- Always adds <think>\\n to the generation prompt.
 
 Reference: https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/tokenizer_config.json
 """
@@ -50,14 +50,14 @@ class Qwen3_5Renderer(Qwen3VLRenderer):
     basic chat format. Overrides tool calling to use Qwen3.5's XML parameter format.
 
     The Qwen3.5 HF template adds empty <think> blocks to assistant messages after
-    the last user query. This is handled via ctx.last_user_index, which is
+    the last user message. This is handled via ctx.last_user_index, which is
     populated by the base build_generation_prompt/build_supervised_example.
     """
 
     def _get_generation_suffix(self, role: Role, ctx: RenderContext) -> list[int]:
         """Override to produce the full generation suffix directly.
 
-        Builds the header tokens manually and appends <think>\n. This matches
+        Builds the header tokens manually and appends <think>\\n. This matches
         the Qwen3.5 template's add_generation_prompt behavior for thinking mode.
         """
         maybe_newline = "\n" if ctx.idx > 0 else ""
@@ -93,8 +93,7 @@ class Qwen3_5Renderer(Qwen3VLRenderer):
         match = _FUNCTION_BLOCK_RE.match(raw_text)
         if not match:
             return UnparsedToolCall(
-                raw_text=raw_text,
-                error="Malformed Qwen3.5 tool call XML",
+                raw_text=raw_text, error="Malformed Qwen3.5 tool call XML"
             )
 
         function_name = match.group("name").strip()
@@ -138,11 +137,11 @@ class Qwen3_5Renderer(Qwen3VLRenderer):
         )
 
     def parse_response(self, response: list[int]) -> tuple[Message, bool]:
-        """Parse response, prepending <think>\n since the generation prompt prefills it.
+        """Parse response, prepending <think>\\n since the generation prompt prefills it.
 
-        When sampling with build_generation_prompt, <think>\n is part of the generation
+        When sampling with build_generation_prompt, <think>\\n is part of the generation
         suffix and not included in the sampled tokens. The response will be
-        "reasoning\n</think>\n\nanswer" so we prepend <think>\n if necessary.
+        "reasoning\\n</think>\\n\\nanswer" so we prepend <think>\\n if necessary.
 
         Also strips leading/trailing whitespace from thinking content to match the
         HF template behavior (which applies |trim to reasoning_content).
@@ -297,8 +296,8 @@ class Qwen3_5DisableThinkingRenderer(Qwen3_5Renderer):
     Renderer for Qwen3.5 models with thinking disabled.
 
     Matches the Qwen3.5 HF template with enable_thinking=False. The only difference
-    from Qwen3_5Renderer is the generation suffix: <think>\n\n</think>\n\n instead
-    of <think>\n, signaling to the model to respond directly without reasoning.
+    from Qwen3_5Renderer is the generation suffix: <think>\\n\\n</think>\\n\\n instead
+    of <think>\\n, signaling to the model to respond directly without reasoning.
     """
 
     def _get_generation_suffix(self, role: Role, ctx: RenderContext) -> list[int]:

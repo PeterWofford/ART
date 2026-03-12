@@ -153,7 +153,6 @@ class Qwen3Renderer(Renderer):
                     rendered_parts.append(f"<think>{p['thinking']}</think>")
                 elif p["type"] == "text":
                     rendered_parts.append(p["text"])
-                # ToolCallPart handled via message's tool_calls field
             output_content = "".join(rendered_parts)
         else:
             # String content - pass through as-is.
@@ -310,7 +309,8 @@ class Qwen3Renderer(Renderer):
             # Use separators=(", ", ": ") to match HF's tojson filter output
             tool_lines = "\n".join(
                 json.dumps(
-                    {"type": "function", "function": tool}, separators=(", ", ": ")
+                    {"type": "function", "function": tool},
+                    separators=(", ", ": "),
                 )
                 for tool in tools
             )
@@ -447,8 +447,7 @@ class Qwen3VLRenderer(Qwen3Renderer):
         """Convert message content to list form for VL rendering.
 
         Converts ThinkingPart to <think>...</think> text (or strips if strip_thinking=True).
-        Wraps images with vision tokens. ToolCallPart is not supported in VL content list
-        (use message's tool_calls field instead).
+        Wraps images with vision tokens. Tool calls are in message's tool_calls field.
         """
         content = message["content"]
         if isinstance(content, str):
@@ -460,9 +459,9 @@ class Qwen3VLRenderer(Qwen3Renderer):
             base_parts: list[ImagePart | TextPart] = []
             for p in content:
                 if p["type"] == "text":
-                    base_parts.append(p)
+                    base_parts.append(cast(TextPart, p))
                 elif p["type"] == "image":
-                    base_parts.append(p)
+                    base_parts.append(cast(ImagePart, p))
                 elif p["type"] == "thinking":
                     if not strip_thinking:
                         # Render thinking as <think>...</think> text
@@ -473,7 +472,6 @@ class Qwen3VLRenderer(Qwen3Renderer):
                             )
                         )
                     # else: strip thinking by not appending
-                # ToolCallPart and UnparsedToolCallPart are handled via message's tool_calls field
 
         # Wrap images with vision tokens
         chunks: list[ImagePart | TextPart] = []
@@ -500,6 +498,7 @@ class Qwen3VLRenderer(Qwen3Renderer):
 
     def _format_tool_calls_chunks(self, message: Message) -> list[ImagePart | TextPart]:
         """Format tool_calls as output chunks. Override in subclasses for different formats."""
+        # Add leading newline to match HF template behavior
         assert "tool_calls" in message, "tool_calls are required to format tool calls"
         return [
             TextPart(

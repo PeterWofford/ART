@@ -533,6 +533,7 @@ class TinkerNativeBackend(Backend):
         renderer = renderers.get_renderer(
             name=config.renderer_name,
             tokenizer=tokenizer,
+            model_name=model.base_model,
         )
 
         saved_state = model.read_state() or {}
