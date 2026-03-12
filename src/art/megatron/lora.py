@@ -23,11 +23,12 @@ import torch
 
 ShardDomain = Literal["tp", "expert_tp"]
 GradSyncDomain = Literal["tp_default", "expert_tp"]
-GradSyncOp = Literal["none", "avg"]
+GradSyncOp = Literal["none", "sum", "avg"]
 
 TP_DEFAULT_GRAD_SYNC_DOMAIN: GradSyncDomain = "tp_default"
 EXPERT_TP_GRAD_SYNC_DOMAIN: GradSyncDomain = "expert_tp"
 GRAD_SYNC_OP_NONE: GradSyncOp = "none"
+GRAD_SYNC_OP_SUM: GradSyncOp = "sum"
 GRAD_SYNC_OP_AVG: GradSyncOp = "avg"
 
 
@@ -38,7 +39,7 @@ class LoRAParallelSpec(BaseModel):
 
     shard_domain: ShardDomain = "tp"
     sharded: bool = False
-    shard_axis: int | None = None
+    shard_dim: int | None = None
     grad_sync_domain: GradSyncDomain = TP_DEFAULT_GRAD_SYNC_DOMAIN
     grad_sync_op: GradSyncOp = GRAD_SYNC_OP_NONE
 
@@ -95,7 +96,7 @@ def _set_lora_parallel_metadata(
     setattr(param, "lora_shard_domain", parallel_spec.shard_domain)
     setattr(param, "lora_tp_sharded", parallel_spec.sharded)
     setattr(param, "lora_tp_replicated", replicated)
-    setattr(param, "lora_tp_shard_axis", parallel_spec.shard_axis)
+    setattr(param, "lora_tp_shard_dim", parallel_spec.shard_dim)
     setattr(param, "grad_sync_domain", parallel_spec.grad_sync_domain)
     setattr(param, "grad_sync_op", parallel_spec.grad_sync_op)
     # Megatron DDP routing flag:
@@ -114,6 +115,21 @@ def _set_lora_parallel_metadata(
             and parallel_spec.grad_sync_op == GRAD_SYNC_OP_AVG
         ),
     )
+
+    # Megatron optimizer and checkpoint logic rely on tensor model-parallel metadata
+    # to distinguish true shards from TP-duplicate params.
+    if parallel_spec.sharded:
+        setattr(param, "tensor_model_parallel", True)
+        setattr(
+            param, "partition_dim", _normalize_axis(parallel_spec.shard_dim, param.ndim)
+        )
+        # stride > 1 means the dim is split into blocks and each tp rank holds a shard of the block
+        # this might happen for fused e.g. gate_(up|proj), but loras are individual per module
+        setattr(param, "partition_stride", 1)
+    else:
+        setattr(param, "tensor_model_parallel", False)
+        setattr(param, "partition_dim", -1)
+        setattr(param, "partition_stride", 1)
 
 
 class LoRA(torch.nn.Module):
@@ -238,7 +254,7 @@ class LoRA(torch.nn.Module):
         domain = getattr(into, "lora_shard_domain")
         sharded = bool(getattr(into, "lora_tp_sharded"))
         if sharded:
-            axis = getattr(into, "lora_tp_shard_axis")
+            axis = getattr(into, "lora_tp_shard_dim")
             if axis is None:
                 raise RuntimeError(
                     f"{self.adapter_model_prefix}: missing shard axis for sharded parameter"
@@ -290,11 +306,11 @@ class LoRA(torch.nn.Module):
     def _manifest_for_param(self, param: torch.nn.Parameter) -> dict[str, Any]:
         domain = getattr(param, "lora_shard_domain")
         sharded = bool(getattr(param, "lora_tp_sharded", False))
-        shard_axis = getattr(param, "lora_tp_shard_axis", None)
+        shard_dim = getattr(param, "lora_tp_shard_dim", None)
         return {
             "domain": domain,
             "sharded": sharded,
-            "shard_axis": shard_axis,
+            "shard_dim": shard_dim,
             "shard_world_size": _get_shard_world_size(domain) if sharded else 1,
             "shard_rank": _get_shard_rank(domain) if sharded else 0,
         }
@@ -367,15 +383,15 @@ class SelfAttentionLinearProjLoRA(torch.nn.Module):
         a_parallel_spec = LoRAParallelSpec(
             shard_domain="tp",
             sharded=True,
-            shard_axis=-2,
+            shard_dim=-2,
             grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
             grad_sync_op=GRAD_SYNC_OP_NONE,  # only need DP-type reductions
         )
         b_parallel_spec = a_parallel_spec.model_copy(
             update={
                 "sharded": False,
-                "shard_axis": None,
-                "grad_sync_op": GRAD_SYNC_OP_AVG,  # megatron reduces across TP ranks
+                "shard_dim": None,
+                "grad_sync_op": GRAD_SYNC_OP_SUM,  # sum replicated TP contributions
             }
         )
         self.lora = LoRA(
@@ -423,6 +439,10 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         assert self.provider.kv_channels is not None
         assert self.provider.num_query_groups is not None
         assert self.provider.num_attention_heads is not None
+        if self.provider.num_attention_heads % self.provider.num_query_groups != 0:
+            raise ValueError(
+                "num_attention_heads must be divisible by num_query_groups for QKV LoRA"
+            )
         q_out_features = self.provider.kv_channels * self.provider.num_attention_heads
         kv_out_features = self.provider.kv_channels * self.provider.num_query_groups
         tp_world_size = ps.get_tensor_model_parallel_world_size()
@@ -434,6 +454,13 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         )
         q_out_features_per_rank = q_out_features // tp_world_size
         kv_out_features_per_rank = kv_out_features // tp_world_size
+        self.num_query_groups_per_partition = (
+            self.provider.num_query_groups // tp_world_size
+        )
+        self.num_attention_heads_per_group = (
+            self.provider.num_attention_heads // self.provider.num_query_groups
+        )
+        self.hidden_size_per_attention_head = self.provider.kv_channels
         assert isinstance(linear_qkv.weight, torch.Tensor)
         self.q_proj_lora = self._build_qkv_lora(
             adapter_model_prefix=f"{adapter_model_prefix}.q_proj",
@@ -470,14 +497,14 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         a_parallel_spec = LoRAParallelSpec(
             shard_domain="tp",
             sharded=False,
-            shard_axis=None,
+            shard_dim=None,
             grad_sync_domain=TP_DEFAULT_GRAD_SYNC_DOMAIN,
-            grad_sync_op=GRAD_SYNC_OP_AVG,  # megatron reduces across TP ranks
+            grad_sync_op=GRAD_SYNC_OP_SUM,  # sum replicated TP contributions
         )
         b_parallel_spec = a_parallel_spec.model_copy(
             update={
                 "sharded": True,
-                "shard_axis": -1,
+                "shard_dim": -1,
                 "grad_sync_op": GRAD_SYNC_OP_NONE,  # only need DP-type reductions
             }
         )
@@ -508,20 +535,32 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         query = self.q_proj_lora(layernorm_output)
         key = self.k_proj_lora(layernorm_output)
         value = self.v_proj_lora(layernorm_output)
-
-        assert isinstance(self.linear_qkv.config.kv_channels, int)
-        query_4d = query.reshape(
-            query.shape[0], query.shape[1], -1, self.linear_qkv.config.kv_channels
+        # Match Megatron mixed_qkv layout:
+        # [S, B, nqg, (nah/nqg + 2), hn] where each query-group packs
+        # [all query heads for that group, key, value].
+        query_5d = query.reshape(
+            query.shape[0],
+            query.shape[1],
+            self.num_query_groups_per_partition,
+            self.num_attention_heads_per_group,
+            self.hidden_size_per_attention_head,
         )
-        key_4d = key.reshape(
-            key.shape[0], key.shape[1], -1, self.linear_qkv.config.kv_channels
+        key_5d = key.reshape(
+            key.shape[0],
+            key.shape[1],
+            self.num_query_groups_per_partition,
+            1,
+            self.hidden_size_per_attention_head,
         )
-        value_4d = value.reshape(
-            value.shape[0], value.shape[1], -1, self.linear_qkv.config.kv_channels
+        value_5d = value.reshape(
+            value.shape[0],
+            value.shape[1],
+            self.num_query_groups_per_partition,
+            1,
+            self.hidden_size_per_attention_head,
         )
-
-        qkv_4d = torch.cat([query_4d, key_4d, value_4d], dim=2)
-        adapter_output = qkv_4d.reshape(qkv_4d.shape[0], qkv_4d.shape[1], -1)
+        qkv_5d = torch.cat([query_5d, key_5d, value_5d], dim=3)
+        adapter_output = qkv_5d.reshape(qkv_5d.shape[0], qkv_5d.shape[1], -1)
 
         return linear_output + adapter_output, bias
 
@@ -566,14 +605,14 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         a_parallel_spec = LoRAParallelSpec(
             shard_domain="expert_tp",
             sharded=False,
-            shard_axis=None,
+            shard_dim=None,
             grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
-            grad_sync_op=GRAD_SYNC_OP_AVG,  # we handle this with extended finalize_grads
+            grad_sync_op=GRAD_SYNC_OP_SUM,  # we handle this with extended finalize_grads
         )
         b_parallel_spec = a_parallel_spec.model_copy(
             update={
                 "sharded": True,
-                "shard_axis": -1,
+                "shard_dim": -1,
                 "grad_sync_domain": EXPERT_TP_GRAD_SYNC_DOMAIN,
                 "grad_sync_op": GRAD_SYNC_OP_NONE,  # only need DP-type reductions
             }
@@ -619,16 +658,16 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
         a_parallel_spec = LoRAParallelSpec(
             shard_domain="expert_tp",
             sharded=True,
-            shard_axis=-2,
+            shard_dim=-2,
             grad_sync_domain=EXPERT_TP_GRAD_SYNC_DOMAIN,
             grad_sync_op=GRAD_SYNC_OP_NONE,  # only need DP-type reductions
         )
         b_parallel_spec = a_parallel_spec.model_copy(
             update={
                 "sharded": False,
-                "shard_axis": None,
+                "shard_dim": None,
                 "grad_sync_domain": EXPERT_TP_GRAD_SYNC_DOMAIN,
-                "grad_sync_op": GRAD_SYNC_OP_AVG,  # we handle this with extended finalize_grads
+                "grad_sync_op": GRAD_SYNC_OP_SUM,  # we handle this with extended finalize_grads
             }
         )
         self.lora = LoRA(

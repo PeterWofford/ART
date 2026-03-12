@@ -8,14 +8,15 @@ import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 GradSyncDomain = Literal["tp_default", "expert_tp"]
-GradSyncOp = Literal["none", "avg"]
+GradSyncOp = Literal["none", "sum", "avg"]
 
 TP_DEFAULT_GRAD_SYNC_DOMAIN: GradSyncDomain = "tp_default"
 EXPERT_TP_GRAD_SYNC_DOMAIN: GradSyncDomain = "expert_tp"
 GRAD_SYNC_OP_NONE: GradSyncOp = "none"
+GRAD_SYNC_OP_SUM: GradSyncOp = "sum"
 GRAD_SYNC_OP_AVG: GradSyncOp = "avg"
 VALID_DOMAINS = (TP_DEFAULT_GRAD_SYNC_DOMAIN, EXPERT_TP_GRAD_SYNC_DOMAIN)
-VALID_SYNC_OPS = (GRAD_SYNC_OP_NONE, GRAD_SYNC_OP_AVG)
+VALID_SYNC_OPS = (GRAD_SYNC_OP_NONE, GRAD_SYNC_OP_SUM, GRAD_SYNC_OP_AVG)
 
 
 def _iter_named_trainable_parameters(
@@ -37,31 +38,36 @@ def _resolve_domain_group(
     domain: GradSyncDomain,
 ) -> torch.distributed.ProcessGroup | None:
     if domain == TP_DEFAULT_GRAD_SYNC_DOMAIN:
-        return None
+        group = ps.get_tensor_model_parallel_group(check_initialized=False)
+        if group is None or group.size() <= 1:
+            return None
+        return group
     if domain != EXPERT_TP_GRAD_SYNC_DOMAIN:
         raise RuntimeError(f"Unknown grad sync domain: {domain}")
 
     group = ps.get_expert_tensor_parallel_group(check_initialized=False)
-    if group is None:
-        return None
-    if group.size() <= 1:
+    if group is None or group.size() <= 1:
         return None
     return group
 
 
 def _resolve_reduce_op(op: GradSyncOp) -> Any:
+    if op == GRAD_SYNC_OP_SUM:
+        return torch.distributed.ReduceOp.SUM
     if op == GRAD_SYNC_OP_AVG:
         return torch.distributed.ReduceOp.AVG
     raise RuntimeError(f"Unknown grad sync op: {op}")
 
 
 def finalize_model_grads_extended(model: list[torch.nn.Module]) -> None:
-    """Run Megatron finalize, then apply non-default grad-sync reductions.
+    """Run Megatron finalize, then apply extra LoRA grad-sync reductions.
 
-    Megatron finalize handles DP/CP (and expert-DP via `param.allreduce=False`) internally.
-    This extension only handles extra reductions outside Megatron's default TP path,
-    currently expert-TP reductions for params annotated with grad_sync_* metadata.
+    Megatron finalize handles DP/CP(via `param.allreduce=True`)(and expert-DP via `param.allreduce=False`) internally.
+    This extension handles extra TP/expert-TP reductions for params annotated
+    with grad_sync_* metadata.
     """
+    # All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
+    # embedding grads across first and last pipeline stages (if not tied)
     finalize_model_grads(model)
 
     buckets: dict[
@@ -73,10 +79,8 @@ def finalize_model_grads_extended(model: list[torch.nn.Module]) -> None:
         domain: GradSyncDomain = getattr(
             param, "grad_sync_domain", TP_DEFAULT_GRAD_SYNC_DOMAIN
         )
-        if domain == TP_DEFAULT_GRAD_SYNC_DOMAIN:
+        if _resolve_domain_group(domain) is None:
             continue
-        if domain not in VALID_DOMAINS:
-            raise RuntimeError(f"{name}: unsupported grad_sync_domain={domain}")
 
         op: GradSyncOp = getattr(param, "grad_sync_op", GRAD_SYNC_OP_NONE)
         if op not in VALID_SYNC_OPS:
@@ -93,7 +97,7 @@ def finalize_model_grads_extended(model: list[torch.nn.Module]) -> None:
             raise RuntimeError(
                 f"{name}: expected non-None main_grad for domain={domain} reduce_op={op}"
             )
-        local_grad = cast(
+        local_grad = cast(  # local part of dtensor
             torch.Tensor, grad._local_tensor if hasattr(grad, "_local_tensor") else grad
         )
         buckets[(domain, op, local_grad.dtype, local_grad.device)].append(
@@ -101,9 +105,9 @@ def finalize_model_grads_extended(model: list[torch.nn.Module]) -> None:
         )
 
     for (domain, op, _dtype, _device), entries in buckets.items():
-        group = _resolve_domain_group(domain)
-        if group is None:
-            continue
+        group = _resolve_domain_group(
+            domain
+        )  # already checked if the domain is one we are handling
 
         grads = [grad for _name, grad in entries]
         coalesced = _flatten_dense_tensors(grads)
