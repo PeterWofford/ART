@@ -1,29 +1,35 @@
 from __future__ import annotations
 
-import argparse
-from contextlib import contextmanager
+from functools import partial
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
-import random
+import re
 import shutil
-import subprocess
-import sys
-from typing import Any, Callable, Literal, TypeVar, cast
+from typing import Any, Literal, TypeVar, cast
 
-import numpy as np
 from pydantic import BaseModel, ConfigDict, Field
+from rich import box
+from rich.console import Console
+from rich.table import Table
+import torch
+
+from .megatron_forward_trace import ForwardTraceCapture
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-ARTIFACT_ROOT = Path(REPO_ROOT / ".local/megatron_lora_oracles")
+ARTIFACT_ROOT = Path(REPO_ROOT / ".local/megatron_lora_correctness")
+ORACLE_MOE_ROUTING_BUNDLE_DIRNAME = "oracle_moe_routing_replay"
+ORACLE_REPLAY_TOPOLOGY_SUFFIX = "oracle_replay"
 
 REGENERATE_ENV = "ART_REGENERATE_MEGATRON_ORACLE"
-BASE_MODEL_ENV = "ART_MEGATRON_ORACLE_BASE_MODEL"
-DP_SUPPORT_ENV = "ART_MEGATRON_ORACLE_ENABLE_DP_PHASE_B"
+EXTENDED_TOPOLOGIES_ENV = "ART_MEGATRON_ORACLE_ENABLE_EXTENDED_TOPOLOGIES"
 SENSITIVITY_MUTATION_ENV = "ART_MEGATRON_ORACLE_MUTATION"
 
-SensitivityMutation = Literal["drop_finalize"]
+DEFAULT_SENSITIVITY_MUTATION = "drop_finalize"
+SUPPORTED_SENSITIVITY_MUTATIONS = (DEFAULT_SENSITIVITY_MUTATION,)
+SensitivityMutation = str
 
 REQUIRED_PACKED_TENSOR_FILES = (
     "tokens.pt",
@@ -35,26 +41,68 @@ REQUIRED_PACKED_TENSOR_FILES = (
     "advantages.pt",
     "weights.pt",
 )
+NON_FINITE_METRIC_VALUE = 1e30
+EXPERT_TABLE_ROW_LIMIT = 8
+EXPERT_TRIPLET_PARAM_RE = re.compile(
+    r"layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\."
+)
+PHASE_PRINT_ORDER = {
+    "forward": 0,
+    "router_scores": 1,
+    "router_topk_ids": 2,
+    "outputs": 3,
+    "losses": 4,
+    "grads": 5,
+    "deltas": 6,
+}
 
 
 class Topology(BaseModel):
+    """Defines distributed topology settings for one Megatron run variant."""
+
     model_config = ConfigDict(frozen=True)
 
     tp: int
     ep: int
     etp: int = 1
     dp: int = 1
-    sp: int = 0
-    phase: Literal["A", "B"] = "A"
+    sp: bool = False
+    cp: int = 1
+    pp: int = 1
+    vpp: int = 1
+
+    def resolved_expert_dp(self) -> int:
+        """Derives expert data parallel size from topology/world-size constraints."""
+        attention_world = self.tp * self.cp * self.pp * self.dp
+        expert_divisor = self.etp * self.ep * self.pp
+        if attention_world % expert_divisor != 0:
+            raise ValueError(
+                "Invalid topology for Megatron expert parallelism: "
+                f"world_size={attention_world} is not divisible by "
+                f"etp*ep*pp={expert_divisor}."
+            )
+        return attention_world // expert_divisor
 
     def slug(self) -> str:
-        return f"tp{self.tp}_ep{self.ep}_etp{self.etp}_dp{self.dp}_sp{self.sp}"
+        return (
+            f"tp{self.tp}_ep{self.ep}_etp{self.etp}"
+            f"_dp{self.dp}_edp{self.resolved_expert_dp()}"
+            f"_cp{self.cp}_pp{self.pp}_vpp{self.vpp}_sp{int(self.sp)}"
+        )
 
     def world_size(self) -> int:
-        return self.tp * self.ep * self.etp * self.dp
+        # Mirrors Megatron parallel-state sizing:
+        # attention side: world = tp * pp * cp * dp
+        # expert side must also divide this world size (validated in resolved_expert_dp()).
+        attention_world = self.tp * self.cp * self.pp * self.dp
+        self.resolved_expert_dp()
+        return attention_world
 
 
 class PackedTensorConfig(BaseModel):
+    """Controls synthetic packed tensor generation used by oracle harness runs."""
+
     num_sequences: int = 8
     sequence_length: int = 256
     prefill_tokens: int = 64
@@ -63,6 +111,8 @@ class PackedTensorConfig(BaseModel):
 
 
 class LoraConfig(BaseModel):
+    """Configures LoRA adapter dimensions and targeted module families."""
+
     rank: int = 1
     alpha: int = 32
     target_modules: list[str] = Field(
@@ -79,28 +129,30 @@ class LoraConfig(BaseModel):
 
 
 class ToleranceProfile(BaseModel):
-    outputs_abs: float = 1e-2
-    outputs_rel: float = 1e-2
-    losses_abs: float = 1e-4
-    losses_rel: float = 1e-4
-    grads_abs: float = 1e-2
-    grads_rel: float = 1e-2
-    deltas_abs: float = 1e-2
-    deltas_rel: float = 1e-2
+    """Defines row-level pass/fail thresholds for variant comparison phases."""
+
+    relative_l2: float = 1e-2
+    mean_abs_pct: float = 1.0
 
 
 class OracleCaseConfig(BaseModel):
+    """Contains all deterministic run parameters for one oracle case."""
+
     base_model: str
+    num_layers: int = 4
     seed: int = 20260305
-    num_steps: int = 3
-    learning_rate: float = 5e-6
+    num_steps: int = 2
+    learning_rate: float = 1e-3
     beta: float = 0.0
+    loss_scale: float = 1e4
     packed_tensors: PackedTensorConfig = Field(default_factory=PackedTensorConfig)
     lora: LoraConfig = Field(default_factory=LoraConfig)
     tolerances: ToleranceProfile = Field(default_factory=ToleranceProfile)
 
 
 class DiskPackedTensorsSpec(BaseModel):
+    """Describes packed tensor artifacts persisted on disk for reuse."""
+
     dir: str
     num_sequences: int
     sequence_length: int
@@ -109,6 +161,8 @@ class DiskPackedTensorsSpec(BaseModel):
 
 
 class CaseArtifacts(BaseModel):
+    """Holds stable case-level artifact paths used by all variants."""
+
     case_id: str
     case_dir: str
     packed_tensors: DiskPackedTensorsSpec
@@ -116,17 +170,23 @@ class CaseArtifacts(BaseModel):
 
 
 class WorkerRunRequest(BaseModel):
+    """Defines one distributed worker invocation for generating variant artifacts."""
+
     case_id: str
     case_config: OracleCaseConfig
     topology: Topology
     topology_dir: str
     packed_tensors: DiskPackedTensorsSpec
     shared_init_adapter_path: str
-    allow_create_shared_init: bool = False
     mutation: SensitivityMutation | None = None
+    moe_routing_replay_path: str | None = None
+    moe_routing_replay_strict: bool = True
+    capture_moe_routing_bundle_path: str | None = None
 
 
 class StepTrace(BaseModel):
+    """Tracks per-step trace artifact filenames and loss metadata."""
+
     step_index: int
     loss: float
     probs_corr: float
@@ -137,8 +197,11 @@ class StepTrace(BaseModel):
 
 
 class RunManifest(BaseModel):
+    """Records run metadata and per-step trace references for one topology output."""
+
     case_id: str
     base_model: str
+    num_layers: int
     topology: str
     world_size: int
     seed: int
@@ -148,18 +211,142 @@ class RunManifest(BaseModel):
     steps: list[StepTrace]
 
 
-class ComparisonFailure(BaseModel):
+class MetricRow(BaseModel):
+    """Represents one comparable unit (param/module/global) for one phase and step."""
+
     case_id: str
+    variant: str
     topology: str
     oracle_topology: str
-    metric: Literal["outputs", "losses", "grads", "lora_deltas"]
     step_index: int
-    key: str
-    max_abs_error: float
-    max_rel_error: float
-    abs_tolerance: float
-    rel_tolerance: float
-    message: str
+    phase: str
+    param: str
+    numel: float
+    mean_abs_diff: float
+    relative_l2: float
+    typical_abs_scale: float
+    mean_abs_pct: float
+    topk_mismatch_fraction: float | None = None
+    top1_mismatch_fraction: float | None = None
+    thresholds: dict[str, float] = Field(default_factory=dict)
+    pass_signal: bool = True
+    failure_reasons: list[str] = Field(default_factory=list)
+
+
+class VariantSpec(BaseModel):
+    """Declares how to execute and evaluate one candidate variant against the oracle."""
+
+    name: str
+    topology: Topology
+    thresholds_by_phase: dict[str, dict[str, float]]
+    output_slug: str | None = None
+    reference_slug: str | None = None
+    mutation: SensitivityMutation | None = None
+    expected_signal: Literal["pass", "fail"] = "pass"
+
+    def resolved_output_slug(self) -> str:
+        if self.output_slug is not None:
+            return self.output_slug
+        return _topology_output_slug(self.topology, self.mutation)
+
+    def resolved_reference_slug(self) -> str:
+        if self.reference_slug is not None:
+            return self.reference_slug
+        return ORACLE_TOPOLOGY.slug()
+
+
+class VariantReport(BaseModel):
+    """Captures full comparison output for one variant run."""
+
+    case_id: str
+    variant: str
+    topology: str
+    reference_topology: str
+    expected_signal: Literal["pass", "fail"]
+    signal: Literal["pass", "fail"]
+    pass_count: int
+    fail_count: int
+    step_summaries: dict[int, dict[str, Any]]
+    metrics: list[MetricRow]
+
+
+class DiffAccumulator:
+    """Accumulates diff statistics across tensors and router-id mismatch counters."""
+
+    def __init__(self) -> None:
+        self.numel = 0
+        self.abs_sum = 0.0
+        self.diff_sq_sum = 0.0
+        self.ref_sq_sum = 0.0
+        self.ref_abs_sum = 0.0
+        self.router_topk_total = 0
+        self.router_topk_mismatch = 0
+        self.router_top1_total = 0
+        self.router_top1_mismatch = 0
+
+    def update(self, reference, candidate) -> None:  # type: ignore[no-untyped-def]
+        """Adds one tensor pair into the accumulator."""
+        ref = reference.detach().float()
+        cand = candidate.detach().float()
+        diff = (cand - ref).abs()
+        if diff.numel() == 0:
+            return
+        self.numel += int(diff.numel())
+        self.abs_sum += float(diff.sum().item())
+        self.diff_sq_sum += float((cand - ref).square().sum().item())
+        self.ref_sq_sum += float(ref.square().sum().item())
+        self.ref_abs_sum += float(ref.abs().sum().item())
+
+    def update_router_ids(self, reference_ids, candidate_ids) -> None:  # type: ignore[no-untyped-def]
+        """Adds router top-k id mismatch counts into the accumulator."""
+        self.router_topk_total += int(reference_ids.numel())
+        self.router_topk_mismatch += int((reference_ids != candidate_ids).sum().item())
+        if reference_ids.ndim >= 2 and reference_ids.shape[1] > 0:
+            self.router_top1_total += int(reference_ids.shape[0])
+            self.router_top1_mismatch += int(
+                (reference_ids[:, 0] != candidate_ids[:, 0]).sum().item()
+            )
+
+    def as_summary(self) -> dict[str, float]:
+        """Returns normalized summary values for one row."""
+        if self.numel == 0:
+            topk_fraction = 0.0
+            top1_fraction = 0.0
+        else:
+            topk_fraction = (
+                self.router_topk_mismatch / self.router_topk_total
+                if self.router_topk_total > 0
+                else 0.0
+            )
+            top1_fraction = (
+                self.router_top1_mismatch / self.router_top1_total
+                if self.router_top1_total > 0
+                else 0.0
+            )
+        if self.numel == 0:
+            return {
+                "numel": 0.0,
+                "mean_abs_diff": 0.0,
+                "relative_l2": 0.0,
+                "typical_abs_scale": 0.0,
+                "mean_abs_pct": 0.0,
+                "topk_mismatch_fraction": topk_fraction,
+                "top1_mismatch_fraction": top1_fraction,
+            }
+        mean_abs = self.abs_sum / self.numel
+        typical_abs = self.ref_abs_sum / self.numel
+        mean_abs_pct = (mean_abs / (typical_abs + 1e-12)) * 100.0
+        return {
+            "numel": _finite_metric(float(self.numel), default=0.0),
+            "mean_abs_diff": _finite_metric(mean_abs),
+            "relative_l2": _finite_metric(
+                (self.diff_sq_sum**0.5) / max(self.ref_sq_sum**0.5, 1e-12)
+            ),
+            "typical_abs_scale": _finite_metric(typical_abs, default=0.0),
+            "mean_abs_pct": _finite_metric(mean_abs_pct),
+            "topk_mismatch_fraction": _finite_metric(topk_fraction, default=1.0),
+            "top1_mismatch_fraction": _finite_metric(top1_fraction, default=1.0),
+        }
 
 
 T = TypeVar("T")
@@ -171,18 +358,18 @@ def _require_not_none(value: T | None, name: str) -> T:
     return value
 
 
-PHASE_A_TOPOLOGIES = [
-    Topology(tp=1, ep=1, etp=1, dp=1, sp=0, phase="A"),
-    Topology(tp=2, ep=1, etp=1, dp=1, sp=1, phase="A"),
-    Topology(tp=1, ep=2, etp=1, dp=1, sp=0, phase="A"),
-    Topology(tp=2, ep=2, etp=1, dp=1, sp=1, phase="A"),
+TOPOLOGIES = [
+    Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
+    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
+    Topology(tp=1, ep=2, etp=1, dp=2, sp=False),
+    Topology(tp=2, ep=2, etp=1, dp=2, sp=True),
 ]
-PHASE_B_TOPOLOGIES = [
-    Topology(tp=1, ep=1, etp=1, dp=2, sp=0, phase="B"),
-    Topology(tp=2, ep=1, etp=1, dp=2, sp=1, phase="B"),
+EXTENDED_TOPOLOGIES = [
+    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
+    Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
 ]
-ORACLE_TOPOLOGY = PHASE_A_TOPOLOGIES[0]
-SENSITIVITY_TOPOLOGY = PHASE_A_TOPOLOGIES[1]
+ORACLE_TOPOLOGY = TOPOLOGIES[0]
+SENSITIVITY_TOPOLOGY = TOPOLOGIES[1]
 
 
 def _truthy(value: str | None) -> bool:
@@ -191,69 +378,57 @@ def _truthy(value: str | None) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def sensitivity_mutation() -> SensitivityMutation | None:
+def sensitivity_mutations() -> list[SensitivityMutation]:
+    """Parses sensitivity mutation selectors from env as a CSV list."""
     raw = os.environ.get(SENSITIVITY_MUTATION_ENV)
     if raw is None or raw.strip() == "":
-        return None
+        return []
     normalized = raw.strip().lower()
     if normalized in {"1", "true", "yes", "on"}:
-        return "drop_finalize"
-    if normalized == "drop_finalize":
-        return "drop_finalize"
+        return [DEFAULT_SENSITIVITY_MUTATION]
+    mutations = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    unsupported = [
+        mutation
+        for mutation in mutations
+        if mutation not in SUPPORTED_SENSITIVITY_MUTATIONS
+    ]
+    if not unsupported:
+        return mutations
+    supported = ", ".join(SUPPORTED_SENSITIVITY_MUTATIONS)
     raise ValueError(
         f"Unsupported {SENSITIVITY_MUTATION_ENV} value '{raw}'. "
-        "Supported values: drop_finalize, 1/true/yes/on."
+        f"Supported values: {supported}, CSV of supported values, 1/true/yes/on."
     )
 
 
 def sensitivity_enabled() -> bool:
-    return sensitivity_mutation() is not None
+    return bool(sensitivity_mutations())
 
 
-def phase_b_dp_enabled() -> bool:
-    return _truthy(os.environ.get(DP_SUPPORT_ENV))
+def extended_topologies_enabled() -> bool:
+    """Returns whether extended topologies are enabled for the suite."""
+    return _truthy(os.environ.get(EXTENDED_TOPOLOGIES_ENV))
 
 
 def regenerate_requested() -> bool:
     return _truthy(os.environ.get(REGENERATE_ENV))
 
 
-def default_case_config() -> OracleCaseConfig:
-    def _env_float(name: str, default: str) -> float:
-        return float(os.environ.get(name, default))
-
-    tolerances = ToleranceProfile(
-        outputs_abs=_env_float("ART_MEGATRON_ORACLE_OUTPUTS_ABS_TOL", "1e-2"),
-        outputs_rel=_env_float("ART_MEGATRON_ORACLE_OUTPUTS_REL_TOL", "1e-2"),
-        losses_abs=_env_float("ART_MEGATRON_ORACLE_LOSSES_ABS_TOL", "1e-4"),
-        losses_rel=_env_float("ART_MEGATRON_ORACLE_LOSSES_REL_TOL", "1e-4"),
-        grads_abs=_env_float("ART_MEGATRON_ORACLE_GRADS_ABS_TOL", "1e-2"),
-        grads_rel=_env_float("ART_MEGATRON_ORACLE_GRADS_REL_TOL", "1e-2"),
-        deltas_abs=_env_float("ART_MEGATRON_ORACLE_DELTAS_ABS_TOL", "1e-2"),
-        deltas_rel=_env_float("ART_MEGATRON_ORACLE_DELTAS_REL_TOL", "1e-2"),
-    )
-    return OracleCaseConfig(
-        base_model=os.environ.get(
-            BASE_MODEL_ENV,
-            "Qwen/Qwen3-30B-A3B-Instruct-2507",
-        ),
-        seed=int(os.environ.get("ART_MEGATRON_ORACLE_SEED", "20260305")),
-        num_steps=int(os.environ.get("ART_MEGATRON_ORACLE_NUM_STEPS", "3")),
-        learning_rate=float(os.environ.get("ART_MEGATRON_ORACLE_LR", "5e-6")),
-        beta=float(os.environ.get("ART_MEGATRON_ORACLE_BETA", "0.0")),
-        tolerances=tolerances,
-    )
+def case_config(
+    base_model: str = "Qwen/Qwen3-30B-A3B-Instruct-2507",
+) -> OracleCaseConfig:
+    """Builds the deterministic default oracle case config."""
+    return OracleCaseConfig(base_model=base_model)
 
 
 def available_gpu_count() -> int:
     import torch
 
-    if not torch.cuda.is_available():
-        return 0
     return int(torch.cuda.device_count())
 
 
 def stable_case_id(case_config: OracleCaseConfig) -> str:
+    """Builds a deterministic case id from case config contents."""
     payload = case_config.model_dump(mode="json")
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
@@ -269,7 +444,7 @@ def stable_case_id(case_config: OracleCaseConfig) -> str:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
+        json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -281,6 +456,7 @@ def _build_packed_tensors(
     config: PackedTensorConfig,
     seed: int,
 ) -> dict[str, Any]:
+    """Generates deterministic synthetic packed tensors used in integration runs."""
     import torch
 
     if config.num_sequences <= 1:
@@ -351,6 +527,7 @@ def _create_packed_tensors(
     case_config: OracleCaseConfig,
     packed_dir: Path,
 ) -> DiskPackedTensorsSpec:
+    """Persists packed tensors to disk and returns their descriptor."""
     from art.preprocessing.pack import PackedTensors, packed_tensors_to_dir
 
     packed_tensors = cast(
@@ -361,15 +538,8 @@ def _create_packed_tensors(
     return DiskPackedTensorsSpec.model_validate(descriptor)
 
 
-def _validate_packed_tensor_files(spec: DiskPackedTensorsSpec) -> None:
-    tensor_dir = Path(spec.dir)
-    for filename in REQUIRED_PACKED_TENSOR_FILES:
-        file_path = tensor_dir / filename
-        if not file_path.exists():
-            raise FileNotFoundError(f"Missing packed tensor file: {file_path}")
-
-
 def ensure_case_artifacts(case_config: OracleCaseConfig) -> CaseArtifacts:
+    """Ensures stable case-level artifacts (input tensors) are present and reusable."""
     case_id = stable_case_id(case_config)
     case_dir = ARTIFACT_ROOT / case_id
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -378,7 +548,6 @@ def ensure_case_artifacts(case_config: OracleCaseConfig) -> CaseArtifacts:
     descriptor_path = case_dir / "packed_tensors.json"
     if descriptor_path.exists():
         packed_spec = DiskPackedTensorsSpec.model_validate(_read_json(descriptor_path))
-        _validate_packed_tensor_files(packed_spec)
     else:
         packed_spec = _create_packed_tensors(case_config, case_dir / "packed_tensors")
         _write_json(descriptor_path, packed_spec.model_dump(mode="json"))
@@ -394,809 +563,822 @@ def ensure_case_artifacts(case_config: OracleCaseConfig) -> CaseArtifacts:
 
 
 def _replace_topology_dir(path: Path) -> None:
+    """Resets one topology output directory before regeneration."""
     if path.exists():
         shutil.rmtree(path)
     path.mkdir(parents=True, exist_ok=True)
     (path / "traces").mkdir(parents=True, exist_ok=True)
 
 
-def _run_worker_subprocess(request: WorkerRunRequest, topology_dir: Path) -> None:
-    request_path = topology_dir / "run_request.json"
-    _write_json(request_path, request.model_dump(mode="json"))
-
-    command = [
-        sys.executable,
-        "-m",
-        "torch.distributed.run",
-        "--standalone",
-        "--nproc_per_node",
-        str(request.topology.world_size()),
-        str(Path(__file__).resolve()),
-        "--worker-run",
-        "--run-request",
-        str(request_path),
-    ]
-    run = subprocess.run(
-        command,
-        cwd=str(REPO_ROOT),
-        env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    combined_output = f"{run.stdout}\n{run.stderr}".strip()
-    (topology_dir / "worker.log").write_text(combined_output + "\n", encoding="utf-8")
-    if run.returncode != 0:
-        tail = "\n".join(combined_output.splitlines()[-80:])
-        raise RuntimeError(
-            f"Topology run failed for {request.topology.slug()} with exit code "
-            f"{run.returncode}.\n{tail}"
-        )
-
-
-def ensure_topology_artifacts(
-    case_config: OracleCaseConfig,
+def _topology_output_slug(
     topology: Topology,
-    *,
-    regenerate: bool = False,
     mutation: SensitivityMutation | None = None,
-) -> Path:
-    case_artifacts = ensure_case_artifacts(case_config)
-    case_dir = Path(case_artifacts.case_dir)
-    topology_dir = case_dir / topology.slug()
-    manifest_path = topology_dir / "manifest.json"
-    if manifest_path.exists() and not regenerate:
-        return topology_dir
-
-    _replace_topology_dir(topology_dir)
-    shared_init_path = Path(case_artifacts.shared_init_adapter_path)
-    allow_create_shared_init = topology.slug() == ORACLE_TOPOLOGY.slug()
-    if not allow_create_shared_init and not shared_init_path.exists():
-        ensure_topology_artifacts(
-            case_config=case_config,
-            topology=ORACLE_TOPOLOGY,
-            regenerate=False,
-            mutation=None,
-        )
-    if not allow_create_shared_init and not shared_init_path.exists():
-        raise FileNotFoundError(
-            f"Oracle shared adapter missing after oracle generation: {shared_init_path}"
-        )
-    if mutation is not None and topology.slug() == ORACLE_TOPOLOGY.slug():
-        raise RuntimeError("Sensitivity mutation cannot be applied to oracle topology")
-
-    request = WorkerRunRequest(
-        case_id=case_artifacts.case_id,
-        case_config=case_config,
-        topology=topology,
-        topology_dir=str(topology_dir),
-        packed_tensors=case_artifacts.packed_tensors,
-        shared_init_adapter_path=str(shared_init_path),
-        allow_create_shared_init=allow_create_shared_init,
-        mutation=mutation,
-    )
-    _run_worker_subprocess(request, topology_dir)
-    if not manifest_path.exists():
-        raise RuntimeError(f"Missing manifest after run: {manifest_path}")
-    return topology_dir
-
-
-def ensure_oracle_reference_artifacts(
-    *,
-    case_config: OracleCaseConfig,
-    regenerate: bool = False,
-) -> Path:
-    return ensure_topology_artifacts(
-        case_config=case_config,
-        topology=ORACLE_TOPOLOGY,
-        regenerate=regenerate,
-        mutation=None,
-    )
+) -> str:
+    """Builds output slug for a topology and optional mutation variant."""
+    return topology.slug() if mutation is None else f"{topology.slug()}__{mutation}"
 
 
 def _load_manifest(topology_dir: Path) -> RunManifest:
+    """Loads one run manifest for a topology output directory."""
     manifest_path = topology_dir / "manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(f"Missing topology manifest: {manifest_path}")
     return RunManifest.model_validate(_read_json(manifest_path))
 
 
 def _load_output_tensor(topology_dir: Path, step: StepTrace):
+    """Loads one output trace tensor referenced by a step trace entry."""
     import torch
 
     path = topology_dir / step.output_file
-    if not path.exists():
-        raise FileNotFoundError(f"Missing output trace: {path}")
     return torch.load(path, map_location="cpu")
 
 
 def _load_safetensor_map(path: Path) -> dict[str, Any]:
+    """Loads one safetensor map from disk."""
     from safetensors.torch import load_file
 
-    if not path.exists():
-        raise FileNotFoundError(f"Missing safetensor trace: {path}")
     return load_file(str(path))
 
 
-def _tensor_error(reference, candidate) -> tuple[float, float]:
-    ref = reference.detach().float()
-    cand = candidate.detach().float()
-    if ref.shape != cand.shape:
-        return float("inf"), float("inf")
-    if ref.numel() == 0:
-        return 0.0, 0.0
-    diff = (cand - ref).abs()
-    max_abs = float(diff.max().item())
-    max_rel = float((diff / ref.abs().clamp_min(1e-12)).max().item())
-    return max_abs, max_rel
-
-
-def _build_failure(
-    *,
-    case_id: str,
-    topology: str,
-    metric: Literal["outputs", "losses", "grads", "lora_deltas"],
-    step_index: int,
-    key: str,
-    max_abs_error: float,
-    max_rel_error: float,
-    abs_tolerance: float,
-    rel_tolerance: float,
-    message: str,
-) -> ComparisonFailure:
-    return ComparisonFailure(
-        case_id=case_id,
-        topology=topology,
-        oracle_topology=ORACLE_TOPOLOGY.slug(),
-        metric=metric,
-        step_index=step_index,
-        key=key,
-        max_abs_error=max_abs_error,
-        max_rel_error=max_rel_error,
-        abs_tolerance=abs_tolerance,
-        rel_tolerance=rel_tolerance,
-        message=message,
-    )
-
-
-def _compare_tensor_pair(
-    *,
-    case_id: str,
-    topology: str,
-    metric: Literal["outputs", "losses", "grads", "lora_deltas"],
-    step_index: int,
-    key: str,
-    reference,
-    candidate,
-    abs_tolerance: float,
-    rel_tolerance: float,
-) -> ComparisonFailure | None:
-    max_abs, max_rel = _tensor_error(reference, candidate)
-    if max_abs <= abs_tolerance or max_rel <= rel_tolerance:
-        return None
-    return _build_failure(
-        case_id=case_id,
-        topology=topology,
-        metric=metric,
-        step_index=step_index,
-        key=key,
-        max_abs_error=max_abs,
-        max_rel_error=max_rel,
-        abs_tolerance=abs_tolerance,
-        rel_tolerance=rel_tolerance,
-        message=f"{metric} mismatch at step {step_index}, key '{key}'",
-    )
-
-
-def _compare_tensor_maps(
-    *,
-    case_id: str,
-    topology: str,
-    metric: Literal["grads", "lora_deltas"],
-    step_index: int,
-    reference: dict[str, Any],
-    candidate: dict[str, Any],
-    abs_tolerance: float,
-    rel_tolerance: float,
-) -> ComparisonFailure | None:
-    ref_keys = set(reference.keys())
-    cand_keys = set(candidate.keys())
-    if ref_keys != cand_keys:
-        missing = sorted(ref_keys - cand_keys)
-        extra = sorted(cand_keys - ref_keys)
-        return _build_failure(
-            case_id=case_id,
-            topology=topology,
-            metric=metric,
-            step_index=step_index,
-            key="__keys__",
-            max_abs_error=float("inf"),
-            max_rel_error=float("inf"),
-            abs_tolerance=abs_tolerance,
-            rel_tolerance=rel_tolerance,
-            message=(
-                f"{metric} key mismatch at step {step_index}; "
-                f"missing={missing[:3]}, extra={extra[:3]}"
-            ),
-        )
-    for key in sorted(ref_keys):
-        failure = _compare_tensor_pair(
-            case_id=case_id,
-            topology=topology,
-            metric=metric,
-            step_index=step_index,
-            key=key,
-            reference=reference[key],
-            candidate=candidate[key],
-            abs_tolerance=abs_tolerance,
-            rel_tolerance=rel_tolerance,
-        )
-        if failure is not None:
-            return failure
-    return None
-
-
-def _write_failure_report(topology_dir: Path, failure: ComparisonFailure) -> None:
-    _write_json(topology_dir / "failure_report.json", failure.model_dump(mode="json"))
-
-
-def compare_topology_to_oracle(
-    *,
-    case_config: OracleCaseConfig,
-    topology: Topology,
-) -> ComparisonFailure | None:
-    if topology.slug() == ORACLE_TOPOLOGY.slug():
-        return None
-
-    case_id = stable_case_id(case_config)
-    case_dir = ARTIFACT_ROOT / case_id
-    oracle_dir = case_dir / ORACLE_TOPOLOGY.slug()
-    topology_dir = case_dir / topology.slug()
-
-    oracle_manifest = _load_manifest(oracle_dir)
-    topology_manifest = _load_manifest(topology_dir)
-    if len(oracle_manifest.steps) != len(topology_manifest.steps):
-        return _build_failure(
-            case_id=case_id,
-            topology=topology.slug(),
-            metric="losses",
-            step_index=0,
-            key="__step_count__",
-            max_abs_error=float("inf"),
-            max_rel_error=float("inf"),
-            abs_tolerance=case_config.tolerances.losses_abs,
-            rel_tolerance=case_config.tolerances.losses_rel,
-            message=(
-                "Step count mismatch: "
-                f"oracle={len(oracle_manifest.steps)} vs "
-                f"topology={len(topology_manifest.steps)}"
-            ),
-        )
-
-    import torch
-
-    for oracle_step, topology_step in zip(
-        oracle_manifest.steps, topology_manifest.steps
+def _align_sequence_parallel(reference, candidate):  # type: ignore[no-untyped-def]
+    """Aligns sequence-parallel-shaped tensors so diff computation is topology-agnostic."""
+    if reference.shape == candidate.shape:
+        return candidate
+    if (
+        candidate.ndim == reference.ndim + 1
+        and candidate.shape[0] * candidate.shape[1] == reference.shape[0]
+        and tuple(candidate.shape[2:]) == tuple(reference.shape[1:])
     ):
-        step_index = oracle_step.step_index
-        oracle_outputs = _load_output_tensor(oracle_dir, oracle_step)
-        topology_outputs = _load_output_tensor(topology_dir, topology_step)
-        failure = _compare_tensor_pair(
-            case_id=case_id,
-            topology=topology.slug(),
-            metric="outputs",
-            step_index=step_index,
-            key="logprobs",
-            reference=oracle_outputs,
-            candidate=topology_outputs,
-            abs_tolerance=case_config.tolerances.outputs_abs,
-            rel_tolerance=case_config.tolerances.outputs_rel,
-        )
-        if failure is not None:
-            return failure
-
-        oracle_loss = torch.tensor([oracle_step.loss], dtype=torch.float32)
-        topology_loss = torch.tensor([topology_step.loss], dtype=torch.float32)
-        failure = _compare_tensor_pair(
-            case_id=case_id,
-            topology=topology.slug(),
-            metric="losses",
-            step_index=step_index,
-            key="loss",
-            reference=oracle_loss,
-            candidate=topology_loss,
-            abs_tolerance=case_config.tolerances.losses_abs,
-            rel_tolerance=case_config.tolerances.losses_rel,
-        )
-        if failure is not None:
-            return failure
-
-        for metric, oracle_file, topo_file, abs_tol, rel_tol in (
-            (
-                "grads",
-                oracle_step.grads_file,
-                topology_step.grads_file,
-                case_config.tolerances.grads_abs,
-                case_config.tolerances.grads_rel,
-            ),
-            (
-                "lora_deltas",
-                oracle_step.deltas_file,
-                topology_step.deltas_file,
-                case_config.tolerances.deltas_abs,
-                case_config.tolerances.deltas_rel,
-            ),
-        ):
-            failure = _compare_tensor_maps(
-                case_id=case_id,
-                topology=topology.slug(),
-                metric=metric,
-                step_index=step_index,
-                reference=_load_safetensor_map(oracle_dir / oracle_file),
-                candidate=_load_safetensor_map(topology_dir / topo_file),
-                abs_tolerance=abs_tol,
-                rel_tolerance=rel_tol,
-            )
-            if failure is not None:
-                return failure
+        return candidate.reshape(reference.shape)
     return None
 
 
-def run_and_compare_topology(
-    *,
-    case_config: OracleCaseConfig,
-    topology: Topology,
-    regenerate: bool = False,
-) -> None:
-    ensure_oracle_reference_artifacts(
-        case_config=case_config,
-        regenerate=regenerate and topology.slug() == ORACLE_TOPOLOGY.slug(),
-    )
-    ensure_topology_artifacts(
-        case_config=case_config,
-        topology=topology,
-        regenerate=regenerate,
-        mutation=None,
-    )
-    failure = compare_topology_to_oracle(case_config=case_config, topology=topology)
-    if failure is None:
-        return
-    topology_dir = ARTIFACT_ROOT / failure.case_id / topology.slug()
-    _write_failure_report(topology_dir, failure)
-    raise AssertionError(
-        "Megatron oracle mismatch: "
-        f"topology={failure.topology}, metric={failure.metric}, "
-        f"step={failure.step_index}, key={failure.key}, "
-        f"max_abs={failure.max_abs_error:.6g}, "
-        f"max_rel={failure.max_rel_error:.6g}, "
-        f"tol_abs={failure.abs_tolerance:.6g}, "
-        f"tol_rel={failure.rel_tolerance:.6g}"
-    )
+def _is_moe_base_forward_param(name: str) -> bool:
+    """Returns whether this forward param is a base MoE expert internal tensor."""
+    if ".mlp.experts." not in name:
+        return False
+    if any(token in name for token in (".router", ".gate_lora", ".up_lora", ".lora")):
+        return False
+    return ".linear_fc1" in name or ".linear_fc2" in name
 
 
-def run_sensitivity_check(
-    *,
-    case_config: OracleCaseConfig,
-    regenerate: bool = False,
-) -> None:
-    mutation = sensitivity_mutation()
-    if mutation is None:
-        raise RuntimeError(
-            f"Sensitivity check requires {SENSITIVITY_MUTATION_ENV} to be set"
-        )
-
-    ensure_oracle_reference_artifacts(
-        case_config=case_config,
-        regenerate=regenerate,
-    )
-    ensure_topology_artifacts(
-        case_config=case_config,
-        topology=SENSITIVITY_TOPOLOGY,
-        regenerate=True,
-        mutation=mutation,
-    )
-    failure = compare_topology_to_oracle(
-        case_config=case_config,
-        topology=SENSITIVITY_TOPOLOGY,
-    )
-    if failure is None:
-        raise AssertionError(
-            "Sensitivity mutation did not produce an oracle mismatch. "
-            f"mutation={mutation}, topology={SENSITIVITY_TOPOLOGY.slug()}"
-        )
-
-
-def _set_deterministic_seed(seed: int) -> None:
-    import torch
-
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-def _merge_sharded_dicts(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]:
-    import torch
-
-    merged: dict[str, list[Any]] = {}
-    for rank_shards in shards_by_rank:
-        for key, tensor in rank_shards.items():
-            merged.setdefault(key, []).append(tensor.detach().cpu())
-    full_state: dict[str, Any] = {}
-    for key, shards in merged.items():
-        if len(shards) == 1:
-            full_state[key] = shards[0].contiguous()
-            continue
-        concat_dim = 1 if ".lora_A." in key else 0
-        full_state[key] = torch.cat(shards, dim=concat_dim).contiguous()
-    return full_state
-
-
-def _gather_full_state(local_state: dict[str, Any]) -> dict[str, Any] | None:
-    import torch
-
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
-    gathered = [None for _ in range(world_size)] if rank == 0 else None
-    torch.distributed.gather_object(local_state, gathered, dst=0)
-    if rank != 0:
+def _lookup_call_by_index(
+    trace: dict[str, list[dict[str, Any]]],
+    module_name: str,
+    call_index: int,
+) -> dict[str, Any] | None:
+    calls = trace.get(module_name)
+    if calls is None:
         return None
-    assert gathered is not None
-    entries = [entry for entry in gathered if entry is not None]
-    return _merge_sharded_dicts(entries)
+    for call in calls:
+        if int(call.get("call_index", -1)) == call_index:
+            return call
+    if 0 <= call_index < len(calls):
+        return calls[call_index]
+    return None
 
 
-def _collect_lora_state(model_chunks: list[Any]) -> dict[str, Any] | None:
-    local_state: dict[str, Any] = {}
-    for chunk in model_chunks:
-        for module in chunk.modules():
-            if not hasattr(module, "sharded_lora_state_dict"):
-                continue
-            module_state = module.sharded_lora_state_dict()
-            for key, value in module_state.items():
-                if key in local_state:
-                    raise RuntimeError(
-                        f"Duplicate LoRA key while collecting state: {key}"
-                    )
-                local_state[key] = value.detach().cpu()
-    return _gather_full_state(local_state)
+def _router_module_name_for_expert_module(module_name: str) -> str | None:
+    if ".mlp.experts.linear_fc1" in module_name:
+        return module_name.replace(".mlp.experts.linear_fc1", ".mlp.router")
+    if ".mlp.experts.linear_fc2" in module_name:
+        return module_name.replace(".mlp.experts.linear_fc2", ".mlp.router")
+    return None
 
 
-def _collect_lora_grads(model_chunks: list[Any]) -> dict[str, Any] | None:
-    from megatron.core import parallel_state as ps
+def _build_moe_row_identities(
+    *,
+    module_name: str,
+    call_index: int,
+    trace: dict[str, list[dict[str, Any]]],
+    row_splits: list[int] | None,
+) -> list[tuple[int, int, int]] | None:
+    router_module_name = _router_module_name_for_expert_module(module_name)
+    if router_module_name is None:
+        return None
+    router_call = _lookup_call_by_index(trace, router_module_name, call_index)
+    if router_call is None:
+        return None
+    router_topk_ids = router_call.get("router_topk_ids")
+    if not isinstance(router_topk_ids, torch.Tensor) or router_topk_ids.ndim != 2:
+        return None
+    token_splits_raw = router_call.get("router_topk_ids__row_splits")
+    if row_splits is None:
+        if isinstance(token_splits_raw, list):
+            row_splits = [
+                int(v) * int(router_topk_ids.shape[1]) for v in token_splits_raw
+            ]
+        else:
+            row_splits = [int(router_topk_ids.numel())]
+    if isinstance(token_splits_raw, list):
+        token_splits = [int(v) for v in token_splits_raw]
+    else:
+        topk = int(router_topk_ids.shape[1])
+        token_splits = [int(v) // topk for v in row_splits]
+    if len(row_splits) != len(token_splits):
+        return None
+    row_cursor = 0
+    token_cursor = 0
+    identities: list[tuple[int, int, int]] = []
+    for row_count, token_count in zip(row_splits, token_splits):
+        local_ids = router_topk_ids[token_cursor : token_cursor + token_count]
+        token_cursor += token_count
+        local_identities: list[tuple[int, int, int]] = []
+        max_expert = int(local_ids.max().item()) if local_ids.numel() > 0 else -1
+        for expert_id in range(max_expert + 1):
+            expert_rows = (local_ids == expert_id).nonzero(as_tuple=False)
+            for token_offset, slot_index in expert_rows.tolist():
+                local_identities.append(
+                    (expert_id, token_cursor - token_count + token_offset, slot_index)
+                )
+        if len(local_identities) != row_count:
+            return None
+        identities.extend(local_identities)
+        row_cursor += row_count
+    if row_cursor != sum(row_splits):
+        return None
+    return identities
 
-    from art.megatron.lora import LoRA
 
-    local_grads: dict[str, Any] = {}
-    for chunk in model_chunks:
-        for module in chunk.modules():
-            if not isinstance(module, LoRA):
-                continue
-            grad_a = (
-                module.A_T.grad
-                if module.A_T.grad is not None
-                else module.A_T.new_zeros(module.A_T.shape)
+def _canonicalize_moe_base_forward_tensor(
+    *,
+    module_name: str,
+    call_index: int,
+    tensor: torch.Tensor,
+    trace: dict[str, list[dict[str, Any]]],
+    call: dict[str, Any],
+) -> torch.Tensor:
+    if not _is_moe_base_forward_param(module_name):
+        return tensor
+    if tensor.ndim != 2:
+        return tensor
+    row_splits_raw = call.get("primary_output__row_splits")
+    row_splits = (
+        [int(v) for v in row_splits_raw] if isinstance(row_splits_raw, list) else None
+    )
+    identities = _build_moe_row_identities(
+        module_name=module_name,
+        call_index=call_index,
+        trace=trace,
+        row_splits=row_splits,
+    )
+    if identities is None or len(identities) != int(tensor.shape[0]):
+        return tensor
+    order = sorted(range(len(identities)), key=lambda index: identities[index])
+    return tensor[order]
+
+
+def _minimal_param_name(name: str) -> str:
+    """Returns a shorter but 1:1 param/module identifier for report readability."""
+    return name.removeprefix("base_model.model.model.").replace(
+        "module.module.decoder.", ""
+    )
+
+
+def _load_forward_trace(
+    topology_dir: Path, step_index: int
+) -> dict[str, list[dict[str, Any]]]:
+    """Loads one merged forward-trace file for a given step."""
+    trace_path = topology_dir / "traces" / f"forward_trace_step_{step_index:03d}.pt"
+    return ForwardTraceCapture.load_trace(trace_path)
+
+
+def _threshold_string(thresholds: dict[str, float]) -> str:
+    """Formats threshold dicts into compact table cells."""
+    if not thresholds:
+        return "-"
+    return ", ".join(f"{key}<={value:.3g}" for key, value in sorted(thresholds.items()))
+
+
+def _finite_metric(value: float, *, default: float = NON_FINITE_METRIC_VALUE) -> float:
+    """Maps NaN/Inf metric values to a large finite sentinel for JSON-safe reports."""
+    value_f = float(value)
+    if math.isnan(value_f):
+        return default
+    if math.isinf(value_f):
+        return default if value_f > 0 else -default
+    return value_f
+
+
+def _triplet_expert_key(param: str) -> tuple[int, int] | None:
+    """Returns (layer, expert_id) for expert up/gate/down params."""
+    match = EXPERT_TRIPLET_PARAM_RE.search(param)
+    if match is None:
+        return None
+    return int(match.group("layer")), int(match.group("expert"))
+
+
+class VariantRunner:
+    """Runs oracle/candidate variants and emits row-level comparison reports."""
+
+    def __init__(
+        self,
+        *,
+        case_config: OracleCaseConfig,
+        console: Console | None = None,
+    ) -> None:
+        self.case_config = case_config
+        self.case_artifacts = ensure_case_artifacts(case_config)
+        self.case_id = self.case_artifacts.case_id
+        self.case_dir = Path(self.case_artifacts.case_dir)
+        self.oracle_slug = ORACLE_TOPOLOGY.slug()
+        self.oracle_dir = self.case_dir / self.oracle_slug
+        self.oracle_routing_bundle_dir = (
+            self.case_dir / ORACLE_MOE_ROUTING_BUNDLE_DIRNAME
+        )
+        self.shared_init_path = Path(self.case_artifacts.shared_init_adapter_path)
+        self.console = console or Console(width=160)
+        self._oracle_initialized = False
+        self._oracle_regenerated = False
+
+    def _run_topology(
+        self,
+        *,
+        topology: Topology,
+        output_slug: str,
+        mutation: SensitivityMutation | None,
+        replay_bundle_dir: Path | None,
+        capture_bundle_dir: Path | None,
+        regenerate: bool,
+    ) -> Path:
+        """Executes one topology worker run and returns its output directory."""
+        topology_dir = self.case_dir / output_slug
+        manifest_path = topology_dir / "manifest.json"
+        if manifest_path.exists() and not regenerate:
+            return topology_dir
+        _replace_topology_dir(topology_dir)
+        request = WorkerRunRequest(
+            case_id=self.case_id,
+            case_config=self.case_config,
+            topology=topology,
+            topology_dir=str(topology_dir),
+            packed_tensors=self.case_artifacts.packed_tensors,
+            shared_init_adapter_path=str(self.shared_init_path),
+            mutation=mutation,
+            moe_routing_replay_path=(
+                None if replay_bundle_dir is None else str(replay_bundle_dir)
+            ),
+            moe_routing_replay_strict=True,
+            capture_moe_routing_bundle_path=(
+                None if capture_bundle_dir is None else str(capture_bundle_dir)
+            ),
+        )
+        from .megatron_oracle_worker import run_worker_subprocess
+
+        run_worker_subprocess(request, topology_dir, repo_root=REPO_ROOT)
+        return topology_dir
+
+    def ensure_oracle(self) -> Path:
+        """Ensures oracle capture and canonical replay artifacts exist exactly once per session."""
+        regenerate = regenerate_requested()
+        if self._oracle_initialized and (not regenerate or self._oracle_regenerated):
+            return self.oracle_dir
+        if regenerate and self.shared_init_path.exists():
+            self.shared_init_path.unlink()
+        bundle_manifest = self.oracle_routing_bundle_dir / "manifest.json"
+        oracle_manifest = self.oracle_dir / "manifest.json"
+        need_capture = (
+            regenerate
+            or not bundle_manifest.exists()
+            or not self.shared_init_path.exists()
+        )
+        run_oracle_topology = partial(
+            self._run_topology,
+            topology=ORACLE_TOPOLOGY,
+            mutation=None,
+            regenerate=True,
+        )
+        if need_capture:
+            run_oracle_topology(
+                output_slug=f"{self.oracle_slug}__oracle_capture",
+                replay_bundle_dir=None,
+                capture_bundle_dir=self.oracle_routing_bundle_dir,
             )
-            grad_b = (
-                module.B_T.grad
-                if module.B_T.grad is not None
-                else module.B_T.new_zeros(module.B_T.shape)
+        if regenerate or not oracle_manifest.exists():
+            run_oracle_topology(
+                output_slug=self.oracle_slug,
+                replay_bundle_dir=self.oracle_routing_bundle_dir,
+                capture_bundle_dir=None,
             )
-            if module.num_local_experts > 1:
-                if ps.get_expert_data_parallel_rank() != 0:
-                    continue
-                for expert in range(module.num_local_experts):
-                    prefix = module.adapter_model_prefix.format(
-                        expert=expert + module._expert_offset
+        self._oracle_initialized = True
+        self._oracle_regenerated = self._oracle_regenerated or regenerate
+        return self.oracle_dir
+
+    def ensure_variant_artifacts(
+        self,
+        variant: VariantSpec,
+    ) -> Path:
+        """Ensures oracle prerequisites and candidate artifacts for one variant."""
+        self.ensure_oracle()
+        output_slug = variant.resolved_output_slug()
+        if output_slug == self.oracle_slug and variant.mutation is None:
+            return self.oracle_dir
+        return self._run_topology(
+            topology=variant.topology,
+            output_slug=output_slug,
+            mutation=variant.mutation,
+            replay_bundle_dir=self.oracle_routing_bundle_dir,
+            capture_bundle_dir=None,
+            regenerate=True,
+        )
+
+    @staticmethod
+    def _apply_thresholds(row: MetricRow, thresholds: dict[str, float]) -> None:
+        """Evaluates row thresholds using AND semantics over all configured keys."""
+        row.thresholds = dict(thresholds)
+        if not thresholds:
+            row.pass_signal = True
+            row.failure_reasons = []
+            return
+        payload = row.model_dump(mode="python")
+        reasons: list[str] = []
+        for key, limit in sorted(thresholds.items()):
+            value = payload.get(key)
+            if not isinstance(value, (int, float)):
+                reasons.append(f"{key}=missing")
+                continue
+            if float(value) > float(limit):
+                reasons.append(f"{key}={float(value):.6g}>{float(limit):.6g}")
+        row.pass_signal = len(reasons) == 0
+        row.failure_reasons = reasons
+
+    @staticmethod
+    def _inf_summary() -> dict[str, float]:
+        """Builds a large-error finite summary for structural mismatches."""
+        return {
+            "numel": 0.0,
+            "mean_abs_diff": NON_FINITE_METRIC_VALUE,
+            "relative_l2": NON_FINITE_METRIC_VALUE,
+            "typical_abs_scale": 0.0,
+            "mean_abs_pct": NON_FINITE_METRIC_VALUE,
+            "topk_mismatch_fraction": 1.0,
+            "top1_mismatch_fraction": 1.0,
+        }
+
+    def _build_metric_row(
+        self,
+        *,
+        variant: VariantSpec,
+        step_index: int,
+        phase: str,
+        param: str,
+        summary: dict[str, float],
+        structural_failure: str | None = None,
+    ) -> MetricRow:
+        """Builds one metric row and applies per-phase thresholds."""
+        row = MetricRow(
+            case_id=self.case_id,
+            variant=variant.name,
+            topology=variant.resolved_output_slug(),
+            oracle_topology=variant.resolved_reference_slug(),
+            step_index=step_index,
+            phase=phase,
+            param=param,
+            numel=summary["numel"],
+            mean_abs_diff=summary["mean_abs_diff"],
+            relative_l2=summary["relative_l2"],
+            typical_abs_scale=summary["typical_abs_scale"],
+            mean_abs_pct=summary["mean_abs_pct"],
+            topk_mismatch_fraction=summary.get("topk_mismatch_fraction"),
+            top1_mismatch_fraction=summary.get("top1_mismatch_fraction"),
+        )
+        self._apply_thresholds(row, variant.thresholds_by_phase.get(phase, {}))
+        if structural_failure is not None:
+            row.pass_signal = False
+            row.failure_reasons = [structural_failure, *row.failure_reasons]
+        return row
+
+    def _build_metric_rows_from_tensor_pairs(
+        self,
+        *,
+        variant: VariantSpec,
+        step_index: int,
+        phase: str,
+        pairs: list[tuple[str, Any, Any]],
+        router_ids: bool = False,
+    ) -> list[MetricRow]:
+        """Builds rows from named tensor pairs with one shared diff path."""
+        rows: list[MetricRow] = []
+        for name, reference, candidate in pairs:
+            shared_kwargs = {
+                "variant": variant,
+                "step_index": step_index,
+                "phase": phase,
+                "param": _minimal_param_name(name),
+            }
+            reference_aligned = reference
+            candidate_aligned = candidate
+            aligned_candidate = _align_sequence_parallel(
+                reference_aligned, candidate_aligned
+            )
+            if aligned_candidate is None:
+                rows.append(
+                    self._build_metric_row(
+                        summary=self._inf_summary(),
+                        structural_failure="shape mismatch",
+                        **shared_kwargs,
                     )
-                    local_grads[f"{prefix}.lora_A.weight"] = (
-                        grad_a[expert].detach().cpu().T
-                    )
-                    local_grads[f"{prefix}.lora_B.weight"] = (
-                        grad_b[expert].detach().cpu().T
-                    )
+                )
+                continue
+            accumulator = DiffAccumulator()
+            if router_ids:
+                accumulator.update_router_ids(reference_aligned, aligned_candidate)
             else:
-                if ps.get_data_parallel_rank() != 0:
-                    continue
-                local_grads[f"{module.adapter_model_prefix}.lora_A.weight"] = (
-                    grad_a.detach().cpu().T
+                accumulator.update(reference_aligned, aligned_candidate)
+            rows.append(
+                self._build_metric_row(
+                    summary=accumulator.as_summary(), **shared_kwargs
                 )
-                local_grads[f"{module.adapter_model_prefix}.lora_B.weight"] = (
-                    grad_b.detach().cpu().T
+            )
+        return rows
+
+    def _check_matching_keys(
+        self,
+        reference: dict[str, Any],
+        candidate: dict[str, Any],
+        variant: VariantSpec,
+        step_index: int,
+        phase: str,
+    ) -> tuple[bool, list[MetricRow] | None]:
+        """Checks if the keys of two tensor maps match and builds a metric row if they don't."""
+        reference_keys = set(reference.keys())
+        candidate_keys = set(candidate.keys())
+        if reference_keys != candidate_keys:
+            missing = sorted(reference_keys - candidate_keys)
+            extra = sorted(candidate_keys - reference_keys)
+            return False, [
+                self._build_metric_row(
+                    variant=variant,
+                    step_index=step_index,
+                    phase=phase,
+                    param="__keys__",
+                    summary=self._inf_summary(),
+                    structural_failure=f"missing={missing[:5]} extra={extra[:5]}",
                 )
-    return _gather_full_state(local_grads)
+            ]
+        return True, None
 
-
-def _validate_adapter_exact(
-    expected_state: dict[str, Any],
-    adapter_model: dict[str, Any],
-) -> None:
-    expected_keys = set(expected_state.keys())
-    adapter_keys = set(adapter_model.keys())
-    missing = sorted(expected_keys - adapter_keys)
-    extra = sorted(adapter_keys - expected_keys)
-    if missing or extra:
-        raise KeyError(
-            f"Adapter keys mismatch: missing={missing[:5]} extra={extra[:5]}"
+    def _build_metric_rows_from_tensor_maps(
+        self,
+        *,
+        variant: VariantSpec,
+        step_index: int,
+        phase: str,
+        reference: dict[str, Any],
+        candidate: dict[str, Any],
+        router_ids: bool = False,
+    ) -> list[MetricRow]:
+        """Builds rows from two keyed tensor maps through a unified compare path."""
+        matching, rows = self._check_matching_keys(
+            reference, candidate, variant, step_index, phase
+        )
+        if not matching:
+            return rows
+        pairs = [
+            (key, reference[key], candidate[key])
+            for key in sorted(set(reference.keys()))
+        ]
+        return self._build_metric_rows_from_tensor_pairs(
+            variant=variant,
+            step_index=step_index,
+            phase=phase,
+            pairs=pairs,
+            router_ids=router_ids,
         )
 
+    @staticmethod
+    def _flatten_forward_trace_tensors(
+        trace: dict[str, list[dict[str, Any]]],
+        *,
+        value_key: str,
+    ) -> dict[str, Any]:
+        """Flattens per-module forward trace calls into a deterministic tensor map."""
+        flattened: dict[str, Any] = {}
+        for module_name in sorted(trace.keys()):
+            for call_offset, call in enumerate(trace[module_name]):
+                tensor = call.get(value_key)
+                if tensor is None:
+                    continue
+                call_index = call.get("call_index", call_offset)
+                if value_key == "primary_output" and isinstance(tensor, torch.Tensor):
+                    tensor = _canonicalize_moe_base_forward_tensor(
+                        module_name=module_name,
+                        call_index=int(call_index),
+                        tensor=tensor,
+                        trace=trace,
+                        call=call,
+                    )
+                flattened[f"{module_name}.call_{call_index}"] = tensor
+        return flattened
 
-def _validate_loaded_state_matches_adapter(
-    loaded_state: dict[str, Any],
-    adapter_model: dict[str, Any],
-) -> None:
-    import torch
+    @staticmethod
+    def _build_step_summaries(rows: list[MetricRow]) -> dict[int, dict[str, Any]]:
+        """Builds step-indexed payloads directly from row model dumps."""
+        step_summaries: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            step_entry = step_summaries.setdefault(row.step_index, {})
+            phase_entry = cast(dict[str, Any], step_entry.setdefault(row.phase, {}))
+            phase_entry[row.param] = row.model_dump(mode="json")
+        return step_summaries
 
-    for key in sorted(adapter_model.keys()):
-        if key not in loaded_state:
-            raise KeyError(f"Loaded LoRA state missing key: {key}")
-        if not torch.equal(loaded_state[key].cpu(), adapter_model[key].cpu()):
-            max_abs, max_rel = _tensor_error(adapter_model[key], loaded_state[key])
-            raise RuntimeError(
-                f"Loaded LoRA state mismatch for key '{key}' "
-                f"(max_abs={max_abs:.6g}, max_rel={max_rel:.6g})"
+    def compare_variant(self, variant: VariantSpec) -> VariantReport:
+        """Compares one candidate variant against its reference topology."""
+        reference_slug = variant.resolved_reference_slug()
+        topology_slug = variant.resolved_output_slug()
+        reference_dir = self.case_dir / reference_slug
+        topology_dir = self.case_dir / topology_slug
+        reference_manifest = _load_manifest(reference_dir)
+        topology_manifest = _load_manifest(topology_dir)
+        rows: list[MetricRow] = []
+        if len(reference_manifest.steps) != len(topology_manifest.steps):
+            rows.append(
+                self._build_metric_row(
+                    variant=variant,
+                    step_index=0,
+                    phase="step_count",
+                    param="__step_count__",
+                    summary=self._inf_summary(),
+                    structural_failure=(
+                        f"reference={len(reference_manifest.steps)} "
+                        f"candidate={len(topology_manifest.steps)}"
+                    ),
+                )
             )
 
+        import torch
 
-def _configure_provider(provider: Any, topology: Topology) -> None:
-    provider.tensor_model_parallel_size = topology.tp
-    provider.expert_model_parallel_size = topology.ep
-    provider.expert_tensor_parallel_size = topology.etp
-    provider.pipeline_model_parallel_size = 1
-    provider.context_parallel_size = 1
-    provider.sequence_parallel = bool(topology.sp)
-    if hasattr(provider, "attention_dropout"):
-        provider.attention_dropout = 0.0
-    if hasattr(provider, "hidden_dropout"):
-        provider.hidden_dropout = 0.0
-
-
-def _delta_state(
-    initial_state: dict[str, Any],
-    current_state: dict[str, Any],
-) -> dict[str, Any]:
-    initial_keys = set(initial_state.keys())
-    current_keys = set(current_state.keys())
-    if initial_keys != current_keys:
-        missing = sorted(initial_keys - current_keys)
-        extra = sorted(current_keys - initial_keys)
-        raise KeyError(
-            f"LoRA state keys changed during training: missing={missing[:3]} extra={extra[:3]}"
+        for reference_step, topology_step in zip(
+            reference_manifest.steps, topology_manifest.steps
+        ):
+            step_index = reference_step.step_index
+            reference_trace = _load_forward_trace(reference_dir, step_index)
+            topology_trace = _load_forward_trace(topology_dir, step_index)
+            map_phase_inputs = [
+                (
+                    "outputs",
+                    {"logprobs": _load_output_tensor(reference_dir, reference_step)},
+                    {"logprobs": _load_output_tensor(topology_dir, topology_step)},
+                    False,
+                ),
+                (
+                    "losses",
+                    {"loss": torch.tensor([reference_step.loss], dtype=torch.float32)},
+                    {"loss": torch.tensor([topology_step.loss], dtype=torch.float32)},
+                    False,
+                ),
+                (
+                    "grads",
+                    _load_safetensor_map(reference_dir / reference_step.grads_file),
+                    _load_safetensor_map(topology_dir / topology_step.grads_file),
+                    False,
+                ),
+                (
+                    "deltas",
+                    _load_safetensor_map(reference_dir / reference_step.deltas_file),
+                    _load_safetensor_map(topology_dir / topology_step.deltas_file),
+                    False,
+                ),
+                *[
+                    (
+                        phase,
+                        self._flatten_forward_trace_tensors(
+                            reference_trace,
+                            value_key=value_key,
+                        ),
+                        self._flatten_forward_trace_tensors(
+                            topology_trace,
+                            value_key=value_key,
+                        ),
+                        phase == "router_topk_ids",
+                    )
+                    for phase, value_key in (
+                        ("forward", "primary_output"),
+                        ("router_scores", "router_topk_scores"),
+                        ("router_topk_ids", "router_topk_ids"),
+                    )
+                ],
+            ]
+            for phase, reference_map, candidate_map, router_ids in map_phase_inputs:
+                rows.extend(
+                    self._build_metric_rows_from_tensor_maps(
+                        variant=variant,
+                        step_index=step_index,
+                        phase=phase,
+                        reference=reference_map,
+                        candidate=candidate_map,
+                        router_ids=router_ids,
+                    )
+                )
+        pass_count = sum(1 for row in rows if row.pass_signal)
+        fail_count = len(rows) - pass_count
+        signal: Literal["pass", "fail"] = "pass" if fail_count == 0 else "fail"
+        return VariantReport(
+            case_id=self.case_id,
+            variant=variant.name,
+            topology=topology_slug,
+            reference_topology=reference_slug,
+            expected_signal=variant.expected_signal,
+            signal=signal,
+            pass_count=pass_count,
+            fail_count=fail_count,
+            step_summaries=self._build_step_summaries(rows),
+            metrics=rows,
         )
+
+    @staticmethod
+    def assert_expected_signal(report: VariantReport, context: str) -> None:
+        """Raises when observed run signal diverges from variant expectation."""
+        if report.signal == report.expected_signal:
+            return
+        if report.signal == "fail":
+            first_failure = next(row for row in report.metrics if not row.pass_signal)
+            raise AssertionError(
+                f"{context}: topology={report.topology} phase={first_failure.phase} "
+                f"step={first_failure.step_index} param={first_failure.param} "
+                f"reasons={'; '.join(first_failure.failure_reasons)}"
+            )
+        raise AssertionError(
+            f"{context}: expected_signal={report.expected_signal} "
+            f"observed_signal={report.signal} topology={report.topology}"
+        )
+
+    def _write_variant_report(self, topology_dir: Path, report: VariantReport) -> None:
+        """Persists full variant report JSON for debugging and regression inspection."""
+        _write_json(
+            topology_dir / "variant_report.json", report.model_dump(mode="json")
+        )
+
+    def print_report(self, report: VariantReport) -> None:
+        """Prints a row-level table with expert rows subsampled by highest relative_l2."""
+        non_expert_rows: list[MetricRow] = []
+        triplet_rows: list[tuple[tuple[int, int], MetricRow]] = []
+        for row in report.metrics:
+            expert_key = _triplet_expert_key(row.param)
+            if expert_key is None:
+                non_expert_rows.append(row)
+                continue
+            triplet_rows.append((expert_key, row))
+
+        scores_by_layer: dict[int, dict[int, float]] = {}
+        for (layer, expert_id), row in triplet_rows:
+            layer_scores = scores_by_layer.setdefault(layer, {})
+            layer_scores[expert_id] = max(
+                layer_scores.get(expert_id, float("-inf")), row.relative_l2
+            )
+
+        selected_experts: set[tuple[int, int]] = set()
+        for layer, expert_scores in scores_by_layer.items():
+            top_experts = sorted(
+                expert_scores.items(),
+                key=lambda item: item[1],
+                reverse=True,
+            )[:EXPERT_TABLE_ROW_LIMIT]
+            for expert_id, _score in top_experts:
+                selected_experts.add((layer, expert_id))
+
+        selected_triplet_rows = [
+            row for expert_key, row in triplet_rows if expert_key in selected_experts
+        ]
+        table_rows = non_expert_rows + selected_triplet_rows
+        detail_table = Table(
+            title=(
+                f"Variant Report | variant={report.variant} "
+                f"| topology={report.topology} | signal={report.signal} "
+                f"| selected_experts={len(selected_experts)} "
+                f"(top {EXPERT_TABLE_ROW_LIMIT} per layer)"
+            ),
+            box=box.SIMPLE_HEAVY,
+            show_lines=False,
+        )
+        detail_table.add_column("Step", justify="right")
+        detail_table.add_column("Phase", style="cyan")
+        detail_table.add_column("Param")
+        detail_table.add_column("Status")
+        detail_table.add_column("relative_l2", justify="right")
+        detail_table.add_column("mean_abs_pct", justify="right")
+        detail_table.add_column("typical_abs", justify="right")
+        # detail_table.add_column("Thresholds")
+        detail_table.add_column("Failure")
+        sorted_rows = sorted(
+            table_rows,
+            key=lambda row: (
+                row.step_index,
+                PHASE_PRINT_ORDER.get(row.phase, 999),
+                row.param,
+                row.pass_signal,
+            ),
+        )
+        for row in sorted_rows:
+            status_text = (
+                "[green]PASS[/green]" if row.pass_signal else "[red]FAIL[/red]"
+            )
+            failure_text = "" if row.pass_signal else "; ".join(row.failure_reasons)
+            detail_table.add_row(
+                str(row.step_index),
+                row.phase,
+                row.param,
+                status_text,
+                f"{row.relative_l2:.6g}",
+                f"{row.mean_abs_pct:.6g}%",
+                f"{row.typical_abs_scale:.6g}",
+                # _threshold_string(row.thresholds),  # disabled for now to avoid clutter, neat to keep though
+                failure_text,
+            )
+        self.console.print(detail_table)
+
+    def run_variant(
+        self,
+        variant: VariantSpec,
+    ) -> VariantReport:
+        """Runs a variant end-to-end, writes JSON report, and prints row table."""
+        topology_dir = self.ensure_variant_artifacts(variant)
+        report = self.compare_variant(variant)
+        self._write_variant_report(topology_dir, report)
+        self.print_report(report)
+        return report
+
+    def run_suite(
+        self,
+        variants: list[VariantSpec],
+    ) -> list[VariantReport]:
+        """Runs variants in order and stops at the first unexpected signal."""
+        reports: list[VariantReport] = []
+        for variant in variants:
+            report = self.run_variant(variant)
+            reports.append(report)
+            self.assert_expected_signal(report, "Megatron oracle suite mismatch")
+        return reports
+
+
+def _default_phase_thresholds(
+    case_cfg: OracleCaseConfig,
+) -> dict[str, dict[str, float]]:
+    """Builds default per-phase (fwd, grad, outputs, losses, deltas) threshold dictionaries."""
+    default = {
+        "relative_l2": case_cfg.tolerances.relative_l2,
+        "mean_abs_pct": case_cfg.tolerances.mean_abs_pct,
+    }
     return {
-        key: current_state[key].detach().cpu() - initial_state[key].detach().cpu()
-        for key in sorted(initial_keys)
+        key: default for key in ["outputs", "losses", "grads", "deltas", "forward"]
+    } | {
+        "router_scores": {"mean_abs_pct": 0.0},
+        "router_topk_ids": {
+            "topk_mismatch_fraction": 0.0,
+            "top1_mismatch_fraction": 0.0,
+        },
     }
 
 
-@contextmanager
-def _mutation_hook(
-    megatron_train_module: Any,
-    mutation: SensitivityMutation | None,
-    pre_optimizer_step_hook: Callable[[], None] | None = None,
-):
-    original_finalize = megatron_train_module._finalize_grads
-    original_optimizer_step = megatron_train_module._optimizer_step
-
-    if mutation == "drop_finalize":
-        megatron_train_module._finalize_grads = lambda _model: None
-    elif mutation is not None:
-        raise ValueError(f"Unsupported mutation: {mutation}")
-
-    if pre_optimizer_step_hook is not None:
-
-        def _patched_optimizer_step(optimizer: Any, learning_rate: float):
-            pre_optimizer_step_hook()
-            return original_optimizer_step(optimizer, learning_rate)
-
-        megatron_train_module._optimizer_step = _patched_optimizer_step
-
-    if mutation is None:
-        if pre_optimizer_step_hook is None:
-            yield
-            return
-    try:
-        yield
-    finally:
-        megatron_train_module._finalize_grads = original_finalize
-        megatron_train_module._optimizer_step = original_optimizer_step
-
-
-def _worker_run(request: WorkerRunRequest) -> None:
-    from megatron.core.optimizer import OptimizerConfig
-    from safetensors.torch import load_file, save_file
-    import torch
-
-    from art import dev, types
-    from art.megatron import train as megatron_train
-    from art.preprocessing.pack import packed_tensors_from_dir
-
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(backend="nccl")
-    _set_deterministic_seed(request.case_config.seed)
-
-    world_size = torch.distributed.get_world_size()
-    if world_size != request.topology.world_size():
-        raise RuntimeError(
-            f"World size mismatch: expected {request.topology.world_size()}, got {world_size}"
+def _suite_variants(case_cfg: OracleCaseConfig) -> list[VariantSpec]:
+    """Builds the standard oracle suite variant ordering."""
+    thresholds = _default_phase_thresholds(case_cfg)
+    variants = [
+        VariantSpec(
+            name="oracle_replay_parity",
+            topology=ORACLE_TOPOLOGY,
+            output_slug=_topology_output_slug(
+                ORACLE_TOPOLOGY, ORACLE_REPLAY_TOPOLOGY_SUFFIX
+            ),
+            thresholds_by_phase=thresholds,
         )
-
-    runtime = megatron_train.build_training_runtime(
-        model_identifier=request.case_config.base_model,
-        provider_configure=lambda provider: _configure_provider(
-            provider, request.topology
-        ),
-        optimizer_config=OptimizerConfig(
-            bf16=True,
-            lr=request.case_config.learning_rate,
-            adam_beta1=0.9,
-            adam_beta2=0.99,
-            clip_grad=0.1,
-            weight_decay=0.1,
-        ),
-        print_env=False,
-        print_optimizer_stats=False,
-    )
-    model_chunks = runtime.model
-    optimizer = runtime.optimizer
-
-    topology_dir = Path(request.topology_dir)
-    traces_dir = topology_dir / "traces"
-    traces_dir.mkdir(parents=True, exist_ok=True)
-
-    shared_init_path = Path(request.shared_init_adapter_path)
-    if not shared_init_path.exists():
-        if not request.allow_create_shared_init:
-            raise FileNotFoundError(
-                f"Missing oracle shared adapter at {shared_init_path}"
-            )
-        initial_state = _collect_lora_state(model_chunks)
-        if torch.distributed.get_rank() == 0:
-            assert initial_state is not None
-            shared_init_path.parent.mkdir(parents=True, exist_ok=True)
-            save_file(initial_state, str(shared_init_path))
-    torch.distributed.barrier()
-    if not shared_init_path.exists():
-        raise FileNotFoundError(f"Shared init adapter not created: {shared_init_path}")
-
-    adapter_model = load_file(str(shared_init_path))
-    expected_state = _collect_lora_state(model_chunks)
-    if torch.distributed.get_rank() == 0:
-        assert expected_state is not None
-        _validate_adapter_exact(expected_state, adapter_model)
-    torch.distributed.barrier()
-
-    megatron_train.load_adapter_into_model(model_chunks, adapter_model)
-    loaded_state = _collect_lora_state(model_chunks)
-    if torch.distributed.get_rank() == 0:
-        assert loaded_state is not None
-        _validate_loaded_state_matches_adapter(loaded_state, adapter_model)
-    torch.distributed.barrier()
-
-    packed_tensors = packed_tensors_from_dir(
-        **request.packed_tensors.model_dump(exclude_none=True)
-    )
-    initial_lora_state = _collect_lora_state(model_chunks)
-    if torch.distributed.get_rank() == 0 and initial_lora_state is None:
-        raise RuntimeError("Failed to collect initial LoRA state on rank 0")
-
-    train_config = types.TrainConfig(
-        learning_rate=request.case_config.learning_rate,
-        beta=request.case_config.beta,
-        kl_penalty_coef=0.0,
-    )
-    experimental_config: dev.TrainConfig = {}
-    step_traces: list[StepTrace] = []
-    captured_grads: dict[str, Any] | None = None
-
-    def _capture_lora_grads() -> None:
-        nonlocal captured_grads
-        captured_grads = _collect_lora_grads(model_chunks)
-
-    with _mutation_hook(
-        megatron_train,
-        request.mutation,
-        pre_optimizer_step_hook=_capture_lora_grads,
+    ]
+    for topology in TOPOLOGIES[1:] + (
+        EXTENDED_TOPOLOGIES if extended_topologies_enabled() else []
     ):
-        for step_index in range(request.case_config.num_steps):
-            sample_index = step_index % request.packed_tensors.num_sequences
-            inputs = megatron_train.select_indexed_inputs(packed_tensors, sample_index)
-            captured_grads = None
-
-            step_result = megatron_train.run_training_step(
-                model_chunks=model_chunks,
-                optimizer=optimizer,
-                learning_rate=train_config.learning_rate,
-                inputs=inputs,
-                config=train_config,
-                experimental_config=experimental_config,
-                ref_logprobs=None,
+        variants.append(
+            VariantSpec(
+                name=f"topology_{topology.slug()}",
+                topology=topology,
+                thresholds_by_phase=thresholds,
             )
-            if torch.distributed.get_rank() == 0 and captured_grads is None:
-                raise RuntimeError("Failed to collect LoRA grads on rank 0")
-
-            current_lora_state = _collect_lora_state(model_chunks)
-            if torch.distributed.get_rank() == 0 and current_lora_state is None:
-                raise RuntimeError("Failed to collect current LoRA state on rank 0")
-
-            if torch.distributed.get_rank() == 0:
-                grads = _require_not_none(captured_grads, "captured_grads")
-                initial_state = _require_not_none(
-                    initial_lora_state, "initial_lora_state"
-                )
-                current_state = _require_not_none(
-                    current_lora_state, "current_lora_state"
-                )
-                output_rel = Path("traces") / f"output_step_{step_index:03d}.pt"
-                grads_rel = Path("traces") / f"grads_step_{step_index:03d}.safetensors"
-                deltas_rel = (
-                    Path("traces") / f"deltas_step_{step_index:03d}.safetensors"
-                )
-                lora_rel = Path(f"lora_step_{step_index:03d}.safetensors")
-
-                torch.save(
-                    step_result.new_logprobs.detach().cpu().float(),
-                    topology_dir / output_rel,
-                )
-                save_file(grads, str(topology_dir / grads_rel))
-                deltas = _delta_state(initial_state, current_state)
-                save_file(deltas, str(topology_dir / deltas_rel))
-                save_file(current_state, str(topology_dir / lora_rel))
-
-                step_traces.append(
-                    StepTrace(
-                        step_index=step_index,
-                        loss=float(step_result.reduced_loss.item()),
-                        probs_corr=step_result.probs_corr,
-                        output_file=str(output_rel),
-                        grads_file=str(grads_rel),
-                        deltas_file=str(deltas_rel),
-                        lora_file=str(lora_rel),
-                    )
-                )
-            torch.distributed.barrier()
-
-    if torch.distributed.get_rank() == 0:
-        manifest = RunManifest(
-            case_id=request.case_id,
-            base_model=request.case_config.base_model,
-            topology=request.topology.slug(),
-            world_size=request.topology.world_size(),
-            seed=request.case_config.seed,
-            num_steps=request.case_config.num_steps,
-            packed_tensors=request.packed_tensors,
-            tolerances=request.case_config.tolerances,
-            steps=step_traces,
         )
-        _write_json(topology_dir / "manifest.json", manifest.model_dump(mode="json"))
-    torch.distributed.barrier()
-    torch.distributed.destroy_process_group()
+    return variants
 
 
-def _run_worker_cli(run_request_path: Path) -> None:
-    request = WorkerRunRequest.model_validate(_read_json(run_request_path))
-    _worker_run(request)
+def run_suite(
+    *,
+    case_config: OracleCaseConfig,
+) -> list[VariantReport]:
+    """Runs replay parity and topology variants with fail-fast assertions."""
+    runner = VariantRunner(case_config=case_config)
+    return runner.run_suite(_suite_variants(case_config))
 
 
-def _parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Megatron oracle harness worker")
-    parser.add_argument("--worker-run", action="store_true")
-    parser.add_argument("--run-request", type=Path)
-    return parser.parse_args(argv)
-
-
-def _main(argv: list[str]) -> int:
-    args = _parse_args(argv)
-    if not args.worker_run:
-        raise SystemExit("This module is intended for test imports or --worker-run")
-    if args.run_request is None:
-        raise SystemExit("--run-request is required with --worker-run")
-    _run_worker_cli(args.run_request)
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(_main(sys.argv[1:]))
+def run_sensitivity_suite(
+    *,
+    case_config: OracleCaseConfig,
+    mutations: list[SensitivityMutation],
+) -> list[VariantReport]:
+    """Runs a list of sensitivity mutations and expects each to fail."""
+    runner = VariantRunner(case_config=case_config)
+    thresholds = _default_phase_thresholds(case_config)
+    variants = [
+        VariantSpec(
+            name=f"sensitivity_{mutation}",
+            topology=SENSITIVITY_TOPOLOGY,
+            mutation=mutation,
+            expected_signal="fail",
+            thresholds_by_phase=thresholds,
+        )
+        for mutation in mutations
+    ]
+    return runner.run_suite(variants)
