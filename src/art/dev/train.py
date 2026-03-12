@@ -1,6 +1,9 @@
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from typing_extensions import TypedDict
+
+if TYPE_CHECKING:
+    from art.megatron.routing_replay import MoeRoutingReplayBundle
 
 
 class TrainConfig(TypedDict, total=False):
@@ -22,6 +25,9 @@ positive advantages. Defaults to 0.0 (perfectly balanced)."""
     logprob_calculation_chunk_size: int
     mask_prob_ratio: bool
     max_negative_advantage_importance_sampling_weight: float
+    moe_routing_replay_bundle: "MoeRoutingReplayBundle | None"
+    moe_routing_replay_path: str | None
+    moe_routing_replay_strict: bool
     num_trajectories_learning_rate_multiplier_power: float
     plot_tensors: bool
     ppo: bool

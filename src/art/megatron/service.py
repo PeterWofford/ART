@@ -36,6 +36,8 @@ class MegatronTrainingJob(BaseModel):
     disk_packed_tensors: DiskPackedTensors
     config: types.TrainConfig
     experimental_config: dev.TrainConfig
+    moe_routing_replay_path: str | None = None
+    moe_routing_replay_strict: bool = True
 
 
 @dataclass
@@ -241,12 +243,19 @@ class MegatronService:
         for job_name in os.listdir(jobs_dir):
             if job_name.endswith(".json"):
                 os.remove(os.path.join(jobs_dir, job_name))
+        if _config.get("moe_routing_replay_bundle") is not None:
+            raise RuntimeError(
+                "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
+                "MegatronService subprocess jobs must use moe_routing_replay_path."
+            )
         job = MegatronTrainingJob(
             lora_path=lora_path,
             optimizer_state_path=self._optimizer_state_path,
             disk_packed_tensors=disk_packed_tensors,
             config=config,
             experimental_config=_config,
+            moe_routing_replay_path=_config.get("moe_routing_replay_path"),
+            moe_routing_replay_strict=_config.get("moe_routing_replay_strict", True),
         )
         job_path = os.path.join(jobs_dir, f"{datetime.datetime.now().isoformat()}.json")
         with open(job_path, "w") as f:

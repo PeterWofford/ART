@@ -39,6 +39,10 @@ from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.offload import OffloadState, offload_to_cpu, reload_to_gpu
 from art.megatron.provider import get_provider
+from art.megatron.routing_replay import (
+    MoeRoutingReplayBundle,
+    MoeRoutingReplayController,
+)
 from art.preprocessing.pack import (
     DiskPackedTensors,
     PackedTensors,
@@ -54,6 +58,8 @@ class TrainingJob(BaseModel):
     disk_packed_tensors: DiskPackedTensors
     config: types.TrainConfig
     experimental_config: dev.TrainConfig
+    moe_routing_replay_path: str | None = None
+    moe_routing_replay_strict: bool = True
 
 
 class TrainingRuntime(BaseModel):
@@ -64,6 +70,7 @@ class TrainingRuntime(BaseModel):
     optimizer: Any
     rank: int
     world_size: int
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None
 
 
 class TrainStepResult(BaseModel):
@@ -129,11 +136,47 @@ def _default_optimizer_config() -> OptimizerConfig:
     )
 
 
+def configure_moe_routing_replay(
+    runtime: TrainingRuntime,
+    *,
+    replay_bundle_path: str | None = None,
+    replay_bundle: MoeRoutingReplayBundle | None = None,
+    strict: bool = True,
+) -> None:
+    if runtime.moe_routing_replay_controller is not None:
+        runtime.moe_routing_replay_controller.remove_router_patches()
+        runtime.moe_routing_replay_controller = None
+
+    if replay_bundle is not None and replay_bundle_path is not None:
+        raise RuntimeError(
+            "Provide either replay_bundle_path or replay_bundle, not both"
+        )
+    if replay_bundle is None and replay_bundle_path is None:
+        return
+
+    if replay_bundle is None:
+        if replay_bundle_path is None:
+            raise RuntimeError(
+                "replay_bundle_path is required when replay_bundle is None"
+            )
+        replay_bundle = MoeRoutingReplayBundle.from_dir(replay_bundle_path)
+
+    controller = MoeRoutingReplayController(
+        bundle=replay_bundle,
+        strict=strict,
+    )
+    controller.install_router_patches(runtime.model)
+    runtime.moe_routing_replay_controller = controller
+
+
 def build_training_runtime(
     *,
     model_identifier: str | None = None,
     provider_configure: Callable[[Any], None] | None = None,
     optimizer_config: OptimizerConfig | None = None,
+    moe_routing_replay_path: str | None = None,
+    moe_routing_replay_bundle: MoeRoutingReplayBundle | None = None,
+    moe_routing_replay_strict: bool = True,
     print_env: bool = True,
     print_optimizer_stats: bool = True,
 ) -> TrainingRuntime:
@@ -186,13 +229,20 @@ def build_training_runtime(
         percent = (num_params / total_params) * 100 if total_params > 0 else 0
         print(f"Optimizer parameters as percent of total: {percent:0.2f}%")
 
-    return TrainingRuntime(
+    runtime = TrainingRuntime(
         provider=provider,
         model=model,
         optimizer=optimizer,
         rank=rank,
         world_size=world_size,
     )
+    configure_moe_routing_replay(
+        runtime,
+        replay_bundle_path=moe_routing_replay_path,
+        replay_bundle=moe_routing_replay_bundle,
+        strict=moe_routing_replay_strict,
+    )
+    return runtime
 
 
 def iter_modules(model_chunks: list[MegatronModule]) -> Any:
@@ -204,11 +254,16 @@ def iter_modules(model_chunks: list[MegatronModule]) -> Any:
 def load_adapter_into_model(
     model_chunks: list[MegatronModule],
     adapter_model: dict[str, torch.Tensor],
+    optimizer: Any | None = None,
 ) -> None:
     with torch.no_grad():
         for module in iter_modules(model_chunks):
             if hasattr(module, "load_lora"):
                 module.load_lora(adapter_model)  # type: ignore[attr-defined]
+
+    if optimizer is None:
+        return
+    optimizer.reload_model_params()
 
 
 def collect_sharded_lora_state(
@@ -285,7 +340,17 @@ def run_training_step(
     config: types.TrainConfig,
     experimental_config: dev.TrainConfig,
     ref_logprobs: torch.Tensor | None = None,
+    step_index: int | None = None,
+    sample_index: int | None = None,
+    moe_routing_replay_controller: MoeRoutingReplayController | None = None,
 ) -> TrainStepResult:
+    if moe_routing_replay_controller is not None:
+        assert step_index is not None and sample_index is not None
+        moe_routing_replay_controller.set_step(
+            step_index=step_index,
+            sample_index=sample_index,
+        )
+
     device = next(model_chunks[0].parameters()).device
     _move_inputs_to_device(inputs, device)
 
@@ -321,6 +386,9 @@ def run_training_step(
         learning_rate,
     )
     reduced_loss = _reduce_loss(loss)
+
+    if moe_routing_replay_controller is not None:
+        moe_routing_replay_controller.finalize_step()
 
     return TrainStepResult(
         reduced_loss=reduced_loss,
@@ -360,6 +428,12 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         config = job.config
         experimental_config = job.experimental_config
 
+        configure_moe_routing_replay(
+            runtime,
+            replay_bundle_path=job.moe_routing_replay_path,
+            strict=job.moe_routing_replay_strict,
+        )
+
         print0(runtime.rank, "Loaded job from", job_path)
         print0(runtime.rank, "Job:", job)
 
@@ -368,7 +442,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             raise FileNotFoundError(f"No adapter model found at {adapter_model_path}")
         print0(runtime.rank, "Loading adapter model from", adapter_model_path)
         adapter_model = load_file(adapter_model_path)
-        load_adapter_into_model(runtime.model, adapter_model)
+        load_adapter_into_model(runtime.model, adapter_model, runtime.optimizer)
 
         optimizer_shard_path = os.path.join(
             job.optimizer_state_path,
@@ -401,7 +475,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         repeat = math.ceil(num_indices / len(indices))
         indices = (indices * repeat)[:num_indices]
 
-        for index in indices:
+        for step_index, index in enumerate(indices):
             inputs = select_indexed_inputs(packed_tensors, index)
             step_result = run_training_step(
                 model_chunks=runtime.model,
@@ -411,6 +485,9 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
                 config=config,
                 experimental_config=experimental_config,
                 ref_logprobs=None,
+                step_index=step_index,
+                sample_index=index,
+                moe_routing_replay_controller=runtime.moe_routing_replay_controller,
             )
             print0(
                 runtime.rank,
