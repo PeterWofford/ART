@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import tempfile
+from typing import cast
 
 import pytest
 import torch
@@ -165,7 +166,8 @@ def test_controller_patches_router_and_replays() -> None:
     controller.set_step(step_index=0, sample_index=0)
 
     logits = torch.randn((4, 3), dtype=torch.float32)
-    replay_probs, replay_map = chunk.decoder.layers[0].mlp.router.routing(logits)
+    router = cast(_FakeRouter, chunk.decoder.layers[0].mlp.router)
+    replay_probs, replay_map = router.routing(logits)
     expected_probs, expected_map = _dense_from_compact(route, dtype=logits.dtype)
 
     assert torch.equal(replay_map.cpu(), expected_map)

@@ -119,10 +119,11 @@ def _set_lora_parallel_metadata(
     # Megatron optimizer and checkpoint logic rely on tensor model-parallel metadata
     # to distinguish true shards from TP-duplicate params.
     if parallel_spec.sharded:
+        shard_dim = parallel_spec.shard_dim
+        if shard_dim is None:
+            raise ValueError("LoRAParallelSpec.shard_dim must be set when sharded=True")
         setattr(param, "tensor_model_parallel", True)
-        setattr(
-            param, "partition_dim", _normalize_axis(parallel_spec.shard_dim, param.ndim)
-        )
+        setattr(param, "partition_dim", _normalize_axis(shard_dim, param.ndim))
         # stride > 1 means the dim is split into blocks and each tp rank holds a shard of the block
         # this might happen for fused e.g. gate_(up|proj), but loras are individual per module
         setattr(param, "partition_stride", 1)

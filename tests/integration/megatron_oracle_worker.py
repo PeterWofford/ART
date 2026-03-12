@@ -201,16 +201,13 @@ def _build_optimizer_config(case_config: OracleCaseConfig):
     """Builds Megatron optimizer settings for deterministic harness runs."""
     from megatron.core.optimizer import OptimizerConfig
 
-    optimizer_kwargs = dict(
+    return OptimizerConfig(
+        bf16=True,
         lr=case_config.learning_rate,
         adam_beta1=0.9,
         adam_beta2=0.99,
         clip_grad=0.1,
         weight_decay=0.1,
-    )
-    return OptimizerConfig(
-        bf16=True,
-        **optimizer_kwargs,
     )
 
 

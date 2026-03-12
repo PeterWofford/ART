@@ -90,12 +90,17 @@ def _extract_primary_tensor(value: Any) -> torch.Tensor | None:
 
 
 def _materialize_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    if hasattr(tensor, "full_tensor"):
-        tensor = cast(torch.Tensor, tensor.full_tensor())
-    elif hasattr(tensor, "to_local"):
-        tensor = cast(torch.Tensor, tensor.to_local())
-    elif hasattr(tensor, "_local_tensor"):
-        tensor = cast(torch.Tensor, tensor._local_tensor)
+    full_tensor = getattr(tensor, "full_tensor", None)
+    if callable(full_tensor):
+        tensor = cast(torch.Tensor, full_tensor())
+    else:
+        to_local = getattr(tensor, "to_local", None)
+        if callable(to_local):
+            tensor = cast(torch.Tensor, to_local())
+        else:
+            local_tensor = getattr(tensor, "_local_tensor", None)
+            if isinstance(local_tensor, torch.Tensor):
+                tensor = local_tensor
     return tensor.detach().cpu()
 
 

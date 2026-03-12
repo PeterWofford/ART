@@ -959,12 +959,7 @@ class VariantRunner:
         """Builds rows from named tensor pairs with one shared diff path."""
         rows: list[MetricRow] = []
         for name, reference, candidate in pairs:
-            shared_kwargs = {
-                "variant": variant,
-                "step_index": step_index,
-                "phase": phase,
-                "param": _minimal_param_name(name),
-            }
+            param_name = _minimal_param_name(name)
             reference_aligned = reference
             candidate_aligned = candidate
             aligned_candidate = _align_sequence_parallel(
@@ -973,9 +968,12 @@ class VariantRunner:
             if aligned_candidate is None:
                 rows.append(
                     self._build_metric_row(
+                        variant=variant,
+                        step_index=step_index,
+                        phase=phase,
+                        param=param_name,
                         summary=self._inf_summary(),
                         structural_failure="shape mismatch",
-                        **shared_kwargs,
                     )
                 )
                 continue
@@ -986,7 +984,11 @@ class VariantRunner:
                 accumulator.update(reference_aligned, aligned_candidate)
             rows.append(
                 self._build_metric_row(
-                    summary=accumulator.as_summary(), **shared_kwargs
+                    variant=variant,
+                    step_index=step_index,
+                    phase=phase,
+                    param=param_name,
+                    summary=accumulator.as_summary(),
                 )
             )
         return rows
@@ -1032,7 +1034,7 @@ class VariantRunner:
             reference, candidate, variant, step_index, phase
         )
         if not matching:
-            return rows
+            return rows if rows is not None else []
         pairs = [
             (key, reference[key], candidate[key])
             for key in sorted(set(reference.keys()))
