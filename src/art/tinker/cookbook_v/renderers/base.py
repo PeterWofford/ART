@@ -212,6 +212,14 @@ class RenderContext:
     prev_message: Message | None = None
     """The previous message in the conversation, if any."""
 
+    last_user_index: int = -1
+    """Index of the last user message in the conversation. -1 if no user messages.
+
+    This is computed by the base build_generation_prompt/build_supervised_example
+    and used by renderers like Qwen3.5 that need to treat assistant messages
+    differently based on whether they come before or after the last user message.
+    """
+
 
 class ToolSpec(TypedDict):
     """
@@ -362,37 +370,42 @@ def _parse_tool_call_json(
     )
 
 
-def parse_content_blocks(content: str) -> list[ContentPart] | None:
+def parse_content_blocks(
+    content: str,
+) -> tuple[list[ContentPart], list[ToolCall | UnparsedToolCall]] | None:
     """
     Parse a string with <think>...</think> and <tool_call>...</tool_call> tags.
 
-    Handles interleaved thinking, tool call, and text blocks, returning parts
-    in order. Empty parts are omitted. Failed tool call parses are included as
-    UnparsedToolCallPart to preserve ordering.
+    Handles interleaved thinking, tool call, and text blocks. Content parts
+    (ThinkingPart, TextPart) are returned in the first element; tool calls
+    (ToolCall, UnparsedToolCall) are returned separately in the second element,
+    preserving their relative order.
 
-    Whitespace is preserved exactly - roundtrip (parse then render) is identity.
+    Whitespace in non-tool-call regions is preserved exactly - roundtrip
+    (parse then render) is identity for the content parts.
 
     Args:
         content: String potentially containing <think> and/or <tool_call> blocks.
 
     Returns:
-        List of ContentPart (ThinkingPart, TextPart, ToolCallPart, UnparsedToolCallPart)
-        in order. Returns None if no special tags are found - caller should use
-        the original string for backward compatibility.
+        Tuple of (content_parts, tool_calls), or None if no special tags are found.
+        content_parts contains only ThinkingPart/TextPart.
+        tool_calls contains ToolCall and UnparsedToolCall in order.
 
     Example:
         >>> parse_content_blocks("<think>step 1</think>answer<tool_call>{...}</tool_call>more")
-        [
-            ThinkingPart(type="thinking", thinking="step 1"),
-            TextPart(type="text", text="answer"),
-            ToolCallPart(type="tool_call", tool_call=ToolCall(...)),
-            TextPart(type="text", text="more"),
-        ]
+        (
+            [ThinkingPart(type="thinking", thinking="step 1"),
+             TextPart(type="text", text="answer"),
+             TextPart(type="text", text="more")],
+            [ToolCall(...)],
+        )
     """
     if "<think>" not in content and "<tool_call>" not in content:
         return None  # No special blocks, caller should use original string
 
     parts: list[ContentPart] = []
+    tool_calls: list[ToolCall | UnparsedToolCall] = []
     pos = 0
 
     # Pattern to find both <think>...</think> and <tool_call>...</tool_call> blocks
@@ -412,21 +425,10 @@ def parse_content_blocks(content: str) -> list[ContentPart] | None:
             if thinking:  # Skip empty thinking blocks
                 parts.append(ThinkingPart(type="thinking", thinking=thinking))
         else:
-            # This is a <tool_call> block
+            # This is a <tool_call> block - goes into separate tool_calls list
             tool_call_json = match.group(2)
             raw_text = match.group(0)  # Full match including tags
-            parsed = _parse_tool_call_json(tool_call_json, raw_text)
-            if isinstance(parsed, UnparsedToolCall):
-                # Include unparsed tool calls as UnparsedToolCallPart to preserve order
-                parts.append(
-                    UnparsedToolCallPart(
-                        type="unparsed_tool_call",
-                        raw_text=parsed.raw_text,
-                        error=parsed.error,
-                    )
-                )
-            else:
-                parts.append(ToolCallPart(type="tool_call", tool_call=parsed))
+            tool_calls.append(_parse_tool_call_json(tool_call_json, raw_text))
 
         pos = match.end()
 
@@ -435,7 +437,7 @@ def parse_content_blocks(content: str) -> list[ContentPart] | None:
     if remaining:  # Skip only truly empty strings
         parts.append(TextPart(type="text", text=remaining))
 
-    return parts
+    return parts, tool_calls
 
 
 def parse_think_blocks(content: str) -> list[ContentPart] | None:
@@ -534,6 +536,7 @@ class RenderedMessage:
 
 class TrainOnWhat(StrEnum):
     LAST_ASSISTANT_MESSAGE = "last_assistant_message"
+    LAST_ASSISTANT_TURN = "last_assistant_turn"
     ALL_ASSISTANT_MESSAGES = "all_assistant_messages"
     ALL_MESSAGES = "all_messages"
     ALL_TOKENS = "all_tokens"
@@ -758,23 +761,36 @@ class Renderer(ABC):
         chunks: list[tinker.types.ModelInputChunk] = []
         if self._bos_tokens:
             chunks.append(tinker.types.EncodedTextChunk(tokens=self._bos_tokens))
+        last_user_idx = max(
+            (idx for idx, message in enumerate(messages) if message["role"] == "user"),
+            default=-1,
+        )
         for idx, message in enumerate(messages):
             ctx = RenderContext(
                 idx=idx,
                 is_last=(idx == len(messages) - 1),
                 prev_message=messages[idx - 1] if idx > 0 else None,
+                last_user_index=last_user_idx,
             )
             rendered_message = self.render_message(message, ctx)
             header_chunk = rendered_message.header
             output_chunks = rendered_message.output
             if header_chunk:
                 chunks.append(header_chunk)
-            chunks.extend([x for x in output_chunks if x])
+            # Filter out empty EncodedTextChunks, which cause 400 errors in model requests.
+            chunks.extend(
+                [
+                    x
+                    for x in output_chunks
+                    if not isinstance(x, tinker.EncodedTextChunk) or x.tokens
+                ]
+            )
 
         suffix_ctx = RenderContext(
             idx=len(messages),
             is_last=True,
             prev_message=messages[-1] if messages else None,
+            last_user_index=last_user_idx,
         )
         suffix_tokens = self._get_generation_suffix(role, suffix_ctx)
         if suffix_tokens:
@@ -787,6 +803,25 @@ class Renderer(ABC):
                 )
             )
         return tinker.ModelInput(chunks=chunks)
+
+    def build_supervised_examples(
+        self,
+        messages: list[Message],
+        train_on_what: TrainOnWhat = TrainOnWhat.LAST_ASSISTANT_TURN,
+    ) -> list[tuple[tinker.ModelInput, torch.Tensor]]:
+        """
+        Build tokens and per-token weights for supervised fine-tuning.
+
+        This returns a list because some renderers do not satisfy the extension
+        property and must be trained as separate examples per assistant turn.
+        """
+        if self.has_extension_property:
+            return [
+                self.build_supervised_example(messages, train_on_what=train_on_what)
+            ]
+        raise NotImplementedError(
+            "build_supervised_examples has not been implemented for this renderer."
+        )
 
     def build_supervised_example(
         self,
@@ -848,6 +883,11 @@ class Renderer(ABC):
                 (tinker.types.EncodedTextChunk(tokens=self._bos_tokens), 0.0)
             )
 
+        last_user_idx = max(
+            (idx for idx, message in enumerate(messages) if message["role"] == "user"),
+            default=-1,
+        )
+
         for idx, message in enumerate(messages):
             if train_on_what == TrainOnWhat.CUSTOMIZED:
                 assert "trainable" in message, (
@@ -861,12 +901,14 @@ class Renderer(ABC):
             is_last_message = idx == len(messages) - 1
             is_assistant = message["role"] == "assistant"
             is_user_or_system = message["role"] in ["user", "system"]
+            is_after_last_user = last_user_idx == -1 or idx > last_user_idx
 
             # only apply weight to header if train_on_what is ALL_TOKENS
             ctx = RenderContext(
                 idx=idx,
                 is_last=is_last_message,
                 prev_message=messages[idx - 1] if idx > 0 else None,
+                last_user_index=last_user_idx,
             )
             rendered_message = self.render_message(message, ctx)
             header_part = rendered_message.header
@@ -880,6 +922,8 @@ class Renderer(ABC):
             match train_on_what:
                 case TrainOnWhat.LAST_ASSISTANT_MESSAGE:
                     output_has_weight = is_last_message and is_assistant
+                case TrainOnWhat.LAST_ASSISTANT_TURN:
+                    output_has_weight = is_assistant and is_after_last_user
                 case TrainOnWhat.ALL_ASSISTANT_MESSAGES:
                     output_has_weight = is_assistant
                 case TrainOnWhat.ALL_MESSAGES:

@@ -1,6 +1,10 @@
 def get_renderer_name(base_model: str) -> str:
     if base_model.startswith("meta-llama/"):
         return "llama3"
+    elif base_model.startswith("Qwen/Qwen3.5-"):
+        print("Defaulting to Qwen3.5 renderer with thinking for", base_model)
+        print(renderer_name_message)
+        return "qwen3_5"
     elif base_model.startswith("Qwen/Qwen3-"):
         if "Instruct" in base_model:
             return "qwen3_instruct"
@@ -38,6 +42,8 @@ Valid renderer names are:
 - qwen3
 - qwen3_disable_thinking
 - qwen3_instruct
+- qwen3_5
+- qwen3_5_disable_thinking
 - deepseekv3
 - deepseekv3_disable_thinking
 - gpt_oss_no_sysprompt
