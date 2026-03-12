@@ -1,6 +1,8 @@
 import json
+from typing import cast
 
 from art.tinker.cookbook_v import renderers
+from art.tinker.cookbook_v.tokenizer_utils import Tokenizer
 from art.tinker.renderers import get_renderer_name
 from art.tinker_native.data import convert_openai_messages_to_renderer_format
 
@@ -56,6 +58,10 @@ def _decode_model_input(tokenizer: FakeTokenizer, model_input: object) -> str:
     return tokenizer.decode(tokens)
 
 
+def _get_test_renderer(name: str, tokenizer: FakeTokenizer) -> renderers.Renderer:
+    return renderers.get_renderer(name, cast(Tokenizer, tokenizer))
+
+
 def test_get_renderer_name_autodetects_qwen3_5() -> None:
     assert get_renderer_name("Qwen/Qwen3.5-35B-A3B") == "qwen3_5"
 
@@ -63,7 +69,7 @@ def test_get_renderer_name_autodetects_qwen3_5() -> None:
 def test_qwen3_5_generation_prompt_matches_hf_suffixes() -> None:
     tokenizer = FakeTokenizer()
 
-    renderer = renderers.get_renderer("qwen3_5", tokenizer)
+    renderer = _get_test_renderer("qwen3_5", tokenizer)
     prompt = renderer.build_generation_prompt(
         [
             {"role": "user", "content": "Question"},
@@ -77,7 +83,7 @@ def test_qwen3_5_generation_prompt_matches_hf_suffixes() -> None:
     )
     assert rendered.endswith("<|im_start|>assistant\n<think>\n")
 
-    disable_renderer = renderers.get_renderer("qwen3_5_disable_thinking", tokenizer)
+    disable_renderer = _get_test_renderer("qwen3_5_disable_thinking", tokenizer)
     disable_prompt = disable_renderer.build_generation_prompt([])
     disable_rendered = _decode_model_input(tokenizer, disable_prompt)
     assert disable_rendered == "<|im_start|>assistant\n<think>\n\n</think>\n\n"
@@ -85,7 +91,7 @@ def test_qwen3_5_generation_prompt_matches_hf_suffixes() -> None:
 
 def test_qwen3_5_parse_response_handles_xml_tool_calls() -> None:
     tokenizer = FakeTokenizer()
-    renderer = renderers.get_renderer("qwen3_5", tokenizer)
+    renderer = _get_test_renderer("qwen3_5", tokenizer)
 
     response = tokenizer.encode(
         "  reasoning  </think>\n\nAnswer first.\n\n"
@@ -120,13 +126,13 @@ def test_qwen3_5_parse_response_handles_xml_tool_calls() -> None:
 
 def test_qwen3_5_to_openai_message_uses_mapping_tool_arguments() -> None:
     tokenizer = FakeTokenizer()
-    renderer = renderers.get_renderer("qwen3_5", tokenizer)
+    renderer = _get_test_renderer("qwen3_5", tokenizer)
 
-    message = {
+    message: renderers.Message = {
         "role": "assistant",
         "content": [
-            {"type": "thinking", "thinking": "reason"},
-            {"type": "text", "text": "Answer"},
+            renderers.ThinkingPart(type="thinking", thinking="reason"),
+            renderers.TextPart(type="text", text="Answer"),
         ],
         "tool_calls": [
             renderers.ToolCall(
@@ -152,7 +158,7 @@ def test_convert_openai_messages_to_renderer_format_stringifies_dict_arguments()
     None
 ):
     tokenizer = FakeTokenizer()
-    renderer = renderers.get_renderer("qwen3_5", tokenizer)
+    renderer = _get_test_renderer("qwen3_5", tokenizer)
 
     converted = convert_openai_messages_to_renderer_format(
         [
@@ -185,6 +191,6 @@ def test_convert_openai_messages_to_renderer_format_stringifies_dict_arguments()
 def test_get_renderer_supports_kimi_k25_factory() -> None:
     tokenizer = FakeTokenizer()
 
-    renderer = renderers.get_renderer("kimi_k25", tokenizer)
+    renderer = _get_test_renderer("kimi_k25", tokenizer)
 
     assert renderer.__class__.__name__ == "KimiK25Renderer"
