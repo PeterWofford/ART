@@ -4,6 +4,8 @@ from pathlib import Path
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from art import Model
 
 
@@ -80,6 +82,7 @@ class TestMetricRoutingBaseline:
     ) -> None:
         fake_run = MagicMock()
         fake_run._is_finished = False
+        fake_run.config = MagicMock()
 
         fake_wandb = types.SimpleNamespace()
         fake_wandb.init = MagicMock(return_value=fake_run)
@@ -121,3 +124,90 @@ class TestMetricRoutingBaseline:
         assert logged_metrics["training_step"] == 1
         assert "time/wall_clock_sec" in logged_metrics
         assert fake_run.log.call_args.kwargs == {}
+
+    def test_update_wandb_config_seeds_wandb_init(self, tmp_path: Path) -> None:
+        fake_run = MagicMock()
+        fake_run._is_finished = False
+        fake_run.config = MagicMock()
+
+        fake_wandb = types.SimpleNamespace()
+        fake_wandb.init = MagicMock(return_value=fake_run)
+        fake_wandb.define_metric = MagicMock()
+        fake_wandb.Settings = lambda **kwargs: kwargs
+
+        payload = {
+            "experiment": {"learning_rate": 1e-5, "batch_size": 4},
+            "dataset": {"split": "train"},
+        }
+
+        with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
+            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+                model = Model(
+                    name="test-model",
+                    project="test-project",
+                    base_path=str(tmp_path),
+                )
+                model.update_wandb_config(payload)
+                run = model._get_wandb_run()
+
+        assert run is fake_run
+        init_kwargs = fake_wandb.init.call_args.kwargs
+        assert init_kwargs["config"] == payload
+        assert "allow_val_change" not in init_kwargs
+        fake_run.config.update.assert_called_once_with(payload)
+
+    def test_update_wandb_config_updates_active_run(self, tmp_path: Path) -> None:
+        fake_run = MagicMock()
+        fake_run._is_finished = False
+        fake_run.config = MagicMock()
+
+        fake_wandb = types.SimpleNamespace()
+        fake_wandb.init = MagicMock(return_value=fake_run)
+        fake_wandb.define_metric = MagicMock()
+        fake_wandb.Settings = lambda **kwargs: kwargs
+
+        with patch.dict(os.environ, {"WANDB_API_KEY": "test-key"}, clear=False):
+            with patch.dict("sys.modules", {"wandb": fake_wandb}):
+                model = Model(
+                    name="test-model",
+                    project="test-project",
+                    base_path=str(tmp_path),
+                )
+                model.update_wandb_config({"experiment": {"learning_rate": 1e-5}})
+                _ = model._get_wandb_run()
+                fake_run.config.update.reset_mock()
+
+                model.update_wandb_config(
+                    {"experiment": {"learning_rate": 1e-5, "batch_size": 8}},
+                )
+                model.update_wandb_config(
+                    {"dataset": {"split": "train"}},
+                )
+
+        assert fake_run.config.update.call_count == 2
+        assert fake_run.config.update.call_args_list[0].args == (
+            {"experiment": {"learning_rate": 1e-5, "batch_size": 8}},
+        )
+        assert fake_run.config.update.call_args_list[1].args == (
+            {
+                "experiment": {"learning_rate": 1e-5, "batch_size": 8},
+                "dataset": {"split": "train"},
+            },
+        )
+
+    def test_update_wandb_config_rejects_conflicting_values(
+        self, tmp_path: Path
+    ) -> None:
+        model = Model(
+            name="test-model",
+            project="test-project",
+            base_path=str(tmp_path),
+        )
+
+        model.update_wandb_config({"experiment": {"learning_rate": 1e-5}})
+
+        with pytest.raises(
+            ValueError,
+            match="Conflicting value for 'experiment.learning_rate'",
+        ):
+            model.update_wandb_config({"experiment": {"learning_rate": 2e-5}})

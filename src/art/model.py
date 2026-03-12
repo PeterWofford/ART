@@ -114,6 +114,7 @@ class Model(
     _openai_client: AsyncOpenAI | None = None
     _wandb_run: Optional["Run"] = None  # Private, for lazy wandb initialization
     _wandb_defined_metrics: set[str]
+    _wandb_config: dict[str, Any]
     _run_start_time: float
     _run_start_monotonic: float
     _last_local_train_log_monotonic: float
@@ -150,6 +151,7 @@ class Model(
             **kwargs,
         )
         object.__setattr__(self, "_wandb_defined_metrics", set())
+        object.__setattr__(self, "_wandb_config", {})
         object.__setattr__(self, "_run_start_time", time.time())
         object.__setattr__(self, "_run_start_monotonic", time.monotonic())
         object.__setattr__(
@@ -371,6 +373,34 @@ class Model(
                 merged[key] = value
         return merged
 
+    @staticmethod
+    def _merge_wandb_config(
+        existing: dict[str, Any],
+        updates: dict[str, Any],
+        *,
+        path: str = "",
+    ) -> dict[str, Any]:
+        merged = dict(existing)
+        for key, value in updates.items():
+            key_path = f"{path}.{key}" if path else key
+            if key not in merged:
+                merged[key] = value
+                continue
+            existing_value = merged[key]
+            if isinstance(existing_value, dict) and isinstance(value, dict):
+                merged[key] = Model._merge_wandb_config(
+                    existing_value,
+                    value,
+                    path=key_path,
+                )
+                continue
+            if existing_value != value:
+                raise ValueError(
+                    "W&B config is immutable once set. "
+                    f"Conflicting value for '{key_path}'."
+                )
+        return merged
+
     def read_state(self) -> StateType | None:
         """Read persistent state from the model directory.
 
@@ -390,6 +420,43 @@ class Model(
         with open(state_path, "r") as f:
             return json.load(f)
 
+    def update_wandb_config(
+        self,
+        config: dict[str, Any],
+    ) -> None:
+        """Merge configuration into the W&B run config for this model.
+
+        This can be called before the W&B run exists, in which case the config is
+        passed to `wandb.init(...)` when ART first creates the run. If the run is
+        already active, ART updates the run config immediately.
+
+        Args:
+            config: JSON-serializable configuration to store on the W&B run.
+        """
+        if not isinstance(config, dict):
+            raise TypeError("config must be a dict[str, Any]")
+
+        merged = self._merge_wandb_config(self._wandb_config, config)
+        object.__setattr__(self, "_wandb_config", merged)
+
+        if self._wandb_run is not None and not self._wandb_run._is_finished:
+            self._sync_wandb_config(self._wandb_run)
+
+    def _sync_wandb_config(
+        self,
+        run: "Run",
+    ) -> None:
+        if not self._wandb_config:
+            return
+
+        run_config = getattr(run, "config", None)
+        if run_config is None or not hasattr(run_config, "update"):
+            return
+
+        run_config.update(
+            self._wandb_config,
+        )
+
     def _get_wandb_run(self) -> Optional["Run"]:
         """Get or create the wandb run for this model."""
         import wandb
@@ -401,6 +468,7 @@ class Model(
                 project=self.project,
                 name=self.name,
                 id=self.name,
+                config=self._wandb_config or None,
                 resume="allow",
                 settings=wandb.Settings(
                     x_stats_open_metrics_endpoints={
@@ -436,6 +504,7 @@ class Model(
             wandb.define_metric("val/*", step_metric="training_step")
             wandb.define_metric("test/*", step_metric="training_step")
             wandb.define_metric("discarded/*", step_metric="training_step")
+            self._sync_wandb_config(run)
         return self._wandb_run
 
     def _log_metrics(
