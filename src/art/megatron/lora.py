@@ -182,9 +182,9 @@ class LoRA(torch.nn.Module):
         return self.A_T.shape[0] if self.A_T.ndim == 3 else 1
 
     def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
-        if not getattr(param, "lora_tp_replicated", False):
+        if not param.lora_tp_replicated:
             return
-        domain = getattr(param, "lora_shard_domain")
+        domain = param.lora_shard_domain
         world_size = _get_shard_world_size(domain)
         if world_size <= 1:
             return
@@ -252,14 +252,9 @@ class LoRA(torch.nn.Module):
         self.load_weight(weight, into=into)
 
     def load_weight(self, weight: torch.Tensor, *, into: torch.nn.Parameter) -> None:
-        domain = getattr(into, "lora_shard_domain")
-        sharded = bool(getattr(into, "lora_tp_sharded"))
-        if sharded:
-            axis = getattr(into, "lora_tp_shard_dim")
-            if axis is None:
-                raise RuntimeError(
-                    f"{self.adapter_model_prefix}: missing shard axis for sharded parameter"
-                )
+        domain = into.lora_shard_domain
+        if into.lora_tp_sharded:
+            axis = into.lora_tp_shard_dim
             axis = _normalize_axis(axis, weight.ndim)
             world_size = _get_shard_world_size(domain)
             rank = _get_shard_rank(domain)
@@ -283,37 +278,35 @@ class LoRA(torch.nn.Module):
         into.requires_grad = True
 
     def _should_export_parameter(self, param: torch.nn.Parameter) -> bool:
+        """
+        Determine if the given LoRA param should be exported in the sharded LoRA state dict
+        (drop replicated ranks/params).
+        """
         if self.num_local_experts > 1:  # self is a MoE layer
             if ps.get_expert_data_parallel_rank() != 0:
                 return False
         else:  # self is a non-MoE layer
-            if ps.get_data_parallel_rank() != 0:
-                return False
-            # Non-MoE layers are replicated across expert-model-parallel ranks.
-            if (
-                ps.get_expert_model_parallel_world_size() > 1
-                and ps.get_expert_model_parallel_rank() != 0
-            ):
+            # dp x cp rank 0 participates
+            if ps.get_data_parallel_rank(with_context_parallel=True) != 0:
                 return False
 
-        if getattr(param, "lora_tp_sharded", False):
-            # this param is fully sharded, all shard ranks participate
+        # this param is fully sharded, all shard ranks participate
+        if param.lora_tp_sharded:
             return True
-
-        domain = getattr(param, "lora_shard_domain")
         # param is replicated, tp rank 0 or etp rank 0 participates
-        return _get_shard_rank(domain) == 0
+        return _get_shard_rank(param.lora_shard_domain) == 0
 
     def _manifest_for_param(self, param: torch.nn.Parameter) -> dict[str, Any]:
-        domain = getattr(param, "lora_shard_domain")
-        sharded = bool(getattr(param, "lora_tp_sharded", False))
-        shard_dim = getattr(param, "lora_tp_shard_dim", None)
         return {
-            "domain": domain,
-            "sharded": sharded,
-            "shard_dim": shard_dim,
-            "shard_world_size": _get_shard_world_size(domain) if sharded else 1,
-            "shard_rank": _get_shard_rank(domain) if sharded else 0,
+            "domain": param.lora_shard_domain,
+            "sharded": param.lora_tp_sharded,
+            "shard_dim": param.lora_tp_shard_dim,
+            "shard_world_size": _get_shard_world_size(param.lora_shard_domain)
+            if param.lora_tp_sharded
+            else 1,
+            "shard_rank": _get_shard_rank(param.lora_shard_domain)
+            if param.lora_tp_sharded
+            else 0,
         }
 
     def _lora_params(self) -> list[tuple[str, torch.nn.Parameter]]:
