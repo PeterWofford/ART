@@ -182,9 +182,9 @@ class LoRA(torch.nn.Module):
         return self.A_T.shape[0] if self.A_T.ndim == 3 else 1
 
     def _broadcast_if_replicated(self, param: torch.nn.Parameter) -> None:
-        if not param.lora_tp_replicated:
+        if not param.lora_tp_replicated:  # ty: ignore[unresolved-attribute]
             return
-        domain = param.lora_shard_domain
+        domain = param.lora_shard_domain  # ty: ignore[unresolved-attribute]
         world_size = _get_shard_world_size(domain)
         if world_size <= 1:
             return
@@ -252,9 +252,9 @@ class LoRA(torch.nn.Module):
         self.load_weight(weight, into=into)
 
     def load_weight(self, weight: torch.Tensor, *, into: torch.nn.Parameter) -> None:
-        domain = into.lora_shard_domain
-        if into.lora_tp_sharded:
-            axis = into.lora_tp_shard_dim
+        domain = into.lora_shard_domain  # ty: ignore[unresolved-attribute]
+        if into.lora_tp_sharded:  # ty: ignore[unresolved-attribute]
+            axis = into.lora_tp_shard_dim  # ty: ignore[unresolved-attribute]
             axis = _normalize_axis(axis, weight.ndim)
             world_size = _get_shard_world_size(domain)
             rank = _get_shard_rank(domain)
@@ -291,21 +291,21 @@ class LoRA(torch.nn.Module):
                 return False
 
         # this param is fully sharded, all shard ranks participate
-        if param.lora_tp_sharded:
+        if param.lora_tp_sharded:  # ty: ignore[unresolved-attribute]
             return True
         # param is replicated, tp rank 0 or etp rank 0 participates
-        return _get_shard_rank(param.lora_shard_domain) == 0
+        return _get_shard_rank(param.lora_shard_domain) == 0  # ty: ignore[unresolved-attribute]
 
     def _manifest_for_param(self, param: torch.nn.Parameter) -> dict[str, Any]:
         return {
-            "domain": param.lora_shard_domain,
-            "sharded": param.lora_tp_sharded,
-            "shard_dim": param.lora_tp_shard_dim,
-            "shard_world_size": _get_shard_world_size(param.lora_shard_domain)
-            if param.lora_tp_sharded
+            "domain": param.lora_shard_domain,  # ty: ignore[unresolved-attribute]
+            "sharded": param.lora_tp_sharded,  # ty: ignore[unresolved-attribute]
+            "shard_dim": param.lora_tp_shard_dim,  # ty: ignore[unresolved-attribute]
+            "shard_world_size": _get_shard_world_size(param.lora_shard_domain)  # ty: ignore[unresolved-attribute]
+            if param.lora_tp_sharded  # ty: ignore[unresolved-attribute]
             else 1,
-            "shard_rank": _get_shard_rank(param.lora_shard_domain)
-            if param.lora_tp_sharded
+            "shard_rank": _get_shard_rank(param.lora_shard_domain)  # ty: ignore[unresolved-attribute]
+            if param.lora_tp_sharded  # ty: ignore[unresolved-attribute]
             else 0,
         }
 

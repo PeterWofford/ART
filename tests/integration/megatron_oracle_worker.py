@@ -342,7 +342,9 @@ def _iter_named_unique_parameters(
     return params
 
 
-def _matches_grad_sync_skip_mutation(param_name: str, mutation: SensitivityMutation) -> bool:
+def _matches_grad_sync_skip_mutation(
+    param_name: str, mutation: SensitivityMutation
+) -> bool:
     if mutation == "bwd_skip_sync_qkv_a":
         return any(
             token in param_name
@@ -381,19 +383,26 @@ def _apply_grad_sync_skip_mutation(
         if not _matches_grad_sync_skip_mutation(param_name, mutation):
             continue
         if (
-            mutation == "bwd_skip_sync_fc1_a"
-            and param.grad_sync_domain != "expert_tp"
+            mutation == "bwd_skip_sync_fc1_a" and param.grad_sync_domain != "expert_tp"  # ty: ignore[unresolved-attribute]
         ):
             continue
 
         # For fc1 A params, extended finalize handles expert-TP sync via grad_sync_op.
-        saved_attrs.append((param, "grad_sync_op", param.grad_sync_op))
-        param.grad_sync_op = "none"
+        saved_attrs.append((param, "grad_sync_op", param.grad_sync_op))  # ty: ignore[unresolved-attribute]
+        param.grad_sync_op = "none"  # ty: ignore[unresolved-attribute]
 
         # Megatron native TP finalize uses this only for tp_default-domain params.
-        if param.average_gradients_across_tp_domain and param.grad_sync_domain == "tp_default":
-            saved_attrs.append((param, "average_gradients_across_tp_domain", param.average_gradients_across_tp_domain))
-            param.average_gradients_across_tp_domain = False
+        average_gradients_across_tp_domain = param.average_gradients_across_tp_domain  # ty: ignore[unresolved-attribute]
+        grad_sync_domain = param.grad_sync_domain  # ty: ignore[unresolved-attribute]
+        if average_gradients_across_tp_domain and grad_sync_domain == "tp_default":
+            saved_attrs.append(
+                (
+                    param,
+                    "average_gradients_across_tp_domain",
+                    average_gradients_across_tp_domain,
+                )
+            )
+            param.average_gradients_across_tp_domain = False  # ty: ignore[unresolved-attribute]
     try:
         yield
     finally:
