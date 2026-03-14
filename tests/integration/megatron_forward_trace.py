@@ -20,6 +20,7 @@ CAPTURE_NAME_TOKENS = (
     ".mlp.experts.linear_fc2.lora",
 )
 ROUTER_NAME_TOKEN = ".mlp.router"
+PRIMARY_OUTPUT_CANONICAL_KEY = "primary_output__is_canonical"
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
@@ -221,6 +222,25 @@ class ForwardTraceCapture:
         if lora_hint is not None:
             return lora_hint
 
+        # Base MoE expert linears need expert-TP aware merge semantics.
+        # With etp>1:
+        # - FC1 (column-parallel) shards output features -> concat on feature dim.
+        # - FC2 (row-parallel) emits partial output contributions -> sum across ranks.
+        # With etp==1, keep the existing token-row concat behavior.
+        etp_world_size = _safe_ps_stat("get_expert_tensor_parallel_world_size", 1)
+        if ".mlp.experts.linear_fc1" in name and ".lora" not in name:
+            if etp_world_size > 1:
+                return {
+                    "op": "concat",
+                    "dim": -1,
+                    "layout": "gate_up_rank_interleaved",
+                }
+            return {"op": "concat", "dim": 0}
+        if ".mlp.experts.linear_fc2" in name and ".lora" not in name:
+            if etp_world_size > 1:
+                return {"op": "sum"}
+            return {"op": "concat", "dim": 0}
+
         gather_output = getattr(module, "gather_output", None)
         if isinstance(gather_output, bool) and not gather_output:
             return {"op": "concat", "dim": -1}
@@ -286,6 +306,249 @@ class ForwardTraceCapture:
     def set_step(self, step_index: int) -> None:
         self.current_step_index = step_index
         self.current_step_trace = {}
+
+    @staticmethod
+    def _is_moe_expert_forward_module(module_name: str) -> bool:
+        """Returns whether one module emits MoE expert forward outputs."""
+        if ".mlp.experts." not in module_name:
+            return False
+        if ".mlp.router" in module_name:
+            return False
+        return ".linear_fc1" in module_name or ".linear_fc2" in module_name
+
+    @staticmethod
+    def _primary_output_merge_hint(call: dict[str, Any]) -> dict[str, Any] | None:
+        """Reads primary-output merge metadata from one call payload."""
+        merge_hints = call.get("merge_hints")
+        if not isinstance(merge_hints, dict):
+            return None
+        primary_hint = merge_hints.get("primary_output")
+        if not isinstance(primary_hint, dict):
+            return None
+        return primary_hint
+
+    @classmethod
+    def _lookup_call_by_index(
+        cls,
+        trace: dict[str, list[dict[str, Any]]],
+        module_name: str,
+        call_index: int,
+    ) -> dict[str, Any] | None:
+        """Finds one call entry by call-index with positional fallback."""
+        calls = trace.get(module_name)
+        if calls is None:
+            return None
+        for call in calls:
+            if int(call.get("call_index", -1)) == call_index:
+                return call
+        if 0 <= call_index < len(calls):
+            return calls[call_index]
+        return None
+
+    @staticmethod
+    def _router_module_name_for_expert_module(module_name: str) -> str | None:
+        """Maps one expert module name to its layer router module name."""
+        for token in (".mlp.experts.linear_fc1", ".mlp.experts.linear_fc2"):
+            token_index = module_name.find(token)
+            if token_index != -1:
+                return f"{module_name[:token_index]}.mlp.router"
+        return None
+
+    @classmethod
+    def _build_moe_row_identities(
+        cls,
+        *,
+        module_name: str,
+        call_index: int,
+        trace: dict[str, list[dict[str, Any]]],
+        row_splits: list[int] | None,
+    ) -> list[tuple[int, int, int]] | None:
+        """Builds stable `(expert_id, token_index, topk_slot)` identities for MoE rows."""
+        router_module_name = cls._router_module_name_for_expert_module(module_name)
+        if router_module_name is None:
+            return None
+        router_call = cls._lookup_call_by_index(trace, router_module_name, call_index)
+        if router_call is None:
+            return None
+        router_topk_ids = router_call.get("router_topk_ids")
+        if not isinstance(router_topk_ids, torch.Tensor) or router_topk_ids.ndim != 2:
+            return None
+        token_splits_raw = router_call.get("router_topk_ids__row_splits")
+        if row_splits is None:
+            if isinstance(token_splits_raw, list):
+                row_splits = [
+                    int(v) * int(router_topk_ids.shape[1]) for v in token_splits_raw
+                ]
+            else:
+                row_splits = [int(router_topk_ids.numel())]
+        if isinstance(token_splits_raw, list):
+            token_splits = [int(v) for v in token_splits_raw]
+        else:
+            topk = int(router_topk_ids.shape[1])
+            token_splits = [int(v) // topk for v in row_splits]
+        if len(row_splits) != len(token_splits):
+            return None
+        row_cursor = 0
+        token_cursor = 0
+        identities: list[tuple[int, int, int]] = []
+        for row_count, token_count in zip(row_splits, token_splits):
+            local_ids = router_topk_ids[token_cursor : token_cursor + token_count]
+            token_cursor += token_count
+            local_identities: list[tuple[int, int, int]] = []
+            max_expert = int(local_ids.max().item()) if local_ids.numel() > 0 else -1
+            for expert_id in range(max_expert + 1):
+                expert_rows = (local_ids == expert_id).nonzero(as_tuple=False)
+                for token_offset, slot_index in expert_rows.tolist():
+                    local_identities.append(
+                        (expert_id, token_cursor - token_count + token_offset, slot_index)
+                    )
+            if len(local_identities) != row_count:
+                return None
+            identities.extend(local_identities)
+            row_cursor += row_count
+        if row_cursor != sum(row_splits):
+            return None
+        return identities
+
+    @classmethod
+    def _canonicalize_etp_fc1_feature_layout(
+        cls,
+        *,
+        module_name: str,
+        tensor: torch.Tensor,
+        call: dict[str, Any],
+    ) -> torch.Tensor:
+        """Normalizes expert-TP fc1 feature order to a topology-independent layout."""
+        if ".mlp.experts.linear_fc1" not in module_name or ".lora" in module_name:
+            return tensor
+        if tensor.ndim != 2:
+            return tensor
+        primary_hint = cls._primary_output_merge_hint(call)
+        if not isinstance(primary_hint, dict):
+            return tensor
+        if primary_hint.get("layout") != "gate_up_rank_interleaved":
+            return tensor
+        rank_meta = call.get("rank_meta")
+        etp_world_size = None
+        if isinstance(rank_meta, list) and rank_meta:
+            first_meta = rank_meta[0]
+            if isinstance(first_meta, dict):
+                etp_world_size = first_meta.get("etp_world_size")
+        elif isinstance(rank_meta, dict):
+            etp_world_size = rank_meta.get("etp_world_size")
+        if not isinstance(etp_world_size, int) or etp_world_size <= 1:
+            return tensor
+        block_count = 2 * etp_world_size
+        if tensor.shape[1] % block_count != 0:
+            return tensor
+        blocks = torch.chunk(tensor, block_count, dim=1)
+        reordered = [blocks[index] for index in range(0, block_count, 2)] + [
+            blocks[index] for index in range(1, block_count, 2)
+        ]
+        return torch.cat(reordered, dim=1).contiguous()
+
+    @classmethod
+    def _canonicalize_moe_expert_row_order(
+        cls,
+        *,
+        module_name: str,
+        call_index: int,
+        tensor: torch.Tensor,
+        trace: dict[str, list[dict[str, Any]]],
+        call: dict[str, Any],
+    ) -> torch.Tensor:
+        """Canonicalizes MoE expert-row ordering using router replay identities."""
+        if not cls._is_moe_expert_forward_module(module_name):
+            return tensor
+        if tensor.ndim != 2:
+            return tensor
+        primary_hint = cls._primary_output_merge_hint(call)
+        if isinstance(primary_hint, dict) and (
+            primary_hint.get("op") != "concat" or primary_hint.get("dim") != 0
+        ):
+            return tensor
+        row_splits_raw = call.get("primary_output__row_splits")
+        row_splits = (
+            [int(v) for v in row_splits_raw] if isinstance(row_splits_raw, list) else None
+        )
+        identities = cls._build_moe_row_identities(
+            module_name=module_name,
+            call_index=call_index,
+            trace=trace,
+            row_splits=row_splits,
+        )
+        if identities is None or len(identities) != int(tensor.shape[0]):
+            return tensor
+        order = sorted(range(len(identities)), key=lambda index: identities[index])
+        return tensor[order]
+
+    @classmethod
+    def _canonicalize_primary_output_tensor(
+        cls,
+        *,
+        module_name: str,
+        call_index: int,
+        tensor: torch.Tensor,
+        trace: dict[str, list[dict[str, Any]]],
+        call: dict[str, Any],
+    ) -> torch.Tensor:
+        """Runs all primary-output canonicalization passes for one call tensor."""
+        tensor = cls._canonicalize_etp_fc1_feature_layout(
+            module_name=module_name,
+            tensor=tensor,
+            call=call,
+        )
+        return cls._canonicalize_moe_expert_row_order(
+            module_name=module_name,
+            call_index=call_index,
+            tensor=tensor,
+            trace=trace,
+            call=call,
+        )
+
+    @classmethod
+    def canonicalize_trace(
+        cls,
+        trace: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Canonicalizes topology-dependent trace outputs in place."""
+        for module_name in sorted(trace.keys()):
+            calls = trace[module_name]
+            for call_offset, call in enumerate(calls):
+                if bool(call.get(PRIMARY_OUTPUT_CANONICAL_KEY)):
+                    continue
+                call_index = int(call.get("call_index", call_offset))
+                tensor = call.get("primary_output")
+                if isinstance(tensor, torch.Tensor):
+                    call["primary_output"] = cls._canonicalize_primary_output_tensor(
+                        module_name=module_name,
+                        call_index=call_index,
+                        tensor=tensor,
+                        trace=trace,
+                        call=call,
+                    )
+                call[PRIMARY_OUTPUT_CANONICAL_KEY] = True
+        return trace
+
+    @classmethod
+    def flatten_trace_tensors(
+        cls,
+        trace: dict[str, list[dict[str, Any]]],
+        *,
+        value_key: str,
+    ) -> dict[str, Any]:
+        """Flattens trace calls into deterministic key->value tensor maps."""
+        if value_key == "primary_output":
+            cls.canonicalize_trace(trace)
+        flattened: dict[str, Any] = {}
+        for module_name in sorted(trace.keys()):
+            for call_offset, call in enumerate(trace[module_name]):
+                tensor = call.get(value_key)
+                if tensor is None:
+                    continue
+                call_index = call.get("call_index", call_offset)
+                flattened[f"{module_name}.call_{call_index}"] = tensor
+        return flattened
 
     @classmethod
     def _merge_rank_values(
@@ -478,15 +741,16 @@ class ForwardTraceCapture:
         gathered_traces = self._gather_rank_traces(self.current_step_trace)
         if gathered_traces is None:
             return None
-        merged_trace = self._merge_rank_traces(gathered_traces)
+        merged_trace = self.canonicalize_trace(self._merge_rank_traces(gathered_traces))
         traces_dir.mkdir(parents=True, exist_ok=True)
         trace_path = traces_dir / f"forward_trace_step_{self.current_step_index:03d}.pt"
         torch.save(merged_trace, trace_path)
         return trace_path
 
-    @staticmethod
-    def load_trace(trace_path: Path) -> dict[str, list[dict[str, Any]]]:
-        return torch.load(trace_path, map_location="cpu", weights_only=False)
+    @classmethod
+    def load_trace(cls, trace_path: Path) -> dict[str, list[dict[str, Any]]]:
+        trace = torch.load(trace_path, map_location="cpu", weights_only=False)
+        return cls.canonicalize_trace(trace)
 
     def close(self) -> None:
         for handle in self._hook_handles:
