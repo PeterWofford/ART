@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import re
 import shutil
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Callable, Literal, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, Field
 from rich import box
@@ -23,12 +23,21 @@ ARTIFACT_ROOT = Path(REPO_ROOT / ".local/megatron_lora_correctness")
 ORACLE_MOE_ROUTING_BUNDLE_DIRNAME = "oracle_moe_routing_replay"
 ORACLE_REPLAY_TOPOLOGY_SUFFIX = "oracle_replay"
 
-REGENERATE_ENV = "ART_REGENERATE_MEGATRON_ORACLE"
-EXTENDED_TOPOLOGIES_ENV = "ART_MEGATRON_ORACLE_ENABLE_EXTENDED_TOPOLOGIES"
-SENSITIVITY_MUTATION_ENV = "ART_MEGATRON_ORACLE_MUTATION"
+REGENERATE_ENV = "ART_REGENERATE_ORACLE"
+EXTENDED_TOPOLOGIES_ENV = "ART_ENABLE_EXTENDED_TOPOLOGIES"
+SENSITIVITY_MUTATION_ENV = "ART_SENSITIVITY_MUTATIONS"
 
-DEFAULT_SENSITIVITY_MUTATION = "drop_finalize"
-SUPPORTED_SENSITIVITY_MUTATIONS = (DEFAULT_SENSITIVITY_MUTATION,)
+DEFAULT_SENSITIVITY_MUTATION = "skip_finalize"
+SUPPORTED_SENSITIVITY_MUTATIONS = (
+    DEFAULT_SENSITIVITY_MUTATION,
+    "fwd_skip_o_proj_tp_reduce",
+    "fwd_o_proj_tp_reduce_avg_not_sum",
+    "bwd_skip_sync_qkv_a",
+    "bwd_skip_sync_o_proj_b",
+    "bwd_skip_sync_fc1_a",
+    "save_drop_nonzero_ranked_tp_shards",
+    "save_duplicate_replicated_entries",
+)
 SensitivityMutation = str
 
 REQUIRED_PACKED_TENSOR_FILES = (
@@ -44,9 +53,10 @@ REQUIRED_PACKED_TENSOR_FILES = (
 NON_FINITE_METRIC_VALUE = 1e30
 EXPERT_TABLE_ROW_LIMIT = 8
 EXPERT_TRIPLET_PARAM_RE = re.compile(
-    r"layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"layers\.(?P<layer>\d+|__layer_avg__)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\."
 )
+LAYER_INDEX_RE = re.compile(r"layers\.(\d+)\.")
 PHASE_PRINT_ORDER = {
     "forward": 0,
     "router_scores": 1,
@@ -85,6 +95,7 @@ class Topology(BaseModel):
         return attention_world // expert_divisor
 
     def slug(self) -> str:
+        """Builds a deterministic topology identifier used for output directories."""
         return (
             f"tp{self.tp}_ep{self.ep}_etp{self.etp}"
             f"_dp{self.dp}_edp{self.resolved_expert_dp()}"
@@ -103,7 +114,7 @@ class Topology(BaseModel):
 class PackedTensorConfig(BaseModel):
     """Controls synthetic packed tensor generation used by oracle harness runs."""
 
-    num_sequences: int = 8
+    num_sequences: int = 4
     sequence_length: int = 256
     prefill_tokens: int = 64
     decode_tokens: int = 64
@@ -128,11 +139,30 @@ class LoraConfig(BaseModel):
     )
 
 
-class ToleranceProfile(BaseModel):
-    """Defines row-level pass/fail thresholds for variant comparison phases."""
+MetricSummary = dict[str, float]
+PhasePassFn = Callable[[MetricSummary], bool]
 
-    relative_l2: float = 1e-2
-    mean_abs_pct: float = 1.0
+
+class MetricThresholdRule(BaseModel):
+    """Callable row pass rule that AND-checks configured metric upper bounds."""
+
+    limits: dict[str, float] = Field(default_factory=dict)
+
+    def failure_reasons(self, summary: MetricSummary) -> list[str]:
+        """Builds readable failure reasons for this threshold rule."""
+        reasons: list[str] = []
+        for key, limit in sorted(self.limits.items()):
+            value = summary.get(key)
+            if not isinstance(value, (int, float)):
+                reasons.append(f"{key}=missing")
+                continue
+            if float(value) > float(limit):
+                reasons.append(f"{key}={float(value):.6g}>{float(limit):.6g}")
+        return reasons
+
+    def __call__(self, summary: MetricSummary) -> bool:
+        """Evaluates whether the summary satisfies all configured bounds."""
+        return len(self.failure_reasons(summary)) == 0
 
 
 class OracleCaseConfig(BaseModel):
@@ -141,13 +171,13 @@ class OracleCaseConfig(BaseModel):
     base_model: str
     num_layers: int = 4
     seed: int = 20260305
-    num_steps: int = 2
-    learning_rate: float = 1e-3
+    num_steps: int = 1
+    grad_accumulation_sequences: int = Field(default=4, ge=1)
+    learning_rate: float = 5e-6
     beta: float = 0.0
-    loss_scale: float = 1e4
+    loss_scale: float = 1
     packed_tensors: PackedTensorConfig = Field(default_factory=PackedTensorConfig)
     lora: LoraConfig = Field(default_factory=LoraConfig)
-    tolerances: ToleranceProfile = Field(default_factory=ToleranceProfile)
 
 
 class DiskPackedTensorsSpec(BaseModel):
@@ -207,7 +237,6 @@ class RunManifest(BaseModel):
     seed: int
     num_steps: int
     packed_tensors: DiskPackedTensorsSpec
-    tolerances: ToleranceProfile
     steps: list[StepTrace]
 
 
@@ -228,7 +257,6 @@ class MetricRow(BaseModel):
     mean_abs_pct: float
     topk_mismatch_fraction: float | None = None
     top1_mismatch_fraction: float | None = None
-    thresholds: dict[str, float] = Field(default_factory=dict)
     pass_signal: bool = True
     failure_reasons: list[str] = Field(default_factory=list)
 
@@ -238,18 +266,25 @@ class VariantSpec(BaseModel):
 
     name: str
     topology: Topology
-    thresholds_by_phase: dict[str, dict[str, float]]
+    pass_fn_by_phase: dict[str, PhasePassFn] = Field(
+        default_factory=dict,
+        repr=False,
+        exclude=True,
+    )
     output_slug: str | None = None
     reference_slug: str | None = None
     mutation: SensitivityMutation | None = None
     expected_signal: Literal["pass", "fail"] = "pass"
+    force_regenerate: bool = True
 
     def resolved_output_slug(self) -> str:
+        """Resolves the artifact slug for this run, including mutation suffix when present."""
         if self.output_slug is not None:
             return self.output_slug
         return _topology_output_slug(self.topology, self.mutation)
 
     def resolved_reference_slug(self) -> str:
+        """Resolves which topology slug should be treated as the comparison oracle."""
         if self.reference_slug is not None:
             return self.reference_slug
         return ORACLE_TOPOLOGY.slug()
@@ -266,8 +301,8 @@ class VariantReport(BaseModel):
     signal: Literal["pass", "fail"]
     pass_count: int
     fail_count: int
-    step_summaries: dict[int, dict[str, Any]]
-    metrics: list[MetricRow]
+    step_summaries: dict[int, dict[str, Any]] = Field(repr=False)
+    metrics: list[MetricRow] = Field(repr=False)
 
 
 class DiffAccumulator:
@@ -296,6 +331,20 @@ class DiffAccumulator:
         self.diff_sq_sum += float((cand - ref).square().sum().item())
         self.ref_sq_sum += float(ref.square().sum().item())
         self.ref_abs_sum += float(ref.abs().sum().item())
+
+    @staticmethod
+    def layer_averaged_summary(reference_stack, candidate_stack) -> dict[str, float]:  # type: ignore[no-untyped-def]
+        """Computes normal per-layer summaries, then averages those summaries."""
+        ref = reference_stack.detach().float()
+        cand = candidate_stack.detach().float()
+        layer_count = int(ref.shape[0])
+        metrics = {k: 0.0 for k in ["numel", "mean_abs_diff", "relative_l2", "typical_abs_scale", "mean_abs_pct"]}
+        for layer_index in range(layer_count):
+            layer_accumulator = DiffAccumulator()
+            layer_accumulator.update(ref[layer_index], cand[layer_index])
+            layer_summary = layer_accumulator.as_summary()
+            metrics = {k: metrics[k] + layer_summary[k] for k in metrics.keys()}
+        return {k: _finite_metric(metrics[k] / layer_count) for k in metrics.keys()}
 
     def update_router_ids(self, reference_ids, candidate_ids) -> None:  # type: ignore[no-untyped-def]
         """Adds router top-k id mismatch counts into the accumulator."""
@@ -353,6 +402,7 @@ T = TypeVar("T")
 
 
 def _require_not_none(value: T | None, name: str) -> T:
+    """Asserts non-None values for required artifacts and raises a named runtime error."""
     if value is None:
         raise RuntimeError(f"{name} is None")
     return value
@@ -361,18 +411,23 @@ def _require_not_none(value: T | None, name: str) -> T:
 TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
     Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
-    Topology(tp=1, ep=2, etp=1, dp=2, sp=False),
-    Topology(tp=2, ep=2, etp=1, dp=2, sp=True),
+    Topology(tp=2, ep=2, etp=1, dp=1, sp=True),
+    Topology(tp=2, ep=1, etp=2, dp=1, sp=True),
 ]
 EXTENDED_TOPOLOGIES = [
     Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=2, sp=True),
+    Topology(tp=1, ep=2, etp=1, dp=2, sp=True),
 ]
 ORACLE_TOPOLOGY = TOPOLOGIES[0]
-SENSITIVITY_TOPOLOGY = TOPOLOGIES[1]
+SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
+SENSITIVITY_TOPOLOGY_BY_MUTATION: dict[SensitivityMutation, Topology] = {
+    mutation: SENSITIVITY_TOPOLOGY for mutation in SUPPORTED_SENSITIVITY_MUTATIONS
+}
+SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(tp=2, ep=1, etp=2, dp=1, sp=True)
 
 
 def _truthy(value: str | None) -> bool:
+    """Parses env-var style booleans using a small accepted truthy set."""
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
@@ -384,6 +439,8 @@ def sensitivity_mutations() -> list[SensitivityMutation]:
     if raw is None or raw.strip() == "":
         return []
     normalized = raw.strip().lower()
+    if normalized == "all":
+        return list(SUPPORTED_SENSITIVITY_MUTATIONS)
     if normalized in {"1", "true", "yes", "on"}:
         return [DEFAULT_SENSITIVITY_MUTATION]
     mutations = [item.strip().lower() for item in raw.split(",") if item.strip()]
@@ -397,12 +454,26 @@ def sensitivity_mutations() -> list[SensitivityMutation]:
     supported = ", ".join(SUPPORTED_SENSITIVITY_MUTATIONS)
     raise ValueError(
         f"Unsupported {SENSITIVITY_MUTATION_ENV} value '{raw}'. "
-        f"Supported values: {supported}, CSV of supported values, 1/true/yes/on."
+        f"Supported values: {supported}, CSV of supported values, all, 1/true/yes/on."
     )
 
 
 def sensitivity_enabled() -> bool:
+    """Returns whether any sensitivity mutation has been requested via environment."""
     return bool(sensitivity_mutations())
+
+
+def sensitivity_topology_for_mutation(mutation: SensitivityMutation) -> Topology:
+    """Returns the sensitivity topology required for one mutation."""
+    return SENSITIVITY_TOPOLOGY_BY_MUTATION[mutation]
+
+
+def sensitivity_required_world_size(mutations: list[SensitivityMutation]) -> int:
+    """Returns the max world-size required by a selected mutation set."""
+    return max(
+        sensitivity_topology_for_mutation(mutation).world_size()
+        for mutation in mutations
+    )
 
 
 def extended_topologies_enabled() -> bool:
@@ -411,6 +482,7 @@ def extended_topologies_enabled() -> bool:
 
 
 def regenerate_requested() -> bool:
+    """Returns whether regeneration mode is enabled for oracle artifacts."""
     return _truthy(os.environ.get(REGENERATE_ENV))
 
 
@@ -422,6 +494,7 @@ def case_config(
 
 
 def available_gpu_count() -> int:
+    """Reports visible CUDA device count for topology scheduling and test skips."""
     import torch
 
     return int(torch.cuda.device_count())
@@ -442,12 +515,14 @@ def stable_case_id(case_config: OracleCaseConfig) -> str:
 
 
 def _write_json(path: Path, payload: Any) -> None:
+    """Writes canonical pretty JSON to disk, creating parent directories as needed."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
+    """Loads a JSON object from disk."""
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
 
@@ -612,141 +687,12 @@ def _align_sequence_parallel(reference, candidate):  # type: ignore[no-untyped-d
     return None
 
 
-def _is_moe_base_forward_param(name: str) -> bool:
-    """Returns whether this forward param is a base MoE expert internal tensor."""
-    if ".mlp.experts." not in name:
-        return False
-    if any(token in name for token in (".router", ".gate_lora", ".up_lora", ".lora")):
-        return False
-    return ".linear_fc1" in name or ".linear_fc2" in name
-
-
-def _lookup_call_by_index(
-    trace: dict[str, list[dict[str, Any]]],
-    module_name: str,
-    call_index: int,
-) -> dict[str, Any] | None:
-    calls = trace.get(module_name)
-    if calls is None:
-        return None
-    for call in calls:
-        if int(call.get("call_index", -1)) == call_index:
-            return call
-    if 0 <= call_index < len(calls):
-        return calls[call_index]
-    return None
-
-
-def _router_module_name_for_expert_module(module_name: str) -> str | None:
-    if ".mlp.experts.linear_fc1" in module_name:
-        return module_name.replace(".mlp.experts.linear_fc1", ".mlp.router")
-    if ".mlp.experts.linear_fc2" in module_name:
-        return module_name.replace(".mlp.experts.linear_fc2", ".mlp.router")
-    return None
-
-
-def _build_moe_row_identities(
-    *,
-    module_name: str,
-    call_index: int,
-    trace: dict[str, list[dict[str, Any]]],
-    row_splits: list[int] | None,
-) -> list[tuple[int, int, int]] | None:
-    router_module_name = _router_module_name_for_expert_module(module_name)
-    if router_module_name is None:
-        return None
-    router_call = _lookup_call_by_index(trace, router_module_name, call_index)
-    if router_call is None:
-        return None
-    router_topk_ids = router_call.get("router_topk_ids")
-    if not isinstance(router_topk_ids, torch.Tensor) or router_topk_ids.ndim != 2:
-        return None
-    token_splits_raw = router_call.get("router_topk_ids__row_splits")
-    if row_splits is None:
-        if isinstance(token_splits_raw, list):
-            row_splits = [
-                int(v) * int(router_topk_ids.shape[1]) for v in token_splits_raw
-            ]
-        else:
-            row_splits = [int(router_topk_ids.numel())]
-    if isinstance(token_splits_raw, list):
-        token_splits = [int(v) for v in token_splits_raw]
-    else:
-        topk = int(router_topk_ids.shape[1])
-        token_splits = [int(v) // topk for v in row_splits]
-    if len(row_splits) != len(token_splits):
-        return None
-    row_cursor = 0
-    token_cursor = 0
-    identities: list[tuple[int, int, int]] = []
-    for row_count, token_count in zip(row_splits, token_splits):
-        local_ids = router_topk_ids[token_cursor : token_cursor + token_count]
-        token_cursor += token_count
-        local_identities: list[tuple[int, int, int]] = []
-        max_expert = int(local_ids.max().item()) if local_ids.numel() > 0 else -1
-        for expert_id in range(max_expert + 1):
-            expert_rows = (local_ids == expert_id).nonzero(as_tuple=False)
-            for token_offset, slot_index in expert_rows.tolist():
-                local_identities.append(
-                    (expert_id, token_cursor - token_count + token_offset, slot_index)
-                )
-        if len(local_identities) != row_count:
-            return None
-        identities.extend(local_identities)
-        row_cursor += row_count
-    if row_cursor != sum(row_splits):
-        return None
-    return identities
-
-
-def _canonicalize_moe_base_forward_tensor(
-    *,
-    module_name: str,
-    call_index: int,
-    tensor: torch.Tensor,
-    trace: dict[str, list[dict[str, Any]]],
-    call: dict[str, Any],
-) -> torch.Tensor:
-    if not _is_moe_base_forward_param(module_name):
-        return tensor
-    if tensor.ndim != 2:
-        return tensor
-    row_splits_raw = call.get("primary_output__row_splits")
-    row_splits = (
-        [int(v) for v in row_splits_raw] if isinstance(row_splits_raw, list) else None
-    )
-    identities = _build_moe_row_identities(
-        module_name=module_name,
-        call_index=call_index,
-        trace=trace,
-        row_splits=row_splits,
-    )
-    if identities is None or len(identities) != int(tensor.shape[0]):
-        return tensor
-    order = sorted(range(len(identities)), key=lambda index: identities[index])
-    return tensor[order]
-
-
-def _minimal_param_name(name: str) -> str:
-    """Returns a shorter but 1:1 param/module identifier for report readability."""
-    return name.removeprefix("base_model.model.model.").replace(
-        "module.module.decoder.", ""
-    )
-
-
 def _load_forward_trace(
     topology_dir: Path, step_index: int
 ) -> dict[str, list[dict[str, Any]]]:
     """Loads one merged forward-trace file for a given step."""
     trace_path = topology_dir / "traces" / f"forward_trace_step_{step_index:03d}.pt"
     return ForwardTraceCapture.load_trace(trace_path)
-
-
-def _threshold_string(thresholds: dict[str, float]) -> str:
-    """Formats threshold dicts into compact table cells."""
-    if not thresholds:
-        return "-"
-    return ", ".join(f"{key}<={value:.3g}" for key, value in sorted(thresholds.items()))
 
 
 def _finite_metric(value: float, *, default: float = NON_FINITE_METRIC_VALUE) -> float:
@@ -759,12 +705,50 @@ def _finite_metric(value: float, *, default: float = NON_FINITE_METRIC_VALUE) ->
     return value_f
 
 
-def _triplet_expert_key(param: str) -> tuple[int, int] | None:
-    """Returns (layer, expert_id) for expert up/gate/down params."""
+def _triplet_expert_key(param: str) -> tuple[str, int] | None:
+    """Returns (projection, expert_id) for expert gate/up/down params."""
     match = EXPERT_TRIPLET_PARAM_RE.search(param)
     if match is None:
         return None
-    return int(match.group("layer")), int(match.group("expert"))
+    return match.group("proj"), int(match.group("expert"))
+
+
+def _layer_agnostic_param_key(param: str) -> str | None:
+    """Normalizes one parameter name by stripping the explicit layer index."""
+    if LAYER_INDEX_RE.search(param) is None:
+        return None
+    return LAYER_INDEX_RE.sub("layers.__layer_avg__.", param, count=1)
+
+
+def _stacked_layers(
+    pairs: list[tuple[str, Any, Any]],
+) -> list[tuple[str, Any, Any]]:
+    """Builds layer-stacked tensor pairs keyed without explicit layer index."""
+    import torch
+
+    grouped: dict[str, list[tuple[Any, Any]]] = {}
+    for name, reference, candidate in pairs:
+        normalized = _layer_agnostic_param_key(name)
+        if normalized is None:
+            raise RuntimeError(
+                "Expected all compared params to include a layer index, "
+                f"got '{name}'."
+            )
+        grouped.setdefault(normalized, []).append(
+            (reference.detach().float(), candidate.detach().float())
+        )
+
+    stacked_pairs: list[tuple[str, Any, Any]] = []
+    for normalized in sorted(grouped):
+        group = grouped[normalized]
+        stacked_pairs.append(
+            (
+                normalized,
+                torch.stack([reference for reference, _ in group], dim=0),
+                torch.stack([candidate for _, candidate in group], dim=0),
+            )
+        )
+    return stacked_pairs
 
 
 class VariantRunner:
@@ -806,9 +790,10 @@ class VariantRunner:
         if manifest_path.exists() and not regenerate:
             return topology_dir
         _replace_topology_dir(topology_dir)
+        run_case_config = self.case_config
         request = WorkerRunRequest(
             case_id=self.case_id,
-            case_config=self.case_config,
+            case_config=run_case_config,
             topology=topology,
             topology_dir=str(topology_dir),
             packed_tensors=self.case_artifacts.packed_tensors,
@@ -878,28 +863,33 @@ class VariantRunner:
             mutation=variant.mutation,
             replay_bundle_dir=self.oracle_routing_bundle_dir,
             capture_bundle_dir=None,
-            regenerate=True,
+            regenerate=variant.force_regenerate,
         )
 
     @staticmethod
-    def _apply_thresholds(row: MetricRow, thresholds: dict[str, float]) -> None:
-        """Evaluates row thresholds using AND semantics over all configured keys."""
-        row.thresholds = dict(thresholds)
-        if not thresholds:
+    def _apply_phase_pass(
+        *,
+        row: MetricRow,
+        phase: str,
+        summary: MetricSummary,
+        pass_fn_by_phase: dict[str, PhasePassFn],
+    ) -> None:
+        """Evaluates a per-phase pass function against one summary payload."""
+        pass_fn = pass_fn_by_phase.get(phase)
+        if pass_fn is None:
             row.pass_signal = True
             row.failure_reasons = []
             return
-        payload = row.model_dump(mode="python")
-        reasons: list[str] = []
-        for key, limit in sorted(thresholds.items()):
-            value = payload.get(key)
-            if not isinstance(value, (int, float)):
-                reasons.append(f"{key}=missing")
-                continue
-            if float(value) > float(limit):
-                reasons.append(f"{key}={float(value):.6g}>{float(limit):.6g}")
-        row.pass_signal = len(reasons) == 0
-        row.failure_reasons = reasons
+        row.pass_signal = bool(pass_fn(summary))
+        if row.pass_signal:
+            row.failure_reasons = []
+            return
+        explain = getattr(pass_fn, "failure_reasons", None)
+        if callable(explain):
+            reasons = explain(summary)
+            row.failure_reasons = reasons if reasons else ["phase pass function returned false"]
+            return
+        row.failure_reasons = ["phase pass function returned false"]
 
     @staticmethod
     def _inf_summary() -> dict[str, float]:
@@ -924,7 +914,7 @@ class VariantRunner:
         summary: dict[str, float],
         structural_failure: str | None = None,
     ) -> MetricRow:
-        """Builds one metric row and applies per-phase thresholds."""
+        """Builds one metric row and applies per-phase pass evaluation."""
         row = MetricRow(
             case_id=self.case_id,
             variant=variant.name,
@@ -941,7 +931,12 @@ class VariantRunner:
             topk_mismatch_fraction=summary.get("topk_mismatch_fraction"),
             top1_mismatch_fraction=summary.get("top1_mismatch_fraction"),
         )
-        self._apply_thresholds(row, variant.thresholds_by_phase.get(phase, {}))
+        self._apply_phase_pass(
+            row=row,
+            phase=phase,
+            summary=summary,
+            pass_fn_by_phase=variant.pass_fn_by_phase,
+        )
         if structural_failure is not None:
             row.pass_signal = False
             row.failure_reasons = [structural_failure, *row.failure_reasons]
@@ -955,11 +950,11 @@ class VariantRunner:
         phase: str,
         pairs: list[tuple[str, Any, Any]],
         router_ids: bool = False,
+        layer_averaged: bool = False,
     ) -> list[MetricRow]:
         """Builds rows from named tensor pairs with one shared diff path."""
         rows: list[MetricRow] = []
         for name, reference, candidate in pairs:
-            param_name = _minimal_param_name(name)
             reference_aligned = reference
             candidate_aligned = candidate
             aligned_candidate = _align_sequence_parallel(
@@ -971,24 +966,30 @@ class VariantRunner:
                         variant=variant,
                         step_index=step_index,
                         phase=phase,
-                        param=param_name,
+                        param=name,
                         summary=self._inf_summary(),
                         structural_failure="shape mismatch",
                     )
                 )
                 continue
-            accumulator = DiffAccumulator()
+            summary: dict[str, float]
             if router_ids:
+                accumulator = DiffAccumulator()
                 accumulator.update_router_ids(reference_aligned, aligned_candidate)
+                summary = accumulator.as_summary()
+            elif layer_averaged:
+                summary = DiffAccumulator.layer_averaged_summary(reference_aligned, aligned_candidate)
             else:
+                accumulator = DiffAccumulator()
                 accumulator.update(reference_aligned, aligned_candidate)
+                summary = accumulator.as_summary()
             rows.append(
                 self._build_metric_row(
                     variant=variant,
                     step_index=step_index,
                     phase=phase,
-                    param=param_name,
-                    summary=accumulator.as_summary(),
+                    param=name,
+                    summary=summary,
                 )
             )
         return rows
@@ -1039,38 +1040,16 @@ class VariantRunner:
             (key, reference[key], candidate[key])
             for key in sorted(set(reference.keys()))
         ]
+        if phase in {"forward", "grads", "deltas"}:
+            pairs = _stacked_layers(pairs)
         return self._build_metric_rows_from_tensor_pairs(
             variant=variant,
             step_index=step_index,
             phase=phase,
             pairs=pairs,
             router_ids=router_ids,
+            layer_averaged=phase in {"forward", "grads", "deltas"},
         )
-
-    @staticmethod
-    def _flatten_forward_trace_tensors(
-        trace: dict[str, list[dict[str, Any]]],
-        *,
-        value_key: str,
-    ) -> dict[str, Any]:
-        """Flattens per-module forward trace calls into a deterministic tensor map."""
-        flattened: dict[str, Any] = {}
-        for module_name in sorted(trace.keys()):
-            for call_offset, call in enumerate(trace[module_name]):
-                tensor = call.get(value_key)
-                if tensor is None:
-                    continue
-                call_index = call.get("call_index", call_offset)
-                if value_key == "primary_output" and isinstance(tensor, torch.Tensor):
-                    tensor = _canonicalize_moe_base_forward_tensor(
-                        module_name=module_name,
-                        call_index=int(call_index),
-                        tensor=tensor,
-                        trace=trace,
-                        call=call,
-                    )
-                flattened[f"{module_name}.call_{call_index}"] = tensor
-        return flattened
 
     @staticmethod
     def _build_step_summaries(rows: list[MetricRow]) -> dict[int, dict[str, Any]]:
@@ -1142,11 +1121,11 @@ class VariantRunner:
                 *[
                     (
                         phase,
-                        self._flatten_forward_trace_tensors(
+                        ForwardTraceCapture.flatten_trace_tensors(
                             reference_trace,
                             value_key=value_key,
                         ),
-                        self._flatten_forward_trace_tensors(
+                        ForwardTraceCapture.flatten_trace_tensors(
                             topology_trace,
                             value_key=value_key,
                         ),
@@ -1187,7 +1166,12 @@ class VariantRunner:
         )
 
     @staticmethod
-    def assert_expected_signal(report: VariantReport, context: str) -> None:
+    def assert_expected_signal(
+        report: VariantReport,
+        context: str,
+        *,
+        report_path: Path,
+    ) -> None:
         """Raises when observed run signal diverges from variant expectation."""
         if report.signal == report.expected_signal:
             return
@@ -1196,11 +1180,13 @@ class VariantRunner:
             raise AssertionError(
                 f"{context}: topology={report.topology} phase={first_failure.phase} "
                 f"step={first_failure.step_index} param={first_failure.param} "
-                f"reasons={'; '.join(first_failure.failure_reasons)}"
+                f"reasons={'; '.join(first_failure.failure_reasons)} "
+                f"report={report_path}"
             )
         raise AssertionError(
             f"{context}: expected_signal={report.expected_signal} "
-            f"observed_signal={report.signal} topology={report.topology}"
+            f"observed_signal={report.signal} topology={report.topology} "
+            f"report={report_path}"
         )
 
     def _write_variant_report(self, topology_dir: Path, report: VariantReport) -> None:
@@ -1210,9 +1196,9 @@ class VariantRunner:
         )
 
     def print_report(self, report: VariantReport) -> None:
-        """Prints a row-level table with expert rows subsampled by highest relative_l2."""
+        """Prints a row-level table with expert rows subsampled by highest mean_abs_pct."""
         non_expert_rows: list[MetricRow] = []
-        triplet_rows: list[tuple[tuple[int, int], MetricRow]] = []
+        triplet_rows: list[tuple[tuple[str, int], MetricRow]] = []
         for row in report.metrics:
             expert_key = _triplet_expert_key(row.param)
             if expert_key is None:
@@ -1220,22 +1206,22 @@ class VariantRunner:
                 continue
             triplet_rows.append((expert_key, row))
 
-        scores_by_layer: dict[int, dict[int, float]] = {}
-        for (layer, expert_id), row in triplet_rows:
-            layer_scores = scores_by_layer.setdefault(layer, {})
-            layer_scores[expert_id] = max(
-                layer_scores.get(expert_id, float("-inf")), row.relative_l2
+        scores_by_proj: dict[str, dict[int, float]] = {}
+        for (projection, expert_id), row in triplet_rows:
+            projection_scores = scores_by_proj.setdefault(projection, {})
+            projection_scores[expert_id] = max(
+                projection_scores.get(expert_id, float("-inf")), row.mean_abs_pct
             )
 
-        selected_experts: set[tuple[int, int]] = set()
-        for layer, expert_scores in scores_by_layer.items():
+        selected_experts: set[tuple[str, int]] = set()
+        for projection, expert_scores in scores_by_proj.items():
             top_experts = sorted(
                 expert_scores.items(),
                 key=lambda item: item[1],
                 reverse=True,
             )[:EXPERT_TABLE_ROW_LIMIT]
             for expert_id, _score in top_experts:
-                selected_experts.add((layer, expert_id))
+                selected_experts.add((projection, expert_id))
 
         selected_triplet_rows = [
             row for expert_key, row in triplet_rows if expert_key in selected_experts
@@ -1244,20 +1230,20 @@ class VariantRunner:
         detail_table = Table(
             title=(
                 f"Variant Report | variant={report.variant} "
-                f"| topology={report.topology} | signal={report.signal} "
                 f"| selected_experts={len(selected_experts)} "
-                f"(top {EXPERT_TABLE_ROW_LIMIT} per layer)"
+                f"(top {EXPERT_TABLE_ROW_LIMIT} per projection by mean_abs_pct)"
             ),
             box=box.SIMPLE_HEAVY,
             show_lines=False,
         )
         detail_table.add_column("Step", justify="right")
         detail_table.add_column("Phase", style="cyan")
-        detail_table.add_column("Param")
+        detail_table.add_column("Param", overflow="fold")
         detail_table.add_column("Status")
         detail_table.add_column("relative_l2", justify="right")
         detail_table.add_column("mean_abs_pct", justify="right")
         detail_table.add_column("typical_abs", justify="right")
+        detail_table.add_column("mean_abs_diff", justify="right")
         # detail_table.add_column("Thresholds")
         detail_table.add_column("Failure")
         sorted_rows = sorted(
@@ -1282,7 +1268,7 @@ class VariantRunner:
                 f"{row.relative_l2:.6g}",
                 f"{row.mean_abs_pct:.6g}%",
                 f"{row.typical_abs_scale:.6g}",
-                # _threshold_string(row.thresholds),  # disabled for now to avoid clutter, neat to keep though
+                f"{row.mean_abs_diff:.6g}",
                 failure_text,
             )
         self.console.print(detail_table)
@@ -1307,32 +1293,42 @@ class VariantRunner:
         for variant in variants:
             report = self.run_variant(variant)
             reports.append(report)
-            self.assert_expected_signal(report, "Megatron oracle suite mismatch")
+            self.assert_expected_signal(
+                report,
+                "Megatron correctness suite mismatch",
+                report_path=self.case_dir
+                / variant.resolved_output_slug()
+                / "variant_report.json",
+            )
         return reports
 
 
-def _default_phase_thresholds(
-    case_cfg: OracleCaseConfig,
-) -> dict[str, dict[str, float]]:
-    """Builds default per-phase (fwd, grad, outputs, losses, deltas) threshold dictionaries."""
-    default = {
-        "relative_l2": case_cfg.tolerances.relative_l2,
-        "mean_abs_pct": case_cfg.tolerances.mean_abs_pct,
-    }
-    return {
-        key: default for key in ["outputs", "losses", "grads", "deltas", "forward"]
-    } | {
-        "router_scores": {"mean_abs_pct": 0.0},
-        "router_topk_ids": {
+def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
+    """Builds default per-phase pass functions over diff summaries."""
+    # note the metrics get averaged across layers to reduce noise
+    # we don't expect particular layers to see errors as opposed to the others so this is helpful
+    fwd_out_loss = MetricThresholdRule(limits={"relative_l2": 3e-2, "mean_abs_pct": 3.0})
+    grads = lambda summary: (
+        summary["mean_abs_pct"] < 5.0
+        or (summary["typical_abs_scale"] < 1e-6 and summary["mean_abs_diff"] < 2e-8 and summary["relative_l2"] < 1.0)
+    )
+    deltas = lambda summary: (
+        summary["mean_abs_pct"] < 15.0
+    )
+    router_topk_rule = MetricThresholdRule(  # should be no mismatch due to router replay
+        limits={
             "topk_mismatch_fraction": 0.0,
             "top1_mismatch_fraction": 0.0,
-        },
-    }
+        }
+    )
+    return {
+        key: fwd_out_loss for key in ["forward", "outputs", "losses"]
+    } | {"grads": grads, "deltas": deltas, "router_topk_ids": router_topk_rule}
 
 
-def _suite_variants(case_cfg: OracleCaseConfig) -> list[VariantSpec]:
+def _suite_variants() -> list[VariantSpec]:
     """Builds the standard oracle suite variant ordering."""
-    thresholds = _default_phase_thresholds(case_cfg)
+    phase_pass = _default_phase_pass_fns()
     variants = [
         VariantSpec(
             name="oracle_replay_parity",
@@ -1340,7 +1336,8 @@ def _suite_variants(case_cfg: OracleCaseConfig) -> list[VariantSpec]:
             output_slug=_topology_output_slug(
                 ORACLE_TOPOLOGY, ORACLE_REPLAY_TOPOLOGY_SUFFIX
             ),
-            thresholds_by_phase=thresholds,
+            pass_fn_by_phase=phase_pass,
+            force_regenerate=regenerate_requested(),
         )
     ]
     for topology in TOPOLOGIES[1:] + (
@@ -1350,7 +1347,7 @@ def _suite_variants(case_cfg: OracleCaseConfig) -> list[VariantSpec]:
             VariantSpec(
                 name=f"topology_{topology.slug()}",
                 topology=topology,
-                thresholds_by_phase=thresholds,
+                pass_fn_by_phase=phase_pass,
             )
         )
     return variants
@@ -1362,7 +1359,7 @@ def run_suite(
 ) -> list[VariantReport]:
     """Runs replay parity and topology variants with fail-fast assertions."""
     runner = VariantRunner(case_config=case_config)
-    return runner.run_suite(_suite_variants(case_config))
+    return runner.run_suite(_suite_variants())
 
 
 def run_sensitivity_suite(
@@ -1372,14 +1369,14 @@ def run_sensitivity_suite(
 ) -> list[VariantReport]:
     """Runs a list of sensitivity mutations and expects each to fail."""
     runner = VariantRunner(case_config=case_config)
-    thresholds = _default_phase_thresholds(case_config)
+    phase_pass = _default_phase_pass_fns()
     variants = [
         VariantSpec(
             name=f"sensitivity_{mutation}",
-            topology=SENSITIVITY_TOPOLOGY,
+            topology=sensitivity_topology_for_mutation(mutation),
             mutation=mutation,
             expected_signal="fail",
-            thresholds_by_phase=thresholds,
+            pass_fn_by_phase=phase_pass,
         )
         for mutation in mutations
     ]

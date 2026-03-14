@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+import hashlib
 import os
 from pathlib import Path
 import random
 import subprocess
 import sys
+from types import MethodType
 from typing import Any, Callable
 
 import numpy as np
+import torch
 
 from art.megatron.routing_replay import (
     ParallelTopology as ReplayParallelTopology,
@@ -20,6 +23,7 @@ from art.megatron.routing_replay import (
 
 from .megatron_forward_trace import ForwardTraceCapture
 from .megatron_oracle_harness import (
+    SUPPORTED_SENSITIVITY_MUTATIONS,
     OracleCaseConfig,
     RunManifest,
     SensitivityMutation,
@@ -104,7 +108,9 @@ def _merge_sharded_dicts(shards_by_rank: list[dict[str, Any]]) -> dict[str, Any]
     return full_state
 
 
-def _gather_full_state(local_state: dict[str, Any]) -> dict[str, Any] | None:
+def _gather_full_state(
+    local_state: dict[str, Any],
+) -> dict[str, Any] | None:
     """Gathers local state dicts to rank 0 and merges them."""
     import torch
 
@@ -119,7 +125,9 @@ def _gather_full_state(local_state: dict[str, Any]) -> dict[str, Any] | None:
     return _merge_sharded_dicts(entries)
 
 
-def _collect_lora_state(model_chunks: list[Any]) -> dict[str, Any] | None:
+def _collect_lora_state(
+    model_chunks: list[Any],
+) -> dict[str, Any] | None:
     """Collects full LoRA adapter state for validation and delta computation."""
     local_state: dict[str, Any] = {}
     for chunk in model_chunks:
@@ -163,6 +171,49 @@ def _collect_lora_grads(model_chunks: list[Any]) -> dict[str, Any] | None:
     return _gather_full_state(local_grads)
 
 
+def _apply_save_mutation_to_tensor_map(
+    tensor_map: dict[str, Any],
+    *,
+    mutation: SensitivityMutation | None,
+) -> dict[str, Any]:
+    """Applies save-only mutation transforms to already-collected full tensor maps."""
+    if mutation == "save_drop_nonzero_ranked_tp_shards":
+        mutated: dict[str, Any] = {}
+        for key, value in tensor_map.items():
+            if not isinstance(value, torch.Tensor):
+                mutated[key] = value
+                continue
+            if ".lora_A." in key and value.ndim >= 2 and value.shape[1] > 1:
+                keep = max(1, value.shape[1] // 2)
+                mutated[key] = value.narrow(1, 0, keep).contiguous()
+                continue
+            if ".lora_B." in key and value.ndim >= 2 and value.shape[0] > 1:
+                keep = max(1, value.shape[0] // 2)
+                mutated[key] = value.narrow(0, 0, keep).contiguous()
+                continue
+            mutated[key] = value
+        return mutated
+
+    if mutation == "save_duplicate_replicated_entries":
+        mutated = dict(tensor_map)
+        source_by_bucket: dict[tuple[tuple[int, ...], str], torch.Tensor] = {}
+        for key in sorted(mutated.keys()):
+            value = mutated[key]
+            if not isinstance(value, torch.Tensor):
+                continue
+            if not key.endswith(".weight"):
+                continue
+            bucket = (tuple(value.shape), str(value.dtype))
+            source = source_by_bucket.get(bucket)
+            if source is None:
+                source_by_bucket[bucket] = value
+                continue
+            mutated[key] = source.clone().contiguous()
+        return mutated
+
+    return tensor_map
+
+
 def _validate_loaded_state_matches_adapter(
     loaded_state: dict[str, Any],
     adapter_model: dict[str, Any],
@@ -174,6 +225,29 @@ def _validate_loaded_state_matches_adapter(
         assert torch.equal(loaded_state[key].cpu(), adapter_model[key].cpu()), (
             f"Loaded LoRA state mismatch for key '{key}'"
         )
+
+
+def _build_deterministic_shared_init(
+    initial_state: dict[str, Any],
+    *,
+    seed: int,
+) -> dict[str, Any]:
+    """Builds deterministic nonzero LoRA init values for both A and B tensors."""
+    initialized: dict[str, Any] = {}
+    for key in sorted(initial_state.keys()):
+        value = initial_state[key]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"Expected tensor value for key '{key}', got {type(value)}")
+        digest = hashlib.sha256(f"{seed}:{key}".encode("utf-8")).digest()
+        key_seed = int.from_bytes(digest[:8], "little") % (2**31)
+        generator = torch.Generator(device="cpu").manual_seed(key_seed)
+        random_values = torch.randn(
+            value.shape,
+            generator=generator,
+            dtype=torch.float32,
+        )
+        initialized[key] = (0.01 * random_values).to(dtype=value.dtype).contiguous()
+    return initialized
 
 
 def _configure_provider(
@@ -207,7 +281,8 @@ def _build_optimizer_config(case_config: OracleCaseConfig):
         adam_beta1=0.9,
         adam_beta2=0.99,
         clip_grad=0.1,
-        weight_decay=0.1,
+        weight_decay=0.0,
+        adam_eps=1e-13,
     )
 
 
@@ -252,9 +327,144 @@ def _delta_state(
     }
 
 
+def _iter_named_unique_parameters(
+    model_chunks: list[Any],
+) -> list[tuple[str, torch.nn.Parameter]]:
+    seen: set[int] = set()
+    params: list[tuple[str, torch.nn.Parameter]] = []
+    for chunk_index, chunk in enumerate(model_chunks):
+        for name, param in chunk.named_parameters():
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            params.append((f"chunk{chunk_index}.{name}", param))
+    return params
+
+
+def _matches_grad_sync_skip_mutation(param_name: str, mutation: SensitivityMutation) -> bool:
+    if mutation == "bwd_skip_sync_qkv_a":
+        return any(
+            token in param_name
+            for token in (
+                ".self_attention.linear_qkv.q_proj_lora.A_T",
+                ".self_attention.linear_qkv.k_proj_lora.A_T",
+                ".self_attention.linear_qkv.v_proj_lora.A_T",
+            )
+        )
+    if mutation == "bwd_skip_sync_o_proj_b":
+        return ".self_attention.linear_proj.lora.B_T" in param_name
+    if mutation == "bwd_skip_sync_fc1_a":
+        return (
+            ".mlp.experts.linear_fc1.gate_lora.A_T" in param_name
+            or ".mlp.experts.linear_fc1.up_lora.A_T" in param_name
+        )
+    return False
+
+
+@contextmanager
+def _apply_grad_sync_skip_mutation(
+    model_chunks: list[Any],
+    mutation: SensitivityMutation | None,
+):
+    if mutation not in {
+        "bwd_skip_sync_qkv_a",
+        "bwd_skip_sync_o_proj_b",
+        "bwd_skip_sync_fc1_a",
+    }:
+        yield
+        return
+
+    saved_attrs: list[tuple[Any, str, Any]] = []
+    for param_name, param in _iter_named_unique_parameters(model_chunks):
+        # this only passes lora params atm, so we assume lora params below
+        if not _matches_grad_sync_skip_mutation(param_name, mutation):
+            continue
+        if (
+            mutation == "bwd_skip_sync_fc1_a"
+            and param.grad_sync_domain != "expert_tp"
+        ):
+            continue
+
+        # For fc1 A params, extended finalize handles expert-TP sync via grad_sync_op.
+        saved_attrs.append((param, "grad_sync_op", param.grad_sync_op))
+        param.grad_sync_op = "none"
+
+        # Megatron native TP finalize uses this only for tp_default-domain params.
+        if param.average_gradients_across_tp_domain and param.grad_sync_domain == "tp_default":
+            saved_attrs.append((param, "average_gradients_across_tp_domain", param.average_gradients_across_tp_domain))
+            param.average_gradients_across_tp_domain = False
+    try:
+        yield
+    finally:
+        for param, attr, value in reversed(saved_attrs):
+            setattr(param, attr, value)
+
+
+@contextmanager
+def _apply_o_proj_forward_mutation(
+    model_chunks: list[Any],
+    mutation: SensitivityMutation | None,
+):
+    if mutation not in {
+        "fwd_skip_o_proj_tp_reduce",
+        "fwd_o_proj_tp_reduce_avg_not_sum",
+    }:
+        yield
+        return
+
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.mappings import (
+        reduce_from_tensor_model_parallel_region,
+        reduce_scatter_to_sequence_parallel_region,
+    )
+
+    from art.megatron.lora import SelfAttentionLinearProjLoRA
+
+    original_forwards: list[tuple[Any, Any]] = []
+    for chunk in model_chunks:
+        for module in chunk.modules():
+            if not isinstance(module, SelfAttentionLinearProjLoRA):
+                continue
+            original_forwards.append((module, module.forward))
+
+            def _mutated_forward(self: Any, x: Any):
+                base_output, bias_output = self.linear_proj(x)
+                lora_output = self.lora(x)
+                tp_size = self.provider.tensor_model_parallel_size
+                if tp_size > 1:
+                    if mutation == "fwd_o_proj_tp_reduce_avg_not_sum":
+                        if self.provider.sequence_parallel:
+                            lora_output = reduce_scatter_to_sequence_parallel_region(
+                                lora_output
+                            )
+                        else:
+                            lora_output = reduce_from_tensor_model_parallel_region(
+                                lora_output
+                            )
+                        lora_output = lora_output / tp_size
+                    elif mutation == "fwd_skip_o_proj_tp_reduce":
+                        if self.provider.sequence_parallel:
+                            seq_per_rank = lora_output.shape[0] // tp_size
+                            tp_rank = ps.get_tensor_model_parallel_rank()
+                            lora_output = lora_output.narrow(
+                                0, tp_rank * seq_per_rank, seq_per_rank
+                            )
+                return base_output + lora_output, bias_output
+
+            module.forward = MethodType(_mutated_forward, module)
+
+    try:
+        yield
+    finally:
+        for module, original_forward in reversed(original_forwards):
+            module.forward = original_forward
+
+
 @contextmanager
 def _mutation_hook(
     megatron_train_module: Any,
+    model_chunks: list[Any],
     mutation: SensitivityMutation | None,
     pre_optimizer_step_hook: Callable[[], None] | None = None,
     loss_scale: float = 1.0,
@@ -264,45 +474,54 @@ def _mutation_hook(
     original_optimizer_step = megatron_train_module._optimizer_step
     original_loss_fn = megatron_train_module.loss_fn
 
-    if mutation == "drop_finalize":
-        megatron_train_module._finalize_grads = lambda _model: None
-    elif mutation is not None:
+    known_mutations = {None, *SUPPORTED_SENSITIVITY_MUTATIONS}
+    if mutation not in known_mutations:
         raise ValueError(f"Unsupported mutation: {mutation}")
+
+    if mutation == "skip_finalize":
+        megatron_train_module._finalize_grads = lambda _model: None
 
     if pre_optimizer_step_hook is not None:
 
         def _patched_optimizer_step(optimizer: Any, learning_rate: float):
-            pre_optimizer_step_hook()
+            if pre_optimizer_step_hook is not None:
+                pre_optimizer_step_hook()
             return original_optimizer_step(optimizer, learning_rate)
 
         megatron_train_module._optimizer_step = _patched_optimizer_step
 
-    if loss_scale <= 0:
-        raise ValueError(f"loss_scale must be > 0, got {loss_scale}")
-    if loss_scale != 1.0:
+    effective_loss_scale = loss_scale
+    if effective_loss_scale <= 0:
+        raise ValueError(
+            f"effective_loss_scale must be > 0, got {effective_loss_scale}"
+        )
+    if effective_loss_scale != 1.0:
 
         def _scaled_loss_fn(*args: Any, **kwargs: Any):
             loss = original_loss_fn(*args, **kwargs)
             return loss.model_copy(
                 update={
-                    "mean_policy_loss": loss.mean_policy_loss * loss_scale,
-                    "mean_kl": loss.mean_kl * loss_scale,
-                    "policy_loss_sum": loss.policy_loss_sum * loss_scale,
+                    "mean_policy_loss": loss.mean_policy_loss * effective_loss_scale,
+                    "mean_kl": loss.mean_kl * effective_loss_scale,
+                    "policy_loss_sum": loss.policy_loss_sum * effective_loss_scale,
                 }
             )
 
         megatron_train_module.loss_fn = _scaled_loss_fn
 
     if mutation is None:
-        if pre_optimizer_step_hook is None and loss_scale == 1.0:
+        if pre_optimizer_step_hook is None and effective_loss_scale == 1.0:
             yield
             return
-    try:
-        yield
-    finally:
-        megatron_train_module._finalize_grads = original_finalize
-        megatron_train_module._optimizer_step = original_optimizer_step
-        megatron_train_module.loss_fn = original_loss_fn
+    with ExitStack() as stack:
+        stack.enter_context(_apply_o_proj_forward_mutation(model_chunks, mutation))
+        stack.enter_context(_apply_grad_sync_skip_mutation(model_chunks, mutation))
+        try:
+            yield
+        finally:
+            megatron_train_module._finalize_grads = original_finalize
+            megatron_train_module._optimizer_step = original_optimizer_step
+            megatron_train_module.loss_fn = original_loss_fn
 
 
 def _worker_run(request: WorkerRunRequest) -> None:
@@ -347,8 +566,12 @@ def _worker_run(request: WorkerRunRequest) -> None:
         initial_state = _collect_lora_state(model_chunks)
         if torch.distributed.get_rank() == 0:
             shared_init_path.parent.mkdir(parents=True, exist_ok=True)
-            save_file(
+            deterministic_init = _build_deterministic_shared_init(
                 _require_not_none(initial_state, "initial_state"),
+                seed=request.case_config.seed,
+            )
+            save_file(
+                deterministic_init,
                 str(shared_init_path),
             )
     torch.distributed.barrier()
@@ -373,6 +596,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
         learning_rate=request.case_config.learning_rate,
         beta=request.case_config.beta,
         kl_penalty_coef=0.0,
+        grad_accumulation_sequences=request.case_config.grad_accumulation_sequences,
     )
     experimental_config: dev.TrainConfig = {}
     step_traces: list[StepTrace] = []
@@ -385,26 +609,36 @@ def _worker_run(request: WorkerRunRequest) -> None:
 
     with _mutation_hook(
         megatron_train,
+        model_chunks,
         request.mutation,
         pre_optimizer_step_hook=_capture_lora_grads,
         loss_scale=request.case_config.loss_scale,
     ):
         for step_index in range(request.case_config.num_steps):
             forward_trace_capture.set_step(step_index)
-            sample_index = step_index % request.packed_tensors.num_sequences
-            inputs = megatron_train.select_indexed_inputs(packed_tensors, sample_index)
+            base_sample_index = (
+                step_index * request.case_config.grad_accumulation_sequences
+            )
+            micro_sample_indices = [
+                (base_sample_index + offset) % request.packed_tensors.num_sequences
+                for offset in range(request.case_config.grad_accumulation_sequences)
+            ]
+            micro_inputs = [
+                megatron_train.select_indexed_inputs(packed_tensors, sample_index)
+                for sample_index in micro_sample_indices
+            ]
             captured_grads = None
 
             step_result = megatron_train.run_training_step(
                 model_chunks=model_chunks,
                 optimizer=optimizer,
                 learning_rate=train_config.learning_rate,
-                inputs=inputs,
+                inputs=micro_inputs,
                 config=train_config,
                 experimental_config=experimental_config,
                 ref_logprobs=None,
                 step_index=step_index,
-                sample_index=sample_index,
+                sample_index=micro_sample_indices,
                 moe_routing_replay_controller=runtime.moe_routing_replay_controller,
             )
             forward_trace_capture.save_current_step(traces_dir)
@@ -421,6 +655,14 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     current_lora_state, "current_lora_state"
                 )
                 deltas = _delta_state(initial_state, current_state)
+                saved_deltas = _apply_save_mutation_to_tensor_map(
+                    deltas,
+                    mutation=request.mutation,
+                )
+                saved_current_state = _apply_save_mutation_to_tensor_map(
+                    current_state,
+                    mutation=request.mutation,
+                )
 
                 output_rel = Path("traces") / f"output_step_{step_index:03d}.pt"
                 grads_rel = Path("traces") / f"grads_step_{step_index:03d}.safetensors"
@@ -434,8 +676,8 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     topology_dir / output_rel,
                 )
                 save_file(grads, str(topology_dir / grads_rel))
-                save_file(deltas, str(topology_dir / deltas_rel))
-                save_file(current_state, str(topology_dir / lora_rel))
+                save_file(saved_deltas, str(topology_dir / deltas_rel))
+                save_file(saved_current_state, str(topology_dir / lora_rel))
 
                 # build and append the step trace
                 step_traces.append(
@@ -481,7 +723,6 @@ def _worker_run(request: WorkerRunRequest) -> None:
             seed=request.case_config.seed,
             num_steps=request.case_config.num_steps,
             packed_tensors=request.packed_tensors,
-            tolerances=request.case_config.tolerances,
             steps=step_traces,
         )
         _write_json(topology_dir / "manifest.json", manifest.model_dump(mode="json"))
