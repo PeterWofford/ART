@@ -133,6 +133,7 @@ def _default_optimizer_config() -> OptimizerConfig:
         adam_beta2=0.99,
         clip_grad=0.1,
         weight_decay=0.1,
+        adam_eps=1e-13,
     )
 
 
@@ -336,63 +337,94 @@ def run_training_step(
     model_chunks: list[MegatronModule],
     optimizer: Any,
     learning_rate: float,
-    inputs: PackedTensors,
+    inputs: PackedTensors | list[PackedTensors],
     config: types.TrainConfig,
     experimental_config: dev.TrainConfig,
     ref_logprobs: torch.Tensor | None = None,
     step_index: int | None = None,
-    sample_index: int | None = None,
+    sample_index: int | list[int] | None = None,
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
 ) -> TrainStepResult:
+    micro_inputs = inputs if isinstance(inputs, list) else [inputs]
+    if not micro_inputs:
+        raise ValueError("run_training_step requires at least one packed sequence")
+
+    if isinstance(sample_index, list):
+        if len(sample_index) != len(micro_inputs):
+            raise ValueError(
+                "sample_index list length must match number of micro inputs: "
+                f"{len(sample_index)} != {len(micro_inputs)}"
+            )
+        micro_sample_indices = sample_index
+    elif sample_index is None:
+        micro_sample_indices = [0] * len(micro_inputs)
+    else:
+        micro_sample_indices = [sample_index] * len(micro_inputs)
+
     if moe_routing_replay_controller is not None:
-        assert step_index is not None and sample_index is not None
+        assert step_index is not None
         moe_routing_replay_controller.set_step(
             step_index=step_index,
-            sample_index=sample_index,
+            sample_index=micro_sample_indices[0],
         )
 
     device = next(model_chunks[0].parameters()).device
-    _move_inputs_to_device(inputs, device)
-
-    attention_state = create_shared_prefix_attention_state(
-        group_ids=inputs["group_ids"],
-        parent_ids=inputs["parent_ids"],
-    )
-    attention_mask = torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device)
 
     for chunk in model_chunks:
         chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
 
-    new_logprobs: torch.Tensor = -model_chunks[0](
-        input_ids=inputs["tokens"],
-        position_ids=inputs["input_pos"],
-        attention_mask=attention_mask,
-        labels=shift_tensor(inputs["tokens"], 0),
-        extra_block_kwargs={"attention_bias": attention_state},
-    )
+    micro_count = len(micro_inputs)
+    loss_sum: torch.Tensor | None = None
+    probs_corr_sum = 0.0
+    new_logprobs: torch.Tensor | None = None
 
-    loss_info = loss_fn(
-        inputs,  # ty: ignore[invalid-argument-type]
-        new_logprobs,
-        ref_logprobs,
-        None,
-        experimental_config,
-    )
-    loss = loss_info.mean_policy_loss + config.beta * loss_info.mean_kl
-    loss.backward()
+    for micro in micro_inputs:
+        _move_inputs_to_device(micro, device)
+        attention_state = create_shared_prefix_attention_state(
+            group_ids=micro["group_ids"],
+            parent_ids=micro["parent_ids"],
+        )
+        attention_mask = torch.zeros((1, 1, 1, 1), dtype=torch.bool, device=device)
+
+        new_logprobs = -model_chunks[0](
+            input_ids=micro["tokens"],
+            position_ids=micro["input_pos"],
+            attention_mask=attention_mask,
+            labels=shift_tensor(micro["tokens"], 0),
+            extra_block_kwargs={"attention_bias": attention_state},
+        )
+
+        loss_info = loss_fn(
+            micro,  # ty: ignore[invalid-argument-type]
+            new_logprobs,
+            ref_logprobs,
+            None,
+            experimental_config,
+        )
+        micro_loss = loss_info.mean_policy_loss + config.beta * loss_info.mean_kl
+        (micro_loss / micro_count).backward()
+        probs_corr_sum += float(loss_info.probs_corr.item())
+        if loss_sum is None:
+            loss_sum = micro_loss.detach()
+        else:
+            loss_sum = loss_sum + micro_loss.detach()
+
+    if new_logprobs is None or loss_sum is None:
+        raise RuntimeError("run_training_step did not produce outputs")
+
     _finalize_grads(model_chunks)
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
     )
-    reduced_loss = _reduce_loss(loss)
+    reduced_loss = _reduce_loss(loss_sum / micro_count)
 
     if moe_routing_replay_controller is not None:
         moe_routing_replay_controller.finalize_step()
 
     return TrainStepResult(
         reduced_loss=reduced_loss,
-        probs_corr=float(loss_info.probs_corr.item()),
+        probs_corr=probs_corr_sum / micro_count,
         new_logprobs=new_logprobs,
         update_successful=update_successful,
         grad_norm=grad_norm,
@@ -475,18 +507,25 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         repeat = math.ceil(num_indices / len(indices))
         indices = (indices * repeat)[:num_indices]
 
-        for step_index, index in enumerate(indices):
-            inputs = select_indexed_inputs(packed_tensors, index)
+        grad_accumulation_sequences = max(1, int(config.grad_accumulation_sequences))
+        for step_index, start in enumerate(
+            range(0, len(indices), grad_accumulation_sequences)
+        ):
+            micro_indices = indices[start : start + grad_accumulation_sequences]
+            micro_inputs = [
+                select_indexed_inputs(packed_tensors, sample_index)
+                for sample_index in micro_indices
+            ]
             step_result = run_training_step(
                 model_chunks=runtime.model,
                 optimizer=runtime.optimizer,
                 learning_rate=config.learning_rate,
-                inputs=inputs,
+                inputs=micro_inputs,
                 config=config,
                 experimental_config=experimental_config,
                 ref_logprobs=None,
                 step_index=step_index,
-                sample_index=index,
+                sample_index=micro_indices,
                 moe_routing_replay_controller=runtime.moe_routing_replay_controller,
             )
             print0(
@@ -535,8 +574,8 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
 
         del packed_tensors
         del adapter_model
-        if "inputs" in locals():
-            del inputs
+        if "micro_inputs" in locals():
+            del micro_inputs
         gc.collect()
         torch.cuda.empty_cache()
 

@@ -696,7 +696,10 @@ class LocalBackend(Backend):
         )
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
         results: list[dict[str, float]] = []
-        estimated_gradient_steps = disk_packed_tensors["num_sequences"]
+        grad_accumulation_sequences = max(1, int(config.grad_accumulation_sequences))
+        estimated_gradient_steps = math.ceil(
+            disk_packed_tensors["num_sequences"] / grad_accumulation_sequences
+        )
         pbar = tqdm.tqdm(total=estimated_gradient_steps, desc="train")
         async for result in service.train(
             disk_packed_tensors, config, dev_config, verbose
