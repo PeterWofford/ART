@@ -291,6 +291,7 @@ def collect_sharded_lora_state(
     return sharded_state_dict, sharded_state_manifest
 
 
+@torch.no_grad()
 def select_indexed_inputs(packed_tensors: PackedTensors, index: int) -> PackedTensors:
     return PackedTensors(  # type: ignore[call-arg]
         **{
@@ -301,6 +302,76 @@ def select_indexed_inputs(packed_tensors: PackedTensors, index: int) -> PackedTe
         pixel_values=[None],
         image_grid_thw=[None],
     )
+
+
+@torch.no_grad()
+def _clone_packed_tensors(inputs: PackedTensors) -> PackedTensors:
+    return PackedTensors(  # type: ignore[call-arg]
+        **{
+            key: value.clone()
+            for key, value in inputs.items()
+            if isinstance(value, torch.Tensor)
+        },
+        pixel_values=[None],
+        image_grid_thw=[None],
+    )
+
+
+@torch.no_grad()
+def _zero_contribution_inputs(template: PackedTensors) -> PackedTensors:
+    dummy = _clone_packed_tensors(template)
+    dummy["assistant_mask"].zero_()
+    return dummy
+
+
+def resolve_local_grad_accumulation_sequences(
+    global_grad_accumulation_sequences: int,
+) -> int:
+    dp_world_size = ps.get_data_parallel_world_size(with_context_parallel=True)
+    if (
+        global_grad_accumulation_sequences <= 0
+        or global_grad_accumulation_sequences % dp_world_size != 0
+    ):
+        raise RuntimeError(
+            "Invalid global grad accumulation / DP world size combination: "
+            f"global_grad_accumulation_sequences={global_grad_accumulation_sequences}, "
+            f"dp_world_size={dp_world_size}"
+        )
+    return global_grad_accumulation_sequences // dp_world_size
+
+
+def build_micro_sample_indices(
+    step_index: int,
+    num_sequences: int,
+    global_grad_accumulation_sequences: int,
+) -> list[int | None]:
+    dp_rank = ps.get_data_parallel_rank(with_context_parallel=True)
+    local_grad_accumulation_sequences = resolve_local_grad_accumulation_sequences(
+        global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+    )
+    base_global_sample_index = step_index * global_grad_accumulation_sequences
+    global_step_indices: list[int | None] = []
+    for offset in range(global_grad_accumulation_sequences):
+        global_sample_index = base_global_sample_index + offset
+        global_step_indices.append(
+            global_sample_index if global_sample_index < num_sequences else None
+        )
+    rank_start = dp_rank * local_grad_accumulation_sequences
+    rank_end = rank_start + local_grad_accumulation_sequences
+    return global_step_indices[rank_start:rank_end]
+
+
+def select_micro_inputs(
+    packed_tensors: PackedTensors,
+    sample_indices: list[int | None],
+    zero_template: PackedTensors,
+) -> list[PackedTensors]:
+    return [
+        _clone_packed_tensors(zero_template)
+        if sample_index is None
+        else select_indexed_inputs(packed_tensors, sample_index)
+        for sample_index in sample_indices
+    ]
 
 
 def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
@@ -332,6 +403,46 @@ def _reduce_loss(loss: torch.Tensor) -> torch.Tensor:
     return reduced_loss
 
 
+def _count_trainable_tokens(inputs: PackedTensors) -> float:
+    assistant_mask = shift_tensor(inputs["assistant_mask"], False)
+    return float(assistant_mask.sum().item())
+
+
+def _global_token_normalization_scale(
+    micro_inputs: list[PackedTensors],
+    device: torch.device,
+) -> float:
+    """
+    Data parallel grad normalization scale
+    dp_world_size / global_micro_batch_token_count, where dp_world_size cancels out
+    the dp grad averaging, since we divide by global rather than local token count.
+    Using reduction="sum" and dividing by global token count means each rank is normalized
+    correctly.
+    """
+    local_token_total = sum(_count_trainable_tokens(micro) for micro in micro_inputs)
+    dp_world_size = 1
+    global_token_total = local_token_total
+
+    dp_world_size = ps.get_data_parallel_world_size(with_context_parallel=True)
+    if dp_world_size > 1:
+        dp_group = ps.get_data_parallel_group(with_context_parallel=True)
+
+        global_token_tensor = torch.tensor(
+            [local_token_total], device=device, dtype=torch.float32
+        )
+        torch.distributed.all_reduce(
+            global_token_tensor,
+            op=torch.distributed.ReduceOp.SUM,
+            group=dp_group,
+        )
+        global_token_total = float(global_token_tensor.item())
+
+    if global_token_total <= 0.0:
+        return 0.0
+
+    return float(dp_world_size) / global_token_total
+
+
 def run_training_step(
     *,
     model_chunks: list[MegatronModule],
@@ -340,9 +451,9 @@ def run_training_step(
     inputs: PackedTensors | list[PackedTensors],
     config: types.TrainConfig,
     experimental_config: dev.TrainConfig,
+    step_index: int,
+    sample_index: int | list[int | None],
     ref_logprobs: torch.Tensor | None = None,
-    step_index: int | None = None,
-    sample_index: int | list[int] | None = None,
     moe_routing_replay_controller: MoeRoutingReplayController | None = None,
 ) -> TrainStepResult:
     micro_inputs = inputs if isinstance(inputs, list) else [inputs]
@@ -356,16 +467,18 @@ def run_training_step(
                 f"{len(sample_index)} != {len(micro_inputs)}"
             )
         micro_sample_indices = sample_index
-    elif sample_index is None:
-        micro_sample_indices = [0] * len(micro_inputs)
     else:
-        micro_sample_indices = [sample_index] * len(micro_inputs)
+        assert len(micro_inputs) == 1
+        micro_sample_indices = [sample_index]
 
     if moe_routing_replay_controller is not None:
-        assert step_index is not None
+        step_sample_index = next(
+            (index for index in micro_sample_indices if index is not None),
+            0,
+        )
         moe_routing_replay_controller.set_step(
             step_index=step_index,
-            sample_index=micro_sample_indices[0],
+            sample_index=step_sample_index,
         )
 
     device = next(model_chunks[0].parameters()).device
@@ -374,7 +487,8 @@ def run_training_step(
         chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
 
     micro_count = len(micro_inputs)
-    loss_sum: torch.Tensor | None = None
+    normalization_scale = _global_token_normalization_scale(micro_inputs, device=device)
+    normalized_loss: torch.Tensor | None = None
     probs_corr_sum = 0.0
     new_logprobs: torch.Tensor | None = None
 
@@ -400,16 +514,20 @@ def run_training_step(
             ref_logprobs,
             None,
             experimental_config,
+            reduction="sum",
         )
-        micro_loss = loss_info.mean_policy_loss + config.beta * loss_info.mean_kl
-        (micro_loss / micro_count).backward()
+        micro_loss = (
+            loss_info.mean_policy_loss + config.beta * loss_info.mean_kl
+        ) * normalization_scale
+        micro_loss.backward()
         probs_corr_sum += float(loss_info.probs_corr.item())
-        if loss_sum is None:
-            loss_sum = micro_loss.detach()
+        detached_micro_loss = micro_loss.detach()
+        if normalized_loss is None:
+            normalized_loss = detached_micro_loss
         else:
-            loss_sum = loss_sum + micro_loss.detach()
+            normalized_loss = normalized_loss + detached_micro_loss
 
-    if new_logprobs is None or loss_sum is None:
+    if new_logprobs is None or normalized_loss is None:
         raise RuntimeError("run_training_step did not produce outputs")
 
     _finalize_grads(model_chunks)
@@ -417,7 +535,7 @@ def run_training_step(
         optimizer,
         learning_rate,
     )
-    reduced_loss = _reduce_loss(loss_sum / micro_count)
+    reduced_loss = _reduce_loss(normalized_loss)
 
     if moe_routing_replay_controller is not None:
         moe_routing_replay_controller.finalize_step()
@@ -496,26 +614,20 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             runtime.rank, "Loading packed tensors from", job.disk_packed_tensors["dir"]
         )
         packed_tensors = packed_tensors_from_dir(**job.disk_packed_tensors)
+        template = select_indexed_inputs(packed_tensors, 0)
+        zero_template = _zero_contribution_inputs(template)
         num_sequences = job.disk_packed_tensors["num_sequences"]
-
-        dp_rank = ps.get_data_parallel_rank()
-        dp_world_size = ps.get_data_parallel_world_size()
-        num_indices = math.ceil(num_sequences / dp_world_size)
-        indices = list(range(dp_rank, num_sequences, dp_world_size))
-        if not indices:
-            indices = [dp_rank % num_sequences]
-        repeat = math.ceil(num_indices / len(indices))
-        indices = (indices * repeat)[:num_indices]
-
-        grad_accumulation_sequences = max(1, int(config.grad_accumulation_sequences))
-        for step_index, start in enumerate(
-            range(0, len(indices), grad_accumulation_sequences)
-        ):
-            micro_indices = indices[start : start + grad_accumulation_sequences]
-            micro_inputs = [
-                select_indexed_inputs(packed_tensors, sample_index)
-                for sample_index in micro_indices
-            ]
+        global_grad_accumulation_sequences = config.grad_accumulation_sequences
+        num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
+        for step_index in range(num_steps):
+            micro_indices = build_micro_sample_indices(
+                step_index=step_index,
+                num_sequences=num_sequences,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
+            )
+            micro_inputs = select_micro_inputs(
+                packed_tensors, micro_indices, zero_template
+            )
             step_result = run_training_step(
                 model_chunks=runtime.model,
                 optimizer=runtime.optimizer,

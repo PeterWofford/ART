@@ -400,7 +400,11 @@ class ForwardTraceCapture:
                 expert_rows = (local_ids == expert_id).nonzero(as_tuple=False)
                 for token_offset, slot_index in expert_rows.tolist():
                     local_identities.append(
-                        (expert_id, token_cursor - token_count + token_offset, slot_index)
+                        (
+                            expert_id,
+                            token_cursor - token_count + token_offset,
+                            slot_index,
+                        )
                     )
             if len(local_identities) != row_count:
                 return None
@@ -469,7 +473,9 @@ class ForwardTraceCapture:
             return tensor
         row_splits_raw = call.get("primary_output__row_splits")
         row_splits = (
-            [int(v) for v in row_splits_raw] if isinstance(row_splits_raw, list) else None
+            [int(v) for v in row_splits_raw]
+            if isinstance(row_splits_raw, list)
+            else None
         )
         identities = cls._build_moe_row_identities(
             module_name=module_name,
@@ -572,11 +578,6 @@ class ForwardTraceCapture:
                 and cls._can_cat_along_dim(tensors, dim=preferred_cat_dim)
             ):
                 return torch.cat(tensors, dim=preferred_cat_dim)
-            if all(
-                tensors[0].shape == tensor.shape and torch.equal(tensors[0], tensor)
-                for tensor in tensors[1:]
-            ):
-                return tensors[0]
             if all(tensor.ndim > 0 for tensor in tensors):
                 if cls._can_cat_along_dim(tensors, dim=0):
                     return torch.cat(tensors, dim=0)
@@ -622,7 +623,7 @@ class ForwardTraceCapture:
             )
         if all(value == values_by_rank[0] for value in values_by_rank[1:]):
             return values_by_rank[0]
-        return values_by_rank[0]
+        return values_by_rank
 
     @classmethod
     def _merge_rank_call_entries(

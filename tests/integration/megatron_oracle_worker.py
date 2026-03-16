@@ -475,6 +475,7 @@ def _mutation_hook(
     megatron_train_module: Any,
     model_chunks: list[Any],
     mutation: SensitivityMutation | None,
+    topology: Topology,
     pre_optimizer_step_hook: Callable[[], None] | None = None,
     loss_scale: float = 1.0,
 ):
@@ -482,6 +483,9 @@ def _mutation_hook(
     original_finalize = megatron_train_module._finalize_grads
     original_optimizer_step = megatron_train_module._optimizer_step
     original_loss_fn = megatron_train_module.loss_fn
+    original_token_normalization_scale = (
+        megatron_train_module._global_token_normalization_scale
+    )
 
     known_mutations = {None, *SUPPORTED_SENSITIVITY_MUTATIONS}
     if mutation not in known_mutations:
@@ -489,6 +493,46 @@ def _mutation_hook(
 
     if mutation == "skip_finalize":
         megatron_train_module._finalize_grads = lambda _model: None
+
+    if mutation == "dp_local_token_normalization":
+
+        def _wrong_local_token_normalization_scale(
+            micro_inputs: list[Any],
+            device: torch.device,
+        ) -> float:
+            del device
+            local_token_total = sum(
+                megatron_train_module._count_trainable_tokens(micro)
+                for micro in micro_inputs
+            )
+            if local_token_total <= 0.0:
+                return 0.0
+            # Intentionally wrong normalization: use only local token total.
+            dp_world_size = int(
+                megatron_train_module.ps.get_data_parallel_world_size(
+                    with_context_parallel=True
+                )
+            )
+            return float(dp_world_size) / float(local_token_total)
+
+        megatron_train_module._global_token_normalization_scale = (
+            _wrong_local_token_normalization_scale
+        )
+
+    if mutation == "dp_grad_accumulation_seqs":
+
+        def _wrong_resolve_local_grad_accumulation_sequences(
+            global_grad_accumulation_sequences: int,
+        ) -> int:
+            return megatron_train_module.resolve_local_grad_accumulation_sequences(
+                global_grad_accumulation_sequences=(
+                    topology.dp * global_grad_accumulation_sequences
+                )
+            )
+
+        megatron_train_module.resolve_local_grad_accumulation_sequences = (
+            _wrong_resolve_local_grad_accumulation_sequences
+        )
 
     if pre_optimizer_step_hook is not None:
 
@@ -531,6 +575,9 @@ def _mutation_hook(
             megatron_train_module._finalize_grads = original_finalize
             megatron_train_module._optimizer_step = original_optimizer_step
             megatron_train_module.loss_fn = original_loss_fn
+            megatron_train_module._global_token_normalization_scale = (
+                original_token_normalization_scale
+            )
 
 
 def _worker_run(request: WorkerRunRequest) -> None:
@@ -599,13 +646,16 @@ def _worker_run(request: WorkerRunRequest) -> None:
     packed_tensors = packed_tensors_from_dir(
         **request.packed_tensors.model_dump(exclude_none=True)
     )
+    template = megatron_train.select_indexed_inputs(packed_tensors, 0)
+    zero_template = megatron_train._zero_contribution_inputs(template)
     initial_lora_state = loaded_state
+    global_grad_accumulation_sequences = request.case_config.grad_accumulation_sequences
 
     train_config = types.TrainConfig(
         learning_rate=request.case_config.learning_rate,
         beta=request.case_config.beta,
         kl_penalty_coef=0.0,
-        grad_accumulation_sequences=request.case_config.grad_accumulation_sequences,
+        grad_accumulation_sequences=global_grad_accumulation_sequences,
     )
     experimental_config: dev.TrainConfig = {}
     step_traces: list[StepTrace] = []
@@ -620,22 +670,20 @@ def _worker_run(request: WorkerRunRequest) -> None:
         megatron_train,
         model_chunks,
         request.mutation,
+        request.topology,
         pre_optimizer_step_hook=_capture_lora_grads,
         loss_scale=request.case_config.loss_scale,
     ):
         for step_index in range(request.case_config.num_steps):
             forward_trace_capture.set_step(step_index)
-            base_sample_index = (
-                step_index * request.case_config.grad_accumulation_sequences
+            micro_sample_indices = megatron_train.build_micro_sample_indices(
+                step_index=step_index,
+                num_sequences=request.packed_tensors.num_sequences,
+                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             )
-            micro_sample_indices = [
-                (base_sample_index + offset) % request.packed_tensors.num_sequences
-                for offset in range(request.case_config.grad_accumulation_sequences)
-            ]
-            micro_inputs = [
-                megatron_train.select_indexed_inputs(packed_tensors, sample_index)
-                for sample_index in micro_sample_indices
-            ]
+            micro_inputs = megatron_train.select_micro_inputs(
+                packed_tensors, micro_sample_indices, zero_template
+            )
             captured_grads = None
 
             step_result = megatron_train.run_training_step(

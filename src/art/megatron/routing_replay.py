@@ -507,6 +507,7 @@ class MoeRoutingReplayController:
         self._active_sample_index: int | None = None
         self._active_step_routes: StepRoutes | None = None
         self._router_call_cursors: dict[str, int] = {}
+        self._router_call_limits: dict[str, int] = {}
         self._global_uid_to_row_index: dict[int, int] = {}
         self._local_router_keys: set[str] = set()
 
@@ -600,6 +601,8 @@ class MoeRoutingReplayController:
         self._local_router_keys.clear()
 
     def set_step(self, *, step_index: int, sample_index: int) -> None:
+        from megatron.core import parallel_state as ps
+
         if step_index not in self.bundle.steps:
             raise RuntimeError(
                 f"Replay bundle missing step_index={step_index}. "
@@ -615,9 +618,26 @@ class MoeRoutingReplayController:
                     "Replay bundle step is missing local router key: "
                     f"step={step_index}, router='{local_router_key}'"
                 )
-        self._router_call_cursors = {
-            router_key: 0 for router_key in sorted(self._local_router_keys)
-        }
+        dp_world_size = int(ps.get_data_parallel_world_size(with_context_parallel=True))
+        dp_rank = int(ps.get_data_parallel_rank(with_context_parallel=True))
+        self._router_call_cursors = {}
+        self._router_call_limits = {}
+        for router_key in sorted(self._local_router_keys):
+            total_calls = len(step_routes.routers[router_key].calls)
+            call_start = 0
+            call_limit = total_calls
+            if dp_world_size > 1:
+                if total_calls % dp_world_size != 0:
+                    raise RuntimeError(
+                        "Replay router call count is not divisible by DP world size: "
+                        f"step={step_index}, router='{router_key}', "
+                        f"calls={total_calls}, dp_world_size={dp_world_size}"
+                    )
+                calls_per_dp_rank = total_calls // dp_world_size
+                call_start = dp_rank * calls_per_dp_rank
+                call_limit = call_start + calls_per_dp_rank
+            self._router_call_cursors[router_key] = call_start
+            self._router_call_limits[router_key] = call_limit
         self._global_uid_to_row_index = {
             int(uid.item()): row_index
             for row_index, uid in enumerate(step_routes.global_token_uids)
@@ -627,9 +647,13 @@ class MoeRoutingReplayController:
         if self._active_step_routes is None:
             raise RuntimeError("finalize_step called before set_step")
         for router_key in sorted(self._local_router_keys):
-            router_routes = self._active_step_routes.routers[router_key]
             consumed = self._router_call_cursors.get(router_key, 0)
-            expected = len(router_routes.calls)
+            expected = self._router_call_limits.get(router_key)
+            if expected is None:
+                raise RuntimeError(
+                    "Routing replay call limits missing for router key: "
+                    f"step={self._active_step_index}, router='{router_key}'"
+                )
             if consumed != expected:
                 raise RuntimeError(
                     "Routing replay step consumption mismatch: "
@@ -640,6 +664,7 @@ class MoeRoutingReplayController:
         self._active_sample_index = None
         self._active_step_routes = None
         self._router_call_cursors = {}
+        self._router_call_limits = {}
         self._global_uid_to_row_index = {}
 
     def get_route_for_router(
@@ -652,7 +677,14 @@ class MoeRoutingReplayController:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         step_routes = self._active_step_routes
         call_index = self._router_call_cursors.get(router_key, 0)
+        call_limit = self._router_call_limits.get(router_key)
         router_calls = step_routes.routers[router_key].calls
+        if call_limit is not None and call_index >= call_limit:
+            raise RuntimeError(
+                "Routing replay call cursor exceeded local call range: "
+                f"step={self._active_step_index}, router='{router_key}', "
+                f"call_index={call_index}, limit={call_limit}"
+            )
         route = router_calls[call_index]
         self._router_call_cursors[router_key] = call_index + 1
 

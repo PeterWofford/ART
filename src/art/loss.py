@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict
 import torch
@@ -27,6 +27,7 @@ def loss_fn(
     ref_logprobs: torch.Tensor | None,
     entropies: torch.Tensor | None,
     experimental_config: dev.TrainConfig,
+    reduction: Literal["mean", "sum"] = "mean",
 ) -> Loss:
     old_logprobs = shift_tensor(inputs["logprobs"], float("nan"))
     advantages = shift_tensor(inputs["advantages"], 0.0)
@@ -132,14 +133,15 @@ def loss_fn(
         kl_div = torch.zeros_like(policy_loss)
     policy_loss = policy_loss * weights * assistant_mask
     kl_div = kl_div * weights * assistant_mask
-    mean_policy_loss = policy_loss.sum() / (assistant_mask.sum() + 1e-6)
-    mean_kl = kl_div.sum() / (assistant_mask.sum() + 1e-6)
+    denominator = assistant_mask.sum() + 1e-6 if reduction == "mean" else 1.0
+    mean_policy_loss = policy_loss.sum() / denominator
+    mean_kl = kl_div.sum() / denominator
     # Compute mean entropy for the current step
     if entropies is not None:
         shifted_entropies = shift_tensor(entropies, 0.0)
-        mean_entropy = (shifted_entropies * weights * assistant_mask).sum() / (
-            assistant_mask.sum() + 1e-6
-        )
+        mean_entropy = (
+            shifted_entropies * weights * assistant_mask
+        ).sum() / denominator
     else:
         mean_entropy = None
     return Loss(

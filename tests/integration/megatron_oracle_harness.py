@@ -37,6 +37,8 @@ SUPPORTED_SENSITIVITY_MUTATIONS = (
     "bwd_skip_sync_fc1_a",
     "save_drop_nonzero_ranked_tp_shards",
     "save_duplicate_replicated_entries",
+    "dp_grad_accumulation_seqs",
+    "dp_local_token_normalization",
 )
 SensitivityMutation = str
 
@@ -118,6 +120,7 @@ class PackedTensorConfig(BaseModel):
     sequence_length: int = 256
     prefill_tokens: int = 64
     decode_tokens: int = 64
+    decode_tokens_jitter: int = Field(default=32, ge=0)
     vocab_high: int = 8192
 
 
@@ -170,7 +173,7 @@ class OracleCaseConfig(BaseModel):
 
     base_model: str
     num_layers: int = 4
-    seed: int = 20260305
+    seed: int = 20260304
     num_steps: int = 1
     grad_accumulation_sequences: int = Field(default=4, ge=1)
     learning_rate: float = 5e-6
@@ -338,7 +341,16 @@ class DiffAccumulator:
         ref = reference_stack.detach().float()
         cand = candidate_stack.detach().float()
         layer_count = int(ref.shape[0])
-        metrics = {k: 0.0 for k in ["numel", "mean_abs_diff", "relative_l2", "typical_abs_scale", "mean_abs_pct"]}
+        metrics = {
+            k: 0.0
+            for k in [
+                "numel",
+                "mean_abs_diff",
+                "relative_l2",
+                "typical_abs_scale",
+                "mean_abs_pct",
+            ]
+        }
         for layer_index in range(layer_count):
             layer_accumulator = DiffAccumulator()
             layer_accumulator.update(ref[layer_index], cand[layer_index])
@@ -423,7 +435,13 @@ SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
 SENSITIVITY_TOPOLOGY_BY_MUTATION: dict[SensitivityMutation, Topology] = {
     mutation: SENSITIVITY_TOPOLOGY for mutation in SUPPORTED_SENSITIVITY_MUTATIONS
 }
-SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(tp=2, ep=1, etp=2, dp=1, sp=True)
+SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(
+    tp=2, ep=1, etp=2, dp=1, sp=True
+)
+SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
+    k: Topology(tp=1, ep=2, etp=1, dp=2, sp=False)
+    for k in ["dp_grad_accumulation_seqs", "dp_local_token_normalization"]
+}
 
 
 def _truthy(value: str | None) -> bool:
@@ -545,6 +563,15 @@ def _build_packed_tensors(
         dtype=torch.long,
         generator=generator,
     )
+    # Ensure paired cross-DP rows are never token-identical.
+    half = config.num_sequences // 2
+    if half > 0 and config.num_sequences % 2 == 0:
+        for pair_index in range(half):
+            left_index = pair_index
+            right_index = pair_index + half
+            if torch.equal(tokens[left_index], tokens[right_index]):
+                token_span = max(1, config.vocab_high - 10)
+                tokens[right_index] = ((tokens[right_index] - 10 + 1) % token_span) + 10
     group_ids = torch.zeros(shape, dtype=torch.long)
     parent_ids = torch.full(shape, -1, dtype=torch.long)
     input_pos = (
@@ -554,17 +581,57 @@ def _build_packed_tensors(
         .clone()
     )
     prefix_length = max(1, min(config.sequence_length - 1, config.prefill_tokens))
-    decode_span = max(1, config.decode_tokens)
-    cursor = prefix_length
-    branch = 1
-    while cursor < config.sequence_length:
-        end = min(config.sequence_length, cursor + decode_span)
-        group_ids[:, cursor:end] = branch
-        parent_ids[:, cursor:end] = 0
-        cursor = end
-        branch += 1
     assistant_mask = torch.zeros(shape, dtype=torch.bool)
-    assistant_mask[:, prefix_length:] = True
+    max_decode_tokens = max(1, config.sequence_length - prefix_length)
+    base_decode_tokens = max(1, min(config.decode_tokens, max_decode_tokens))
+    jitter_width = min(config.decode_tokens_jitter, max_decode_tokens - 1)
+    candidate_decode_lengths: list[int] = []
+    for _ in range(config.num_sequences):
+        if jitter_width > 0:
+            jitter = int(
+                torch.randint(
+                    low=-jitter_width,
+                    high=jitter_width + 1,
+                    size=(1,),
+                    generator=generator,
+                    dtype=torch.long,
+                ).item()
+            )
+        else:
+            jitter = 0
+        decode_length = max(
+            1,
+            min(max_decode_tokens, base_decode_tokens + jitter),
+        )
+        candidate_decode_lengths.append(decode_length)
+    # Keep jitter local around the configured decode length, but force pairwise
+    # differences across halves so default DP rank shards see different lengths.
+    if half > 0 and config.num_sequences % 2 == 0:
+        for pair_index in range(half):
+            left_index = pair_index
+            right_index = pair_index + half
+            if (
+                candidate_decode_lengths[left_index]
+                != candidate_decode_lengths[right_index]
+            ):
+                continue
+            if candidate_decode_lengths[right_index] < max_decode_tokens:
+                candidate_decode_lengths[right_index] += 1
+            elif candidate_decode_lengths[right_index] > 1:
+                candidate_decode_lengths[right_index] -= 1
+
+    for sequence_index, decode_length in enumerate(candidate_decode_lengths):
+        active_stop = prefix_length + decode_length
+        assistant_mask[sequence_index, prefix_length:active_stop] = True
+        decode_span = max(1, min(config.decode_tokens, decode_length))
+        cursor = prefix_length
+        branch = 1
+        while cursor < active_stop:
+            end = min(active_stop, cursor + decode_span)
+            group_ids[sequence_index, cursor:end] = branch
+            parent_ids[sequence_index, cursor:end] = 0
+            cursor = end
+            branch += 1
     logprobs = (
         torch.randn(
             shape,
@@ -619,12 +686,16 @@ def ensure_case_artifacts(case_config: OracleCaseConfig) -> CaseArtifacts:
     case_dir = ARTIFACT_ROOT / case_id
     case_dir.mkdir(parents=True, exist_ok=True)
     _write_json(case_dir / "case_config.json", case_config.model_dump(mode="json"))
+    regenerate = regenerate_requested()
 
     descriptor_path = case_dir / "packed_tensors.json"
-    if descriptor_path.exists():
+    packed_dir = case_dir / "packed_tensors"
+    if descriptor_path.exists() and not regenerate:
         packed_spec = DiskPackedTensorsSpec.model_validate(_read_json(descriptor_path))
     else:
-        packed_spec = _create_packed_tensors(case_config, case_dir / "packed_tensors")
+        if packed_dir.exists():
+            shutil.rmtree(packed_dir)
+        packed_spec = _create_packed_tensors(case_config, packed_dir)
         _write_json(descriptor_path, packed_spec.model_dump(mode="json"))
 
     shared_init_path = case_dir / "shared_init" / "adapter_model.safetensors"
@@ -731,8 +802,7 @@ def _stacked_layers(
         normalized = _layer_agnostic_param_key(name)
         if normalized is None:
             raise RuntimeError(
-                "Expected all compared params to include a layer index, "
-                f"got '{name}'."
+                f"Expected all compared params to include a layer index, got '{name}'."
             )
         grouped.setdefault(normalized, []).append(
             (reference.detach().float(), candidate.detach().float())
@@ -887,7 +957,9 @@ class VariantRunner:
         explain = getattr(pass_fn, "failure_reasons", None)
         if callable(explain):
             reasons = explain(summary)
-            row.failure_reasons = reasons if reasons else ["phase pass function returned false"]
+            row.failure_reasons = (
+                reasons if reasons else ["phase pass function returned false"]
+            )
             return
         row.failure_reasons = ["phase pass function returned false"]
 
@@ -978,7 +1050,9 @@ class VariantRunner:
                 accumulator.update_router_ids(reference_aligned, aligned_candidate)
                 summary = accumulator.as_summary()
             elif layer_averaged:
-                summary = DiffAccumulator.layer_averaged_summary(reference_aligned, aligned_candidate)
+                summary = DiffAccumulator.layer_averaged_summary(
+                    reference_aligned, aligned_candidate
+                )
             else:
                 accumulator = DiffAccumulator()
                 accumulator.update(reference_aligned, aligned_candidate)
@@ -1307,23 +1381,31 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     """Builds default per-phase pass functions over diff summaries."""
     # note the metrics get averaged across layers to reduce noise
     # we don't expect particular layers to see errors as opposed to the others so this is helpful
-    fwd_out_loss = MetricThresholdRule(limits={"relative_l2": 3e-2, "mean_abs_pct": 3.0})
+    fwd_out_loss = MetricThresholdRule(
+        limits={"relative_l2": 3e-2, "mean_abs_pct": 3.0}
+    )
     grads = lambda summary: (
         summary["mean_abs_pct"] < 5.0
-        or (summary["typical_abs_scale"] < 1e-6 and summary["mean_abs_diff"] < 2e-8 and summary["relative_l2"] < 1.0)
+        or (
+            summary["typical_abs_scale"] < 1e-6
+            and summary["mean_abs_diff"] < 2e-8
+            and summary["relative_l2"] < 1.0
+        )
     )
-    deltas = lambda summary: (
-        summary["mean_abs_pct"] < 15.0
+    deltas = lambda summary: summary["mean_abs_pct"] < 15.0
+    router_topk_rule = (
+        MetricThresholdRule(  # should be no mismatch due to router replay
+            limits={
+                "topk_mismatch_fraction": 0.0,
+                "top1_mismatch_fraction": 0.0,
+            }
+        )
     )
-    router_topk_rule = MetricThresholdRule(  # should be no mismatch due to router replay
-        limits={
-            "topk_mismatch_fraction": 0.0,
-            "top1_mismatch_fraction": 0.0,
-        }
-    )
-    return {
-        key: fwd_out_loss for key in ["forward", "outputs", "losses"]
-    } | {"grads": grads, "deltas": deltas, "router_topk_ids": router_topk_rule}
+    return {key: fwd_out_loss for key in ["forward", "outputs", "losses"]} | {
+        "grads": grads,
+        "deltas": deltas,
+        "router_topk_ids": router_topk_rule,
+    }
 
 
 def _suite_variants() -> list[VariantSpec]:
