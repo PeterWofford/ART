@@ -206,12 +206,12 @@ def build_training_runtime(
         ),
     )
 
-    if not torch.distributed.is_initialized():
+    if not torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
         raise RuntimeError(
             "torch.distributed must be initialized before building runtime"
         )
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()  # ty: ignore[possibly-missing-attribute]
+    world_size = torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
 
     if rank == 0 and print_env:
         print("TORCHINDUCTOR_CACHE_DIR:", os.environ["TORCHINDUCTOR_CACHE_DIR"])
@@ -404,11 +404,15 @@ def _optimizer_step(
 
 def _reduce_loss(
     loss: torch.Tensor,
-    op: torch.distributed.ReduceOp.RedOpType = torch.distributed.ReduceOp.AVG,
-    group: torch.distributed.ProcessGroup | None = None,
+    op: Any = torch.distributed.ReduceOp.AVG,  # ty: ignore[possibly-missing-attribute]
+    group: Any | None = None,
 ) -> torch.Tensor:
     reduced_loss = loss.detach().clone()
-    torch.distributed.all_reduce(reduced_loss, op=op, group=group)
+    torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+        reduced_loss,
+        op=op,
+        group=group,
+    )
     return reduced_loss
 
 
@@ -495,7 +499,7 @@ def run_training_step(
             experimental_config,
             reduction="sum",
         )
-        micro_loss = loss_info.policy_loss + config.beta * loss_info.kl
+        micro_loss = loss_info.policy_loss
         micro_loss.backward()
         probs_corr_sum += float(loss_info.probs_corr.item())
         detached_micro_loss = micro_loss.detach()
@@ -515,7 +519,7 @@ def run_training_step(
     global_num_tokens = max(num_tokens.item(), 1.0)
     reduced_loss = _reduce_loss(
         raw_loss_sum / global_num_tokens,
-        op=torch.distributed.ReduceOp.SUM,
+        op=torch.distributed.ReduceOp.SUM,  # ty: ignore[possibly-missing-attribute]
         group=ps.get_data_parallel_group(with_context_parallel=True),
     )
 
@@ -537,7 +541,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
     offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
 
     while True:
-        torch.distributed.barrier()
+        torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
         jobs_dir = "/tmp/megatron_training_jobs"
         os.makedirs(jobs_dir, exist_ok=True)
         job_names = sorted(
@@ -673,7 +677,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         gc.collect()
         torch.cuda.empty_cache()
 
-        torch.distributed.barrier()
+        torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
         if runtime.rank == 0:
             os.remove(job_path)
             with open(

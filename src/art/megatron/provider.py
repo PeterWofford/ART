@@ -1,7 +1,8 @@
 import copy
 from functools import partial
 import inspect
-from typing import Callable
+from pathlib import Path
+from typing import Callable, cast
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
@@ -70,9 +71,11 @@ def get_provider(
         "Only Qwen3 MoE models are supported"
     )
     if torch_dtype != torch.bfloat16:
+        model_name_or_path = bridge.hf_pretrained.model_name_or_path
+        assert model_name_or_path is not None
         bridge.hf_pretrained._state_dict_accessor = StateDict(
             _CastingStateSource(
-                SafeTensorsStateSource(bridge.hf_pretrained.model_name_or_path),
+                SafeTensorsStateSource(cast(str | Path, model_name_or_path)),
                 dtype=torch_dtype,
             )
         )

@@ -833,13 +833,16 @@ def _patch_alltoall_dispatcher_preprocess() -> None:
             tokens_per_expert=tokens_per_expert,
         )
         self._art_replay_expert_input_inverse_permutation = inverse_order_cpu
+        active_step_routes = controller._active_step_routes
+        if active_step_routes is None:
+            raise RuntimeError(
+                "MoE replay dispatcher preprocess called before set_step"
+            )
         trace_row_uids, trace_uid_span = _canonical_trace_row_uids(
             canonical_expert_token_uids,
             tokens_per_expert=tokens_per_expert,
             local_expert_indices=getattr(self, "local_expert_indices", None),
-            sample_uid_span=int(
-                controller._active_step_routes.global_token_uids.numel()
-            ),
+            sample_uid_span=int(active_step_routes.global_token_uids.numel()),
             num_experts=int(getattr(self, "num_experts", 1)),
         )
         _attach_trace_row_uids(
@@ -1257,6 +1260,10 @@ class MoeRoutingReplayController:
         context_parallel_size: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         step_routes = self._active_step_routes
+        if step_routes is None:
+            raise RuntimeError(
+                "Routing replay get_route_for_router called before set_step"
+            )
         call_cursor = self._router_call_cursors.get(router_key, 0)
         call_sequence = self._router_call_sequences.get(router_key)
         if call_sequence is None:

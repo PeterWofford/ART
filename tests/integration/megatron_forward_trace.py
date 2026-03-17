@@ -47,9 +47,9 @@ def _rank_metadata() -> dict[str, int]:
     """Builds lightweight distributed metadata for one trace call."""
     rank = 0
     world_size = 1
-    if torch.distributed.is_initialized():
-        rank = _safe_int(torch.distributed.get_rank(), 0)
-        world_size = _safe_int(torch.distributed.get_world_size(), 1)
+    if torch.distributed.is_initialized():  # ty: ignore[possibly-missing-attribute]
+        rank = _safe_int(torch.distributed.get_rank(), 0)  # ty: ignore[possibly-missing-attribute]
+        world_size = _safe_int(torch.distributed.get_world_size(), 1)  # ty: ignore[possibly-missing-attribute]
     return {
         "global_rank": rank,
         "world_size": world_size,
@@ -904,15 +904,15 @@ class ForwardTraceCapture:
         local_trace: dict[str, list[dict[str, Any]]],
     ) -> list[dict[str, list[dict[str, Any]]]] | None:
         if (
-            not torch.distributed.is_initialized()
-            or torch.distributed.get_world_size() == 1
+            not torch.distributed.is_initialized()  # ty: ignore[possibly-missing-attribute]
+            or torch.distributed.get_world_size() == 1  # ty: ignore[possibly-missing-attribute]
         ):
             return [local_trace]
         gathered: list[dict[str, list[dict[str, Any]]] | None] = [
             None
-        ] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(gathered, local_trace)
-        if torch.distributed.get_rank() != 0:
+        ] * torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
+        torch.distributed.all_gather_object(gathered, local_trace)  # ty: ignore[possibly-missing-attribute]
+        if torch.distributed.get_rank() != 0:  # ty: ignore[possibly-missing-attribute]
             return None
         return cast(list[dict[str, list[dict[str, Any]]]], gathered)
 
@@ -934,15 +934,15 @@ class ForwardTraceCapture:
         local_outputs: list[tuple[int | None, int, int | None, torch.Tensor]],
     ) -> list[list[tuple[int | None, int, int | None, torch.Tensor]]] | None:
         if (
-            not torch.distributed.is_initialized()
-            or torch.distributed.get_world_size() == 1
+            not torch.distributed.is_initialized()  # ty: ignore[possibly-missing-attribute]
+            or torch.distributed.get_world_size() == 1  # ty: ignore[possibly-missing-attribute]
         ):
             return [local_outputs]
         gathered: list[
             list[tuple[int | None, int, int | None, torch.Tensor]] | None
-        ] = [None] * torch.distributed.get_world_size()
-        torch.distributed.all_gather_object(gathered, local_outputs)
-        if torch.distributed.get_rank() != 0:
+        ] = [None] * torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
+        torch.distributed.all_gather_object(gathered, local_outputs)  # ty: ignore[possibly-missing-attribute]
+        if torch.distributed.get_rank() != 0:  # ty: ignore[possibly-missing-attribute]
             return None
         return cast(
             list[list[tuple[int | None, int, int | None, torch.Tensor]]],

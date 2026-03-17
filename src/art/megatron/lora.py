@@ -45,7 +45,12 @@ class LoRAParallelSpec(BaseModel):
 
 
 def _distributed_initialized() -> bool:
-    return torch.distributed.is_available() and torch.distributed.is_initialized()
+    is_initialized = getattr(torch.distributed, "is_initialized", None)
+    return (
+        torch.distributed.is_available()
+        and callable(is_initialized)
+        and bool(is_initialized())
+    )
 
 
 def _get_shard_world_size(domain: ShardDomain) -> int:
@@ -70,7 +75,7 @@ def _get_shard_rank(domain: ShardDomain) -> int:
     return group.rank()
 
 
-def _get_shard_group(domain: ShardDomain) -> torch.distributed.ProcessGroup | None:
+def _get_shard_group(domain: ShardDomain) -> Any | None:
     if not _distributed_initialized():
         return None
     if domain == "tp":
@@ -193,8 +198,14 @@ class LoRA(torch.nn.Module):
             raise RuntimeError(
                 f"{self.adapter_model_prefix}: missing process group for replicated parameter domain={domain}"
             )
-        src = torch.distributed.get_global_rank(group, 0)
-        torch.distributed.broadcast(param.data, src=src, group=group)
+        src = torch.distributed.get_global_rank(  # ty: ignore[possibly-missing-attribute]
+            group, 0
+        )
+        torch.distributed.broadcast(  # ty: ignore[possibly-missing-attribute]
+            param.data,
+            src=src,
+            group=group,
+        )
 
     def reset_lora_parameters(self) -> None:
         """Initialize LoRA weights (A=Kaiming, B=zeros) like PEFT defaults."""
@@ -595,6 +606,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         alpha: float,
         num_local_experts: int,
     ) -> LoRA:
+        assert linear_fc1 is not None
         assert isinstance(linear_fc1.weight0, torch.Tensor)
         a_parallel_spec = LoRAParallelSpec(
             shard_domain="expert_tp",

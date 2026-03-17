@@ -4,6 +4,7 @@ from typing import Any, Literal, cast
 
 from megatron.core import parallel_state as ps
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.transformer.module import MegatronModule
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
@@ -20,7 +21,7 @@ VALID_SYNC_OPS = (GRAD_SYNC_OP_NONE, GRAD_SYNC_OP_SUM, GRAD_SYNC_OP_AVG)
 
 
 def _iter_named_trainable_parameters(
-    model: list[torch.nn.Module],
+    model: list[MegatronModule],
 ) -> Iterable[tuple[str, torch.nn.Parameter]]:
     seen: set[int] = set()
     for chunk_index, model_chunk in enumerate(model):
@@ -36,7 +37,7 @@ def _iter_named_trainable_parameters(
 
 def _resolve_domain_group(
     domain: GradSyncDomain,
-) -> torch.distributed.ProcessGroup | None:
+) -> Any | None:
     if domain == TP_DEFAULT_GRAD_SYNC_DOMAIN:
         group = ps.get_tensor_model_parallel_group(check_initialized=False)
         if group is None or group.size() <= 1:
@@ -53,14 +54,14 @@ def _resolve_domain_group(
 
 def _resolve_reduce_op(op: GradSyncOp) -> Any:
     if op == GRAD_SYNC_OP_SUM:
-        return torch.distributed.ReduceOp.SUM
+        return torch.distributed.ReduceOp.SUM  # ty: ignore[possibly-missing-attribute]
     if op == GRAD_SYNC_OP_AVG:
-        return torch.distributed.ReduceOp.AVG
+        return torch.distributed.ReduceOp.AVG  # ty: ignore[possibly-missing-attribute]
     raise RuntimeError(f"Unknown grad sync op: {op}")
 
 
 def finalize_model_grads_extended(
-    model: list[torch.nn.Module],
+    model: list[MegatronModule],
     num_tokens: torch.Tensor | None = None,
 ) -> None:
     """Run Megatron finalize, then apply extra LoRA grad-sync reductions.
@@ -71,7 +72,10 @@ def finalize_model_grads_extended(
     """
     # All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
     # embedding grads across first and last pipeline stages (if not tied)
-    finalize_model_grads(model, num_tokens=num_tokens)
+    finalize_model_grads(
+        cast(list[torch.nn.Module], model),
+        num_tokens=num_tokens,
+    )
 
     buckets: dict[
         tuple[GradSyncDomain, GradSyncOp, torch.dtype, torch.device],
@@ -119,7 +123,11 @@ def finalize_model_grads_extended(
             if torch.is_floating_point(coalesced) and coalesced.dtype != torch.float32
             else coalesced
         )
-        torch.distributed.all_reduce(reduced, op=_resolve_reduce_op(op), group=group)
+        torch.distributed.all_reduce(  # ty: ignore[possibly-missing-attribute]
+            reduced,
+            op=_resolve_reduce_op(op),
+            group=group,
+        )
         if reduced is not coalesced:
             reduced = reduced.to(dtype=coalesced.dtype)
         for grad, synced in zip(grads, _unflatten_dense_tensors(reduced, grads)):

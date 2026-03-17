@@ -207,17 +207,14 @@ def get_compute_loss_fn(trainer: "GRPOTrainer") -> Callable[..., torch.Tensor]:
         )
 
         trainer._metrics["train"]["loss/learning_rate"].append(config.learning_rate)
-        total_loss = loss.policy_loss + config.beta * loss.kl
-        trainer._metrics["train"]["loss/train"].append(total_loss.item())
+        trainer._metrics["train"]["loss/train"].append(loss.policy_loss.item())
         if loss.entropy is not None:
             trainer._metrics["train"]["loss/entropy"].append(loss.entropy.item())
-        if config.beta > 0.0:
-            trainer._metrics["train"]["loss/kl_div"].append(loss.kl.item())
         if loss.kl_policy_ref is not None:
             trainer._metrics["train"]["loss/kl_policy_ref"].append(
                 loss.kl_policy_ref.item()
             )
-        return total_loss
+        return loss.policy_loss
 
     return compute_loss
 

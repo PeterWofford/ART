@@ -114,10 +114,12 @@ def _gather_full_state(
     """Gathers local state dicts to rank 0 and merges them."""
     import torch
 
-    rank = torch.distributed.get_rank()
-    world_size = torch.distributed.get_world_size()
+    rank = torch.distributed.get_rank()  # ty: ignore[possibly-missing-attribute]
+    world_size = torch.distributed.get_world_size()  # ty: ignore[possibly-missing-attribute]
     gathered = [None for _ in range(world_size)] if rank == 0 else None
-    torch.distributed.gather_object(local_state, gathered, dst=0)
+    torch.distributed.gather_object(  # ty: ignore[possibly-missing-attribute]
+        local_state, gathered, dst=0
+    )
     if rank != 0:
         return None
     assert gathered is not None
@@ -562,7 +564,7 @@ def _patch_lora_for_fp32(
 
         return (out * self.scale).to(dtype=x.dtype)
 
-    LoRA.forward = _reference_forward
+    LoRA.forward = _reference_forward  # ty: ignore[invalid-assignment]
     try:
         yield
     finally:
@@ -705,7 +707,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
 
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(backend="nccl")
+    torch.distributed.init_process_group(backend="nccl")  # ty: ignore[possibly-missing-attribute]
     _set_deterministic_seed(request.case_config.seed)
     _configure_cuda_precision(request.case_config)
 
@@ -738,7 +740,7 @@ def _worker_run(request: WorkerRunRequest) -> None:
     shared_init_path = Path(request.shared_init_adapter_path)
     if not shared_init_path.exists():
         initial_state = _collect_lora_state(model_chunks)
-        if torch.distributed.get_rank() == 0:
+        if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
             shared_init_path.parent.mkdir(parents=True, exist_ok=True)
             deterministic_init = _build_deterministic_shared_init(
                 _require_not_none(initial_state, "initial_state"),
@@ -748,17 +750,17 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 deterministic_init,
                 str(shared_init_path),
             )
-    torch.distributed.barrier()
+    torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
 
     # load the shared initial lora into the model and validate we can collect it from the model
     adapter_model = load_file(str(shared_init_path))
     megatron_train.load_adapter_into_model(model_chunks, adapter_model, optimizer)
     loaded_state = _collect_lora_state(model_chunks)
-    if torch.distributed.get_rank() == 0:
+    if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
         _validate_loaded_state_matches_adapter(
             _require_not_none(loaded_state, "loaded_state"), adapter_model
         )
-    torch.distributed.barrier()
+    torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
 
     # load the inputs
     packed_tensors = packed_tensors_from_dir(
@@ -771,7 +773,6 @@ def _worker_run(request: WorkerRunRequest) -> None:
 
     train_config = types.TrainConfig(
         learning_rate=request.case_config.learning_rate,
-        beta=request.case_config.beta,
         kl_penalty_coef=0.0,
         grad_accumulation_sequences=global_grad_accumulation_sequences,
     )
@@ -831,10 +832,10 @@ def _worker_run(request: WorkerRunRequest) -> None:
             )
             ordered_micro_outputs = forward_trace_capture.ordered_step_outputs()
             forward_trace_capture.save_current_step(traces_dir)
-            torch.distributed.barrier()
+            torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
             current_lora_state = _collect_lora_state(model_chunks)
 
-            if torch.distributed.get_rank() == 0:
+            if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
                 grads = _require_not_none(captured_grads, "captured_grads")
                 initial_state = _require_not_none(
                     initial_lora_state, "initial_lora_state"
@@ -886,11 +887,11 @@ def _worker_run(request: WorkerRunRequest) -> None:
                         lora_file=str(lora_rel),
                     )
                 )
-            torch.distributed.barrier()
+            torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
 
     forward_trace_capture.close()
 
-    if torch.distributed.get_rank() == 0:
+    if torch.distributed.get_rank() == 0:  # ty: ignore[possibly-missing-attribute]
         # build and save the moe routing replay bundle
         if request.capture_moe_routing_bundle_path is not None:
             replay_bundle = build_bundle_from_forward_trace_dir(
@@ -918,8 +919,8 @@ def _worker_run(request: WorkerRunRequest) -> None:
             steps=step_traces,
         )
         _write_json(topology_dir / "manifest.json", manifest.model_dump(mode="json"))
-    torch.distributed.barrier()
-    torch.distributed.destroy_process_group()
+    torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
+    torch.distributed.destroy_process_group()  # ty: ignore[possibly-missing-attribute]
 
 
 def run_worker_cli(run_request_path: Path) -> None:
