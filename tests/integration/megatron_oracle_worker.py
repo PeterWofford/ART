@@ -144,7 +144,9 @@ def _collect_lora_state(
     return _gather_full_state(local_state)
 
 
-def _collect_lora_grads(model_chunks: list[Any]) -> dict[str, Any] | None:
+def _collect_lora_grads(
+    model_chunks: list[Any],
+) -> dict[str, Any] | None:
     """Collects full LoRA gradient tensors across all ranks."""
     from art.megatron.lora import LoRA
 
@@ -163,11 +165,8 @@ def _collect_lora_grads(model_chunks: list[Any]) -> dict[str, Any] | None:
                     raise RuntimeError(f"LoRA param main_grad is None for key '{key}'")
                 if hasattr(grad, "_local_tensor"):
                     grad = grad._local_tensor
-                local_grads[key] = (
-                    grad[expert].detach().cpu().T
-                    if expert is not None
-                    else grad.detach().cpu().T
-                )
+                captured_grad = grad[expert] if expert is not None else grad
+                local_grads[key] = captured_grad.detach().cpu().T
     return _gather_full_state(local_grads)
 
 
@@ -259,12 +258,20 @@ def _configure_provider(
     provider.tensor_model_parallel_size = topology.tp
     provider.expert_model_parallel_size = topology.ep
     provider.expert_tensor_parallel_size = topology.etp
-    # These are intentionally pinned to 1 for now; switching to topology-driven
-    # values is the single lever to start CP/PP coverage in the harness.
+    # These are intentionally pinned to 1 for now
     provider.pipeline_model_parallel_size = 1
     provider.context_parallel_size = 1
     provider.sequence_parallel = topology.sp
     provider.num_layers = case_config.num_layers
+    if case_config.precision == "fp32":
+        provider.bf16 = False
+        provider.fp16 = False
+        provider.params_dtype = torch.float32
+        provider.pipeline_dtype = torch.float32
+        provider.enable_autocast = False
+        provider.autocast_dtype = None
+        provider.attention_softmax_in_fp32 = True
+        provider.fp32_residual_connection = True
     if hasattr(provider, "attention_dropout"):
         provider.attention_dropout = 0.0
     if hasattr(provider, "hidden_dropout"):
@@ -275,8 +282,26 @@ def _build_optimizer_config(case_config: OracleCaseConfig):
     """Builds Megatron optimizer settings for deterministic harness runs."""
     from megatron.core.optimizer import OptimizerConfig
 
+    if case_config.precision == "fp32":
+        return OptimizerConfig(
+            bf16=False,
+            fp16=False,
+            params_dtype=torch.float32,
+            main_grads_dtype=torch.float32,
+            main_params_dtype=torch.float32,
+            exp_avg_dtype=torch.float32,
+            exp_avg_sq_dtype=torch.float32,
+            lr=case_config.learning_rate,
+            adam_beta1=0.9,
+            adam_beta2=0.99,
+            clip_grad=0.1,
+            weight_decay=0.0,
+            adam_eps=1e-13,
+        )
+
     return OptimizerConfig(
         bf16=True,
+        fp16=False,
         lr=case_config.learning_rate,
         adam_beta1=0.9,
         adam_beta2=0.99,
@@ -284,6 +309,14 @@ def _build_optimizer_config(case_config: OracleCaseConfig):
         weight_decay=0.0,
         adam_eps=1e-13,
     )
+
+
+def _configure_cuda_precision(case_config: OracleCaseConfig) -> None:
+    if case_config.precision != "fp32":
+        return
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("highest")
 
 
 def _assert_runtime_configuration(
@@ -471,6 +504,72 @@ def _apply_o_proj_forward_mutation(
 
 
 @contextmanager
+def _patch_lora_for_fp32(
+    model_chunks: list[Any],
+    optimizer: Any,
+):
+    """
+    torch grouped_gemm is bf16 only, so we have a simple custom fp32 path
+    to make the numbers match closely
+    """
+    from art.megatron.lora import LoRA
+
+    del model_chunks
+    del optimizer
+    original_forward = LoRA.forward
+
+    def _reference_forward(
+        self: Any,
+        x: torch.Tensor,
+        tokens_per_expert: list[int] | torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        work_dtype = (
+            torch.float32
+            if torch.is_floating_point(x) and x.dtype != torch.float32
+            else x.dtype
+        )
+        work_x = x.to(dtype=work_dtype)
+        work_a = self.A_T.to(dtype=work_dtype)
+        work_b = self.B_T.to(dtype=work_dtype)
+
+        if tokens_per_expert is None or self.num_local_experts == 1:
+            return (((work_x @ work_a) @ work_b) * self.scale).to(dtype=x.dtype)
+
+        counts = (
+            tokens_per_expert.tolist()
+            if isinstance(tokens_per_expert, torch.Tensor)
+            else list(tokens_per_expert)
+        )
+        out = work_x.new_zeros((work_x.shape[0], work_b.shape[-1]))
+
+        cursor = 0
+        for expert_index, count in enumerate(counts):
+            count_int = int(count)
+            if count_int <= 0:
+                continue
+            next_cursor = cursor + count_int
+            x_chunk = work_x[cursor:next_cursor]
+            out[cursor:next_cursor] = (x_chunk @ work_a[expert_index]) @ work_b[
+                expert_index
+            ]
+            cursor = next_cursor
+
+        if cursor != int(work_x.shape[0]):
+            raise RuntimeError(
+                "Expert LoRA reference path did not consume all grouped rows: "
+                f"consumed={cursor}, rows={int(work_x.shape[0])}"
+            )
+
+        return (out * self.scale).to(dtype=x.dtype)
+
+    LoRA.forward = _reference_forward
+    try:
+        yield
+    finally:
+        LoRA.forward = original_forward
+
+
+@contextmanager
 def _mutation_hook(
     megatron_train_module: Any,
     model_chunks: list[Any],
@@ -480,11 +579,14 @@ def _mutation_hook(
     loss_scale: float = 1.0,
 ):
     """Applies optional sensitivity mutation hooks around training steps."""
-    original_finalize = megatron_train_module._finalize_grads
+    original_finalize = megatron_train_module.finalize_model_grads_extended
     original_optimizer_step = megatron_train_module._optimizer_step
     original_loss_fn = megatron_train_module.loss_fn
-    original_token_normalization_scale = (
-        megatron_train_module._global_token_normalization_scale
+    original_local_token_count_tensor = (
+        megatron_train_module._local_trainable_token_count_tensor
+    )
+    original_build_micro_sample_indices = (
+        megatron_train_module.build_micro_sample_indices
     )
 
     known_mutations = {None, *SUPPORTED_SENSITIVITY_MUTATIONS}
@@ -492,46 +594,55 @@ def _mutation_hook(
         raise ValueError(f"Unsupported mutation: {mutation}")
 
     if mutation == "skip_finalize":
-        megatron_train_module._finalize_grads = lambda _model: None
+        megatron_train_module.finalize_model_grads_extended = (
+            lambda _model, **_kwargs: (None)
+        )
 
     if mutation == "dp_local_token_normalization":
 
-        def _wrong_local_token_normalization_scale(
+        def _wrong_local_trainable_token_count_tensor(
             micro_inputs: list[Any],
             device: torch.device,
-        ) -> float:
-            del device
+        ) -> torch.Tensor:
             local_token_total = sum(
                 megatron_train_module._count_trainable_tokens(micro)
                 for micro in micro_inputs
             )
-            if local_token_total <= 0.0:
-                return 0.0
-            # Intentionally wrong normalization: use only local token total.
             dp_world_size = int(
                 megatron_train_module.ps.get_data_parallel_world_size(
                     with_context_parallel=True
                 )
             )
-            return float(dp_world_size) / float(local_token_total)
+            wrong_local_token_total = local_token_total / max(dp_world_size, 1)
+            return torch.tensor(
+                [wrong_local_token_total],
+                device=device,
+                dtype=torch.float32,
+            )
 
-        megatron_train_module._global_token_normalization_scale = (
-            _wrong_local_token_normalization_scale
+        megatron_train_module._local_trainable_token_count_tensor = (
+            _wrong_local_trainable_token_count_tensor
         )
 
     if mutation == "dp_grad_accumulation_seqs":
 
-        def _wrong_resolve_local_grad_accumulation_sequences(
+        def _wrong_build_micro_sample_indices(
+            *,
+            step_index: int,
+            num_sequences: int,
             global_grad_accumulation_sequences: int,
-        ) -> int:
-            return megatron_train_module.resolve_local_grad_accumulation_sequences(
-                global_grad_accumulation_sequences=(
-                    topology.dp * global_grad_accumulation_sequences
+        ) -> list[int | None]:
+            base_global_sample_index = step_index * global_grad_accumulation_sequences
+            return [
+                (global_sample_index if global_sample_index < num_sequences else None)
+                for global_sample_index in range(
+                    base_global_sample_index,
+                    base_global_sample_index + global_grad_accumulation_sequences,
                 )
-            )
+            ]
 
-        megatron_train_module.resolve_local_grad_accumulation_sequences = (
-            _wrong_resolve_local_grad_accumulation_sequences
+        megatron_train_module.build_micro_sample_indices = (
+            _wrong_build_micro_sample_indices
         )
 
     if pre_optimizer_step_hook is not None:
@@ -554,8 +665,8 @@ def _mutation_hook(
             loss = original_loss_fn(*args, **kwargs)
             return loss.model_copy(
                 update={
-                    "mean_policy_loss": loss.mean_policy_loss * effective_loss_scale,
-                    "mean_kl": loss.mean_kl * effective_loss_scale,
+                    "policy_loss": loss.policy_loss * effective_loss_scale,
+                    "kl": loss.kl * effective_loss_scale,
                     "policy_loss_sum": loss.policy_loss_sum * effective_loss_scale,
                 }
             )
@@ -572,11 +683,14 @@ def _mutation_hook(
         try:
             yield
         finally:
-            megatron_train_module._finalize_grads = original_finalize
+            megatron_train_module.finalize_model_grads_extended = original_finalize
             megatron_train_module._optimizer_step = original_optimizer_step
             megatron_train_module.loss_fn = original_loss_fn
-            megatron_train_module._global_token_normalization_scale = (
-                original_token_normalization_scale
+            megatron_train_module._local_trainable_token_count_tensor = (
+                original_local_token_count_tensor
+            )
+            megatron_train_module.build_micro_sample_indices = (
+                original_build_micro_sample_indices
             )
 
 
@@ -593,9 +707,13 @@ def _worker_run(request: WorkerRunRequest) -> None:
     torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(backend="nccl")
     _set_deterministic_seed(request.case_config.seed)
+    _configure_cuda_precision(request.case_config)
 
     runtime = megatron_train.build_training_runtime(
         model_identifier=request.case_config.base_model,
+        provider_torch_dtype=(
+            torch.float32 if request.case_config.precision == "fp32" else torch.bfloat16
+        ),
         provider_configure=lambda provider: _configure_provider(
             provider, request.topology, request.case_config
         ),
@@ -660,27 +778,40 @@ def _worker_run(request: WorkerRunRequest) -> None:
     experimental_config: dev.TrainConfig = {}
     step_traces: list[StepTrace] = []
     captured_grads: dict[str, Any] | None = None
-    forward_trace_capture = ForwardTraceCapture(model_chunks, enabled=True)
+    routing_replay_controller = runtime.moe_routing_replay_controller
+    micro_start_callback = (
+        routing_replay_controller.begin_micro
+        if routing_replay_controller is not None
+        else None
+    )
+    forward_trace_capture = ForwardTraceCapture(
+        model_chunks,
+        enabled=True,
+        micro_start_callback=micro_start_callback,
+    )
 
     def _capture_lora_grads() -> None:
         nonlocal captured_grads
         captured_grads = _collect_lora_grads(model_chunks)
 
-    with _mutation_hook(
-        megatron_train,
-        model_chunks,
-        request.mutation,
-        request.topology,
-        pre_optimizer_step_hook=_capture_lora_grads,
-        loss_scale=request.case_config.loss_scale,
+    with (
+        _mutation_hook(
+            megatron_train,
+            model_chunks,
+            request.mutation,
+            request.topology,
+            pre_optimizer_step_hook=_capture_lora_grads,
+            loss_scale=request.case_config.loss_scale,
+        ),
+        _patch_lora_for_fp32(model_chunks, optimizer),
     ):
         for step_index in range(request.case_config.num_steps):
-            forward_trace_capture.set_step(step_index)
             micro_sample_indices = megatron_train.build_micro_sample_indices(
                 step_index=step_index,
                 num_sequences=request.packed_tensors.num_sequences,
                 global_grad_accumulation_sequences=global_grad_accumulation_sequences,
             )
+            forward_trace_capture.set_step(step_index, micro_sample_indices)
             micro_inputs = megatron_train.select_micro_inputs(
                 packed_tensors, micro_sample_indices, zero_template
             )
@@ -698,12 +829,12 @@ def _worker_run(request: WorkerRunRequest) -> None:
                 sample_index=micro_sample_indices,
                 moe_routing_replay_controller=runtime.moe_routing_replay_controller,
             )
+            ordered_micro_outputs = forward_trace_capture.ordered_step_outputs()
             forward_trace_capture.save_current_step(traces_dir)
             torch.distributed.barrier()
             current_lora_state = _collect_lora_state(model_chunks)
 
             if torch.distributed.get_rank() == 0:
-                # save artifacts (outputs, grads, lora deltas, current lora)
                 grads = _require_not_none(captured_grads, "captured_grads")
                 initial_state = _require_not_none(
                     initial_lora_state, "initial_lora_state"
@@ -727,16 +858,20 @@ def _worker_run(request: WorkerRunRequest) -> None:
                     Path("traces") / f"deltas_step_{step_index:03d}.safetensors"
                 )
                 lora_rel = Path(f"lora_step_{step_index:03d}.safetensors")
+                ordered_outputs = _require_not_none(
+                    ordered_micro_outputs, "ordered_micro_outputs"
+                )
+                if not ordered_outputs:
+                    raise RuntimeError("Expected at least one captured micro output")
 
                 torch.save(
-                    step_result.new_logprobs.detach().cpu().float(),
+                    torch.stack(ordered_outputs, dim=0),
                     topology_dir / output_rel,
                 )
                 save_file(grads, str(topology_dir / grads_rel))
                 save_file(saved_deltas, str(topology_dir / deltas_rel))
                 save_file(saved_current_state, str(topology_dir / lora_rel))
 
-                # build and append the step trace
                 step_traces.append(
                     StepTrace(
                         step_index=step_index,

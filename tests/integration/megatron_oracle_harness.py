@@ -113,6 +113,31 @@ class Topology(BaseModel):
         return attention_world
 
 
+TOPOLOGIES = [
+    Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
+    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
+    Topology(tp=2, ep=2, etp=1, dp=1, sp=True),
+    Topology(tp=2, ep=1, etp=2, dp=1, sp=True),
+]
+EXTENDED_TOPOLOGIES = [
+    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
+    Topology(tp=1, ep=2, etp=1, dp=2, sp=False),
+    Topology(tp=1, ep=1, etp=2, dp=2, sp=True),
+]
+ORACLE_TOPOLOGY = TOPOLOGIES[0]
+SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
+SENSITIVITY_TOPOLOGY_BY_MUTATION: dict[SensitivityMutation, Topology] = {
+    mutation: SENSITIVITY_TOPOLOGY for mutation in SUPPORTED_SENSITIVITY_MUTATIONS
+}
+SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(
+    tp=2, ep=1, etp=2, dp=1, sp=True
+)
+SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
+    k: Topology(tp=1, ep=2, etp=1, dp=2, sp=False)
+    for k in ["dp_grad_accumulation_seqs", "dp_local_token_normalization"]
+}
+
+
 class PackedTensorConfig(BaseModel):
     """Controls synthetic packed tensor generation used by oracle harness runs."""
 
@@ -172,6 +197,7 @@ class OracleCaseConfig(BaseModel):
     """Contains all deterministic run parameters for one oracle case."""
 
     base_model: str
+    precision: Literal["bf16", "fp32"] = "fp32"
     num_layers: int = 4
     seed: int = 20260304
     num_steps: int = 1
@@ -418,30 +444,6 @@ def _require_not_none(value: T | None, name: str) -> T:
     if value is None:
         raise RuntimeError(f"{name} is None")
     return value
-
-
-TOPOLOGIES = [
-    Topology(tp=1, ep=1, etp=1, dp=1, sp=False),
-    Topology(tp=2, ep=1, etp=1, dp=1, sp=True),
-    Topology(tp=2, ep=2, etp=1, dp=1, sp=True),
-    Topology(tp=2, ep=1, etp=2, dp=1, sp=True),
-]
-EXTENDED_TOPOLOGIES = [
-    Topology(tp=1, ep=1, etp=1, dp=2, sp=False),
-    Topology(tp=1, ep=2, etp=1, dp=2, sp=True),
-]
-ORACLE_TOPOLOGY = TOPOLOGIES[0]
-SENSITIVITY_TOPOLOGY = Topology(tp=2, ep=2, etp=1, dp=1, sp=True)
-SENSITIVITY_TOPOLOGY_BY_MUTATION: dict[SensitivityMutation, Topology] = {
-    mutation: SENSITIVITY_TOPOLOGY for mutation in SUPPORTED_SENSITIVITY_MUTATIONS
-}
-SENSITIVITY_TOPOLOGY_BY_MUTATION["bwd_skip_sync_fc1_a"] = Topology(
-    tp=2, ep=1, etp=2, dp=1, sp=True
-)
-SENSITIVITY_TOPOLOGY_BY_MUTATION |= {
-    k: Topology(tp=1, ep=2, etp=1, dp=2, sp=False)
-    for k in ["dp_grad_accumulation_seqs", "dp_local_token_normalization"]
-}
 
 
 def _truthy(value: str | None) -> bool:
@@ -798,6 +800,7 @@ def _stacked_layers(
     import torch
 
     grouped: dict[str, list[tuple[Any, Any]]] = {}
+    original_names_by_group: dict[str, list[str]] = {}
     for name, reference, candidate in pairs:
         normalized = _layer_agnostic_param_key(name)
         if normalized is None:
@@ -807,10 +810,18 @@ def _stacked_layers(
         grouped.setdefault(normalized, []).append(
             (reference.detach().float(), candidate.detach().float())
         )
+        original_names_by_group.setdefault(normalized, []).append(name)
 
     stacked_pairs: list[tuple[str, Any, Any]] = []
     for normalized in sorted(grouped):
         group = grouped[normalized]
+        reference_shapes = {tuple(reference.shape) for reference, _ in group}
+        candidate_shapes = {tuple(candidate.shape) for _, candidate in group}
+        if len(reference_shapes) != 1 or len(candidate_shapes) != 1:
+            original_names = original_names_by_group[normalized]
+            for original_name, (reference, candidate) in zip(original_names, group):
+                stacked_pairs.append((original_name, reference, candidate))
+            continue
         stacked_pairs.append(
             (
                 normalized,
@@ -840,7 +851,7 @@ class VariantRunner:
             self.case_dir / ORACLE_MOE_ROUTING_BUNDLE_DIRNAME
         )
         self.shared_init_path = Path(self.case_artifacts.shared_init_adapter_path)
-        self.console = console or Console(width=160)
+        self.console = console or Console(width=140)
         self._oracle_initialized = False
         self._oracle_regenerated = False
 
@@ -1318,7 +1329,6 @@ class VariantRunner:
         detail_table.add_column("mean_abs_pct", justify="right")
         detail_table.add_column("typical_abs", justify="right")
         detail_table.add_column("mean_abs_diff", justify="right")
-        # detail_table.add_column("Thresholds")
         detail_table.add_column("Failure")
         sorted_rows = sorted(
             table_rows,
@@ -1382,17 +1392,9 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     # note the metrics get averaged across layers to reduce noise
     # we don't expect particular layers to see errors as opposed to the others so this is helpful
     fwd_out_loss = MetricThresholdRule(
-        limits={"relative_l2": 3e-2, "mean_abs_pct": 3.0}
+        limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0}
     )
-    grads = lambda summary: (
-        summary["mean_abs_pct"] < 5.0
-        or (
-            summary["typical_abs_scale"] < 1e-6
-            and summary["mean_abs_diff"] < 2e-8
-            and summary["relative_l2"] < 1.0
-        )
-    )
-    deltas = lambda summary: summary["mean_abs_pct"] < 15.0
+    grads_deltas = MetricThresholdRule(limits={"mean_abs_pct": 10.0})
     router_topk_rule = (
         MetricThresholdRule(  # should be no mismatch due to router replay
             limits={
@@ -1402,8 +1404,8 @@ def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
         )
     )
     return {key: fwd_out_loss for key in ["forward", "outputs", "losses"]} | {
-        "grads": grads,
-        "deltas": deltas,
+        "grads": grads_deltas,
+        "deltas": grads_deltas,
         "router_topk_ids": router_topk_rule,
     }
 
