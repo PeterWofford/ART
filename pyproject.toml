@@ -1,6 +1,6 @@
 [project]
 name = "openpipe-art"
-version = "0.5.16"
+version = "0.5.17"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -38,7 +38,7 @@ backend = [
     "pytest>=8.4.1",
     "nbmake>=1.5.5",
     "gql<4",
-    "vllm==0.15.1 ; sys_platform == 'linux'",
+    "vllm==0.17.0 ; sys_platform == 'linux'",
 ]
 megatron = [
     "torch>=2.8.0",
@@ -62,6 +62,7 @@ tinker = [
     "huggingface_hub",
     "numpy",
     "pillow",
+    "pyarrow>=15.0.0",
     "pydantic>=2.12.5",
     "tinker>=0.8.1",
     "torch>=2.8.0",
@@ -116,12 +117,15 @@ force-sort-within-sections = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "live_api_cost: opt-in live API cost validation against provider endpoints",
+]
 
 [tool.uv]
 required-version = ">=0.6.15"
 # Override numpy to <2.0 for compatibility with megatron-core in the training
-# environment. vLLM 0.15.1 pulls opencv-python-headless>=4.13 which wants
-# numpy>=2 on Python 3.9+, but megatron-core requires numpy<2.
+# environment. vLLM pulls opencv-python-headless>=4.13 which wants numpy>=2 on
+# Python 3.9+, but megatron-core requires numpy<2.
 override-dependencies = ["transformer-engine>=2.11.0", "numpy<2"]
 # Keep apex build isolation enabled so uv can inject torch from
 # `extra-build-dependencies` during lock/sync on non-GPU client machines.

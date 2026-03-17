@@ -6,11 +6,16 @@ import os
 import shutil
 import socket
 import subprocess
+import time
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
 import warnings
 
 logger = logging.getLogger(__name__)
+
+_AUTO_GPU_HOURLY_PRICING_USD = {
+    "H200": 3.0,
+}
 
 import aiohttp
 import numpy as np
@@ -39,6 +44,12 @@ from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
 from ..backend import AnyTrainableModel, Backend
+from ..metrics_taxonomy import (
+    TRAIN_GRADIENT_STEPS_KEY,
+    average_metric_samples,
+    build_training_summary_metrics,
+    summarize_trajectory_groups,
+)
 from ..model import Model, TrainableModel
 from ..preprocessing.pack import (
     PackedTensors,
@@ -60,7 +71,13 @@ from .service import ModelService
 
 
 class LocalBackend(Backend):
-    def __init__(self, *, in_process: bool = False, path: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        in_process: bool = False,
+        path: str | None = None,
+        gpu_cost_per_hour_usd: float | None = None,
+    ) -> None:
         """
         Initializes a local, directory-based Backend interface at the given path.
 
@@ -71,15 +88,73 @@ class LocalBackend(Backend):
         Args:
             in_process: Whether to run the local service in-process.
             path: The path to the local directory. Defaults to "{repo_root}/.art".
+            gpu_cost_per_hour_usd: Optional per-GPU hourly price override used for
+                automatic `costs/gpu` accounting on train steps. When unset,
+                ART auto-detects supported GPU types (H200 at $3/hr today) and
+                skips GPU cost logging for unknown devices instead of guessing.
         """
         self._in_process = in_process
         self._path = path or get_default_art_path()
+        self._gpu_cost_per_hour_usd = (
+            float(gpu_cost_per_hour_usd) if gpu_cost_per_hour_usd is not None else None
+        )
         os.makedirs(self._path, exist_ok=True)
 
         # Other initialization
         self._services: dict[str, ModelService] = {}
         self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
+
+    def supports_automatic_train_step_metrics(self) -> bool:
+        return True
+
+    def automatic_gpu_cost_per_hour_usd(self, model: Model) -> float | None:
+        per_gpu_cost = self._resolve_gpu_cost_per_hour_usd()
+        if per_gpu_cost is None:
+            return None
+
+        gpu_count = self._allocated_gpu_count(model)
+        if gpu_count <= 0:
+            return None
+        return per_gpu_cost * gpu_count
+
+    def _resolve_gpu_cost_per_hour_usd(self) -> float | None:
+        if self._gpu_cost_per_hour_usd is not None:
+            return self._gpu_cost_per_hour_usd
+        if not torch.cuda.is_available():
+            return None
+
+        num_visible_gpus = torch.cuda.device_count()
+        if num_visible_gpus <= 0:
+            return None
+
+        resolved_costs: list[float] = []
+        for index in range(num_visible_gpus):
+            device_name = torch.cuda.get_device_name(index).upper()
+            for gpu_name, hourly_cost in _AUTO_GPU_HOURLY_PRICING_USD.items():
+                if gpu_name in device_name:
+                    resolved_costs.append(hourly_cost)
+                    break
+            else:
+                return None
+
+        if not resolved_costs:
+            return None
+        if len(set(resolved_costs)) != 1:
+            return None
+        return resolved_costs[0]
+
+    def _allocated_gpu_count(self, model: Model) -> int:
+        if isinstance(model, TrainableModel) and model._internal_config is not None:
+            trainer_gpu_ids = set(model._internal_config.get("trainer_gpu_ids", []))
+            inference_gpu_ids = set(model._internal_config.get("inference_gpu_ids", []))
+            allocated_gpu_ids = trainer_gpu_ids | inference_gpu_ids
+            if allocated_gpu_ids:
+                return len(allocated_gpu_ids)
+
+        if not torch.cuda.is_available():
+            return 0
+        return torch.cuda.device_count()
 
     def __enter__(self) -> Self:
         return self
@@ -244,7 +319,7 @@ class LocalBackend(Backend):
         )
         if not tokenized_results:
             return None
-        max_tokens = max(len(result.tokens) for result in tokenized_results)
+        max_tokens = max(len(result.token_ids) for result in tokenized_results)
         # Round up max_tokens to the nearest multiple of 2048
         sequence_length = math.ceil(max_tokens / 2048) * 2048
         # Cap sequence length at the model's max sequence length
@@ -427,7 +502,6 @@ class LocalBackend(Backend):
         *,
         # Core training parameters
         learning_rate: float = 5e-6,
-        beta: float = 0.0,
         # KL-penalized advantage adjustment
         kl_penalty_coef: float = 0.0,
         kl_penalty_reference_step: int | None = None,
@@ -470,7 +544,6 @@ class LocalBackend(Backend):
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
-            beta: KL penalty coefficient added to the loss. Defaults to 0.0.
             kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
                 Tokens diverging more from the reference get reduced advantages.
                 Defaults to 0.0 (disabled).
@@ -527,7 +600,7 @@ class LocalBackend(Backend):
 
         # Build config objects from explicit kwargs
         config = TrainConfig(
-            learning_rate=learning_rate, beta=beta, kl_penalty_coef=kl_penalty_coef
+            learning_rate=learning_rate, kl_penalty_coef=kl_penalty_coef
         )
         dev_config: dev.TrainConfig = {
             "advantage_balance": advantage_balance,
@@ -567,20 +640,28 @@ class LocalBackend(Backend):
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
+        trainer_started = time.monotonic()
         async for metrics in self._train_model(
             model, groups_list, config, dev_config, verbose
         ):
             training_metrics.append(metrics)
 
         # Aggregate metrics
-        avg_metrics: dict[str, float] = {}
-        if training_metrics:
-            avg_metrics = {
-                k: sum(d.get(k, 0) for d in training_metrics)
-                / sum(1 for d in training_metrics if k in d)
-                for k in {k for d in training_metrics for k in d}
-                if k != "num_gradient_steps"
+        avg_metrics = average_metric_samples(training_metrics)
+        summary = summarize_trajectory_groups(groups_list)
+        avg_metrics.setdefault(
+            "time/step_trainer_s", time.monotonic() - trainer_started
+        )
+        avg_metrics.update(
+            {
+                key: value
+                for key, value in build_training_summary_metrics(
+                    summary,
+                    include_trainable_groups=True,
+                ).items()
+                if key not in avg_metrics
             }
+        )
 
         # Get step and checkpoint path
         step = await self._get_step(model)
@@ -618,12 +699,10 @@ class LocalBackend(Backend):
         if verbose:
             print("Packing tensors...")
 
-        # Count submitted groups and trainable groups
-        num_groups_submitted = len(trajectory_groups)
-        num_groups_trainable = sum(
-            1
-            for group in trajectory_groups
-            if group and len(set(trajectory.reward for trajectory in group)) > 1
+        summary = summarize_trajectory_groups(trajectory_groups)
+        base_metrics = build_training_summary_metrics(
+            summary,
+            include_trainable_groups=True,
         )
 
         packed_tensors = self._get_packed_tensors(
@@ -686,16 +765,19 @@ class LocalBackend(Backend):
             # Yield metrics showing no groups were trainable
             # (the frontend will handle logging)
             yield {
-                "num_groups_submitted": num_groups_submitted,
-                "num_groups_trainable": 0,
-                "num_gradient_steps": 0,
+                **base_metrics,
+                "data/step_num_groups_trainable": 0.0,
+                "data/step_trainer_tokens": 0.0,
+                TRAIN_GRADIENT_STEPS_KEY: 0.0,
             }
             return
+        base_metrics["data/step_trainer_tokens"] = float(
+            packed_tensors["assistant_mask"].sum().item()
+        )
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        results: list[dict[str, float]] = []
         grad_accumulation_sequences = max(1, int(config.grad_accumulation_sequences))
         estimated_gradient_steps = math.ceil(
             disk_packed_tensors["num_sequences"] / grad_accumulation_sequences
@@ -705,13 +787,16 @@ class LocalBackend(Backend):
             disk_packed_tensors, config, dev_config, verbose
         ):
             num_gradient_steps = int(
-                result.pop("num_gradient_steps", estimated_gradient_steps)
+                result.pop(TRAIN_GRADIENT_STEPS_KEY, estimated_gradient_steps)
             )
             assert num_gradient_steps == estimated_gradient_steps, (
                 f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
             )
-            results.append(result)
-            yield {**result, "num_gradient_steps": num_gradient_steps}
+            yield {
+                **base_metrics,
+                **result,
+                TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
+            }
             pbar.update(1)
             pbar.set_postfix(result)
         pbar.close()
@@ -798,15 +883,20 @@ class LocalBackend(Backend):
         service = await self._get_service(model)
 
         pbar = tqdm.tqdm(total=len(batches), desc="sft train")
-        total_trainable_tokens = 0
+        total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
+        total_trajectories = len(trajectory_list)
         batch_count = 0
 
         async for result in service.train_sft(batches, verbose):
             pbar.update(1)
-            pbar.set_postfix({"loss": f"{result.get('loss', 0):.4f}"})
-            total_trainable_tokens += result.get("num_trainable_tokens", 0)
+            pbar.set_postfix({"loss": f"{result.get('loss/train', 0):.4f}"})
             batch_count += 1
-            yield result
+            yield {
+                **result,
+                "data/step_num_trajectories": float(total_trajectories),
+                "data/step_trainer_tokens": float(total_trainable_tokens),
+                TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
+            }
 
         pbar.close()
 

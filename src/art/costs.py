@@ -1,4 +1,4 @@
-"""Cost utilities for ART training and evaluation."""
+"""Cost utilities for ART training and Tinker inference."""
 
 from __future__ import annotations
 
@@ -16,11 +16,15 @@ class ModelPricing:
 
 
 TokenCount: TypeAlias = int | None
-CostCalculator: TypeAlias = Callable[[TokenCount, TokenCount], dict[str, float]]
+CostCalculator: TypeAlias = Callable[[TokenCount, TokenCount, str], dict[str, float]]
 
 # Pricing per model ($/1M tokens). Keep in sync with infra pricing.
 MODEL_PRICING: dict[str, ModelPricing] = {
     # Qwen models
+    "Qwen/Qwen3.5-4B": ModelPricing(prefill=0.22, sample=0.67, train=0.67),
+    "Qwen/Qwen3.5-27B": ModelPricing(prefill=1.24, sample=3.73, train=3.73),
+    "Qwen/Qwen3.5-35B-A3B": ModelPricing(prefill=0.36, sample=0.89, train=1.07),
+    "Qwen/Qwen3.5-397B-A17B": ModelPricing(prefill=2.00, sample=5.00, train=6.00),
     "Qwen/Qwen3-4B-Instruct-2507": ModelPricing(prefill=0.07, sample=0.22, train=0.22),
     "Qwen/Qwen3-8B": ModelPricing(prefill=0.13, sample=0.40, train=0.40),
     "Qwen/Qwen3-8B-Base": ModelPricing(prefill=0.13, sample=0.40, train=0.40),
@@ -60,6 +64,7 @@ MODEL_PRICING: dict[str, ModelPricing] = {
     "openai/gpt-oss-20b": ModelPricing(prefill=0.12, sample=0.30, train=0.36),
     # Moonshot models
     "moonshotai/Kimi-K2-Thinking": ModelPricing(prefill=0.98, sample=2.44, train=2.93),
+    "moonshotai/Kimi-K2.5": ModelPricing(prefill=1.47, sample=3.66, train=4.40),
 }
 
 
@@ -88,28 +93,35 @@ def compute_sample_costs(
     *,
     prompt_tokens: int | None,
     completion_tokens: int | None,
+    cost_context: str,
     pricing: ModelPricing,
 ) -> dict[str, float]:
-    """Compute prompt+completion costs for a single API call."""
+    """Compute Tinker prompt+completion costs for a single inference call."""
+    normalized_context = cost_context.strip("/")
+    if not normalized_context:
+        raise ValueError("cost_context must be non-empty")
     prompt_value = float(prompt_tokens or 0)
     completion_value = float(completion_tokens or 0)
     prefill_cost = tokens_to_cost(prompt_value, pricing.prefill)
     sample_cost = tokens_to_cost(completion_value, pricing.sample)
     return {
-        "costs_prefill": prefill_cost,
-        "costs_sample": sample_cost,
+        f"costs/{normalized_context}/tinker_prefill": prefill_cost,
+        f"costs/{normalized_context}/tinker_sample": sample_cost,
     }
 
 
 def build_cost_calculator(pricing: ModelPricing) -> CostCalculator:
-    """Return a callable that computes prompt+completion costs for a request."""
+    """Return a callable that computes split-scoped Tinker inference costs."""
 
     def _calculator(
-        prompt_tokens: int | None, completion_tokens: int | None
+        prompt_tokens: int | None,
+        completion_tokens: int | None,
+        cost_context: str,
     ) -> dict[str, float]:
         return compute_sample_costs(
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
+            cost_context=cost_context,
             pricing=pricing,
         )
 

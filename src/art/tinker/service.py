@@ -47,8 +47,8 @@ class TinkerService:
         self._server = OpenAICompatibleTinkerServer(
             host=config.get("host") if config else None,
             port=config.get("port") if config else None,
-            models=state.models,
         )
+        self._server.models = state.models
         with log_timing("Starting OpenAI-compatible Tinker server"):
             return await self._server.start()
 
@@ -80,7 +80,7 @@ class TinkerService:
             for mask, lp in zip(masks, logprobs_list):
                 logprobs[mask] = lp
             loss = loss_fn(inputs, logprobs.unsqueeze(0), None, None, _config)
-            return loss.policy_loss, {"policy_loss": loss.policy_loss.item()}
+            return loss.policy_loss, {"loss/train": loss.policy_loss.item()}
 
         shifted_tokens = shift_tensor(packed_tensors["tokens"], 0)
 

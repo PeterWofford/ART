@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cached_property
 from itertools import takewhile
 import math
 import random
@@ -16,7 +17,6 @@ from ..trajectories import History, Trajectory, TrajectoryGroup, get_messages
 class TokenizedResult:
     advantage: float
     chat: str
-    tokens: list[str]
     token_ids: list[int]
     input_pos: list[int]
     assistant_mask: list[int]
@@ -24,15 +24,19 @@ class TokenizedResult:
     pixel_values: torch.Tensor | None
     image_grid_thw: torch.Tensor | None
     trajectory: Trajectory
+    _tokenizer: "PreTrainedTokenizerBase" = field(repr=False, compare=False)
     weight: float = 0.0
     prompt_id: int = 0
     prompt_length: int = 0
+
+    @cached_property
+    def tokens(self) -> list[str]:
+        return [self._tokenizer.decode(token_id) for token_id in self.token_ids]
 
     def without_prompt(self) -> "TokenizedResult":
         return TokenizedResult(
             advantage=self.advantage,
             chat=self.chat,
-            tokens=self.tokens[self.prompt_length :],
             token_ids=self.token_ids[self.prompt_length :],
             input_pos=self.input_pos[self.prompt_length :],
             assistant_mask=self.assistant_mask[self.prompt_length :],
@@ -40,6 +44,7 @@ class TokenizedResult:
             pixel_values=None,
             image_grid_thw=None,
             trajectory=self.trajectory,
+            _tokenizer=self._tokenizer,
             weight=self.weight,
             prompt_id=self.prompt_id,
             prompt_length=0,
@@ -347,7 +352,6 @@ def tokenize_trajectory(
     return TokenizedResult(
         advantage=advantage,
         chat=chat,
-        tokens=[tokenizer.decode(token_id) for token_id in token_ids],
         token_ids=token_ids,
         input_pos=list(range(len(token_ids))),
         assistant_mask=assistant_mask,
@@ -355,6 +359,7 @@ def tokenize_trajectory(
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
         trajectory=trajectory,
+        _tokenizer=tokenizer,
     )
 
 

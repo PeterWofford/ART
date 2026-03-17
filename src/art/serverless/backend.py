@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal
 import warnings
 
@@ -9,6 +10,12 @@ from art.serverless.client import Client, ExperimentalTrainingConfig
 
 from .. import dev
 from ..backend import AnyTrainableModel, Backend
+from ..metrics_taxonomy import (
+    TRAIN_GRADIENT_STEPS_KEY,
+    average_metric_samples,
+    build_training_summary_metrics,
+    summarize_trajectory_groups,
+)
 from ..trajectories import Trajectory, TrajectoryGroup
 from ..types import ServerlessTrainResult, TrainConfig, TrainSFTConfig
 from ..utils.record_provenance import record_provenance
@@ -28,6 +35,44 @@ def _extract_step_from_wandb_artifact(artifact: "wandb.Artifact") -> int | None:
             except ValueError:
                 pass
     return None
+
+
+_UPSTREAM_TRAIN_METRIC_KEYS = {
+    "reward": "reward",
+    "reward_std_dev": "reward_std_dev",
+    "exception_rate": "exception_rate",
+    "policy_loss": "loss/train",
+    "loss": "loss/train",
+    "entropy": "loss/entropy",
+    "kl_div": "loss/kl_div",
+    "kl_policy_ref": "loss/kl_policy_ref",
+    "grad_norm": "loss/grad_norm",
+    "learning_rate": "loss/learning_rate",
+    "num_groups_submitted": "data/step_num_groups_submitted",
+    "num_groups_trainable": "data/step_num_groups_trainable",
+    "num_trajectories": "data/step_num_trajectories",
+    "num_trainable_tokens": "data/step_trainer_tokens",
+    "train_tokens": "data/step_trainer_tokens",
+    "num_datums": "data/step_num_datums",
+}
+
+
+def _canonicalize_upstream_metric_key(metric: str) -> str:
+    if "/" in metric:
+        return metric
+    if metric == "tokens_per_second":
+        return ""
+    if metric.startswith("group_metric_"):
+        return f"group_{metric[len('group_metric_') :]}"
+    return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
+
+
+def _canonicalize_upstream_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    return {
+        canonical_key: float(value)
+        for key, value in metrics.items()
+        if (canonical_key := _canonicalize_upstream_metric_key(key))
+    }
 
 
 class ServerlessBackend(Backend):
@@ -149,7 +194,6 @@ class ServerlessBackend(Backend):
         *,
         # Core training parameters
         learning_rate: float = 5e-6,
-        beta: float = 0.0,
         # RL algorithm settings
         ppo: bool = False,
         epsilon: float | None = None,
@@ -179,7 +223,6 @@ class ServerlessBackend(Backend):
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
-            beta: KL penalty coefficient. Defaults to 0.0.
             ppo: Whether to use PPO clipping. Defaults to False.
             epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
@@ -212,7 +255,7 @@ class ServerlessBackend(Backend):
         groups_list = list(trajectory_groups)
 
         # Build config objects from explicit kwargs
-        config = TrainConfig(learning_rate=learning_rate, beta=beta)
+        config = TrainConfig(learning_rate=learning_rate)
         dev_config: dev.TrainConfig = {
             "advantage_balance": advantage_balance,
             "importance_sampling_level": importance_sampling_level,
@@ -235,20 +278,28 @@ class ServerlessBackend(Backend):
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
+        trainer_started = time.monotonic()
         async for metrics in self._train_model(
             model, groups_list, config, dev_config, verbose
         ):
             training_metrics.append(metrics)
 
         # Aggregate metrics
-        avg_metrics: dict[str, float] = {}
-        if training_metrics:
-            avg_metrics = {
-                k: sum(d.get(k, 0) for d in training_metrics)
-                / sum(1 for d in training_metrics if k in d)
-                for k in {k for d in training_metrics for k in d}
-                if k != "num_gradient_steps"
+        avg_metrics = average_metric_samples(training_metrics)
+        summary = summarize_trajectory_groups(groups_list)
+        avg_metrics.setdefault(
+            "time/step_trainer_s", time.monotonic() - trainer_started
+        )
+        avg_metrics.update(
+            {
+                key: value
+                for key, value in build_training_summary_metrics(
+                    summary,
+                    include_trainable_groups=True,
+                ).items()
+                if key not in avg_metrics
             }
+        )
 
         # Get step and artifact name
         step = await self._get_step(model)
@@ -275,6 +326,11 @@ class ServerlessBackend(Backend):
         dev_config: dev.TrainConfig,
         verbose: bool = False,
     ) -> AsyncIterator[dict[str, float]]:
+        summary = summarize_trajectory_groups(trajectory_groups)
+        base_metrics = build_training_summary_metrics(
+            summary,
+            include_trainable_groups=True,
+        )
         assert model.id is not None, "Model ID is required"
         training_job = await self._client.training_jobs.create(  # ty:ignore[possibly-missing-attribute]
             model_id=model.id,
@@ -307,7 +363,14 @@ class ServerlessBackend(Backend):
                     assert pbar is not None and num_sequences is not None
                     pbar.update(1)
                     pbar.set_postfix(event.data)
-                    yield {**event.data, "num_gradient_steps": num_sequences}
+                    metrics = _canonicalize_upstream_metrics(
+                        {k: float(v) for k, v in event.data.items()}
+                    )
+                    yield {
+                        **base_metrics,
+                        **metrics,
+                        TRAIN_GRADIENT_STEPS_KEY: float(num_sequences),
+                    }
                 elif event.type == "training_started":
                     num_sequences = event.data["num_sequences"]
                     if pbar is None:
@@ -472,7 +535,14 @@ class ServerlessBackend(Backend):
                     assert pbar is not None and num_batches is not None
                     pbar.update(1)
                     pbar.set_postfix(event.data)
-                    yield {**event.data, "num_gradient_steps": num_batches}
+                    metrics = _canonicalize_upstream_metrics(
+                        {k: float(v) for k, v in event.data.items()}
+                    )
+                    yield {
+                        **metrics,
+                        "data/step_num_trajectories": float(num_trajectories),
+                        TRAIN_GRADIENT_STEPS_KEY: float(num_batches),
+                    }
                 elif event.type == "training_started":
                     num_batches = event.data.get("num_sequences", 0)
                     if pbar is None:
