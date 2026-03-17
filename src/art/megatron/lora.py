@@ -684,6 +684,8 @@ class MLPExpertsLinearFC2LoRA(torch.nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_out, bias_out = self.linear_fc2(x, tokens_per_expert)
         adapter_out = self.lora(x, tokens_per_expert=tokens_per_expert)
+        # the reason there is no TP comm here is because the MoE token routing handles
+        # expert TP comm externally
         return base_out + adapter_out, bias_out
 
 

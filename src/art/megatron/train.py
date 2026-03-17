@@ -173,6 +173,7 @@ def configure_moe_routing_replay(
 def build_training_runtime(
     *,
     model_identifier: str | None = None,
+    provider_torch_dtype: torch.dtype = torch.bfloat16,
     provider_configure: Callable[[Any], None] | None = None,
     optimizer_config: OptimizerConfig | None = None,
     moe_routing_replay_path: str | None = None,
@@ -182,7 +183,9 @@ def build_training_runtime(
     print_optimizer_stats: bool = True,
 ) -> TrainingRuntime:
     provider = get_provider(
-        model_identifier or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER)
+        model_identifier
+        or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
+        torch_dtype=provider_torch_dtype,
     )
     if provider_configure is not None:
         provider_configure(provider)
@@ -194,7 +197,11 @@ def build_training_runtime(
     model = cast(
         list[MegatronModule],
         provider.provide_distributed_model(
-            ddp_config=DistributedDataParallelConfig(),
+            ddp_config=DistributedDataParallelConfig(
+                # memory and comm for this should be small anyways cause lora
+                grad_reduce_in_fp32=True,
+                average_in_collective=False,
+            ),
             data_parallel_random_init=False,
         ),
     )
@@ -327,7 +334,7 @@ def _zero_contribution_inputs(template: PackedTensors) -> PackedTensors:
 def resolve_local_grad_accumulation_sequences(
     global_grad_accumulation_sequences: int,
 ) -> int:
-    dp_world_size = ps.get_data_parallel_world_size(with_context_parallel=True)
+    dp_world_size = ps.get_data_parallel_world_size()
     if (
         global_grad_accumulation_sequences <= 0
         or global_grad_accumulation_sequences % dp_world_size != 0
@@ -345,7 +352,8 @@ def build_micro_sample_indices(
     num_sequences: int,
     global_grad_accumulation_sequences: int,
 ) -> list[int | None]:
-    dp_rank = ps.get_data_parallel_rank(with_context_parallel=True)
+    dp_rank = ps.get_data_parallel_rank()
+    dp_world_size = ps.get_data_parallel_world_size()
     local_grad_accumulation_sequences = resolve_local_grad_accumulation_sequences(
         global_grad_accumulation_sequences=global_grad_accumulation_sequences,
     )
@@ -356,9 +364,10 @@ def build_micro_sample_indices(
         global_step_indices.append(
             global_sample_index if global_sample_index < num_sequences else None
         )
-    rank_start = dp_rank * local_grad_accumulation_sequences
-    rank_end = rank_start + local_grad_accumulation_sequences
-    return global_step_indices[rank_start:rank_end]
+    return [
+        global_step_indices[offset * dp_world_size + dp_rank]
+        for offset in range(local_grad_accumulation_sequences)
+    ]
 
 
 def select_micro_inputs(
@@ -380,10 +389,6 @@ def _move_inputs_to_device(inputs: PackedTensors, device: torch.device) -> None:
             inputs[key] = value.to(device)  # type: ignore[index]
 
 
-def _finalize_grads(model_chunks: list[MegatronModule]) -> None:
-    finalize_model_grads_extended(cast(list[torch.nn.Module], model_chunks))
-
-
 def _optimizer_step(
     optimizer: Any,
     learning_rate: float,
@@ -397,9 +402,13 @@ def _optimizer_step(
     return update_successful, grad_norm, num_zeros_in_grad
 
 
-def _reduce_loss(loss: torch.Tensor) -> torch.Tensor:
+def _reduce_loss(
+    loss: torch.Tensor,
+    op: torch.distributed.ReduceOp.RedOpType = torch.distributed.ReduceOp.AVG,
+    group: torch.distributed.ProcessGroup | None = None,
+) -> torch.Tensor:
     reduced_loss = loss.detach().clone()
-    torch.distributed.all_reduce(reduced_loss, op=torch.distributed.ReduceOp.AVG)
+    torch.distributed.all_reduce(reduced_loss, op=op, group=group)
     return reduced_loss
 
 
@@ -408,39 +417,12 @@ def _count_trainable_tokens(inputs: PackedTensors) -> float:
     return float(assistant_mask.sum().item())
 
 
-def _global_token_normalization_scale(
+def _local_trainable_token_count_tensor(
     micro_inputs: list[PackedTensors],
     device: torch.device,
-) -> float:
-    """
-    Data parallel grad normalization scale
-    dp_world_size / global_micro_batch_token_count, where dp_world_size cancels out
-    the dp grad averaging, since we divide by global rather than local token count.
-    Using reduction="sum" and dividing by global token count means each rank is normalized
-    correctly.
-    """
+) -> torch.Tensor:
     local_token_total = sum(_count_trainable_tokens(micro) for micro in micro_inputs)
-    dp_world_size = 1
-    global_token_total = local_token_total
-
-    dp_world_size = ps.get_data_parallel_world_size(with_context_parallel=True)
-    if dp_world_size > 1:
-        dp_group = ps.get_data_parallel_group(with_context_parallel=True)
-
-        global_token_tensor = torch.tensor(
-            [local_token_total], device=device, dtype=torch.float32
-        )
-        torch.distributed.all_reduce(
-            global_token_tensor,
-            op=torch.distributed.ReduceOp.SUM,
-            group=dp_group,
-        )
-        global_token_total = float(global_token_tensor.item())
-
-    if global_token_total <= 0.0:
-        return 0.0
-
-    return float(dp_world_size) / global_token_total
+    return torch.tensor([local_token_total], device=device, dtype=torch.float32)
 
 
 def run_training_step(
@@ -472,13 +454,10 @@ def run_training_step(
         micro_sample_indices = [sample_index]
 
     if moe_routing_replay_controller is not None:
-        step_sample_index = next(
-            (index for index in micro_sample_indices if index is not None),
-            0,
-        )
         moe_routing_replay_controller.set_step(
             step_index=step_index,
-            sample_index=step_sample_index,
+            sample_index=micro_sample_indices,
+            global_grad_accumulation_sequences=config.grad_accumulation_sequences,
         )
 
     device = next(model_chunks[0].parameters()).device
@@ -487,8 +466,8 @@ def run_training_step(
         chunk.zero_grad_buffer()  # ty: ignore[call-non-callable]
 
     micro_count = len(micro_inputs)
-    normalization_scale = _global_token_normalization_scale(micro_inputs, device=device)
-    normalized_loss: torch.Tensor | None = None
+    raw_loss_sum: torch.Tensor | None = None
+    num_tokens = _local_trainable_token_count_tensor(micro_inputs, device=device)
     probs_corr_sum = 0.0
     new_logprobs: torch.Tensor | None = None
 
@@ -516,26 +495,29 @@ def run_training_step(
             experimental_config,
             reduction="sum",
         )
-        micro_loss = (
-            loss_info.mean_policy_loss + config.beta * loss_info.mean_kl
-        ) * normalization_scale
+        micro_loss = loss_info.policy_loss + config.beta * loss_info.kl
         micro_loss.backward()
         probs_corr_sum += float(loss_info.probs_corr.item())
         detached_micro_loss = micro_loss.detach()
-        if normalized_loss is None:
-            normalized_loss = detached_micro_loss
+        if raw_loss_sum is None:
+            raw_loss_sum = detached_micro_loss
         else:
-            normalized_loss = normalized_loss + detached_micro_loss
+            raw_loss_sum = raw_loss_sum + detached_micro_loss
 
-    if new_logprobs is None or normalized_loss is None:
+    if new_logprobs is None or raw_loss_sum is None:
         raise RuntimeError("run_training_step did not produce outputs")
 
-    _finalize_grads(model_chunks)
+    finalize_model_grads_extended(model_chunks, num_tokens=num_tokens)
     update_successful, grad_norm, num_zeros_in_grad = _optimizer_step(
         optimizer,
         learning_rate,
     )
-    reduced_loss = _reduce_loss(normalized_loss)
+    global_num_tokens = max(num_tokens.item(), 1.0)
+    reduced_loss = _reduce_loss(
+        raw_loss_sum / global_num_tokens,
+        op=torch.distributed.ReduceOp.SUM,
+        group=ps.get_data_parallel_group(with_context_parallel=True),
+    )
 
     if moe_routing_replay_controller is not None:
         moe_routing_replay_controller.finalize_step()

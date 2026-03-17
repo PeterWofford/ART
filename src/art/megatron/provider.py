@@ -5,6 +5,11 @@ from typing import Callable
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.gpt_provider import GPTModelProvider
+from megatron.bridge.models.hf_pretrained.state import (
+    SafeTensorsStateSource,
+    StateDict,
+    StateSource,
+)
 from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -28,15 +33,49 @@ def _resolve_layer_spec(
     return base_layer_spec(config, **kwargs)
 
 
-def get_provider(model: str) -> GPTModelProvider:
+class _CastingStateSource(StateSource):
+    def __init__(self, source: StateSource, *, dtype: torch.dtype):
+        self._source = source
+        self._dtype = dtype
+
+    def get_all_keys(self) -> list[str]:
+        return self._source.get_all_keys()
+
+    def load_tensors(self, keys: list[str]) -> dict[str, torch.Tensor]:
+        loaded = self._source.load_tensors(keys)
+        return {
+            key: (
+                value.to(dtype=self._dtype)
+                if torch.is_floating_point(value) and value.dtype != self._dtype
+                else value
+            )
+            for key, value in loaded.items()
+        }
+
+    def has_glob(self, pattern: str) -> bool:
+        return self._source.has_glob(pattern)
+
+
+def get_provider(
+    model: str,
+    *,
+    torch_dtype: torch.dtype = torch.bfloat16,
+) -> GPTModelProvider:
     bridge = AutoBridge.from_hf_pretrained(
         model,
-        torch_dtype=torch.bfloat16,
+        dtype=torch_dtype,
         trust_remote_code=True,
     )
     assert isinstance(bridge._model_bridge, Qwen3MoEBridge), (
         "Only Qwen3 MoE models are supported"
     )
+    if torch_dtype != torch.bfloat16:
+        bridge.hf_pretrained._state_dict_accessor = StateDict(
+            _CastingStateSource(
+                SafeTensorsStateSource(bridge.hf_pretrained.model_name_or_path),
+                dtype=torch_dtype,
+            )
+        )
     provider = bridge.to_megatron_provider()
     base_layer_spec = provider.transformer_layer_spec
 
@@ -62,6 +101,11 @@ def get_provider(model: str) -> GPTModelProvider:
     provider.expert_tensor_parallel_size = 1
     provider.moe_shared_expert_overlap = True
     provider.moe_router_dtype = "fp32"
+    # params are disabled anyways, but should know about this if we switch to full FT
+    # because DP 'dummy' microbatches will unintentionally have loss for this
+    provider.moe_aux_loss_coeff = 0.0
+    # effectively just a flag modifying finalize_model_grads behavior for DPxCP
+    provider.calculate_per_token_loss = True
     if provider.tensor_model_parallel_size > 1:
         provider.sequence_parallel = True
     return provider

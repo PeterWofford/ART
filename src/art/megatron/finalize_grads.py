@@ -59,7 +59,10 @@ def _resolve_reduce_op(op: GradSyncOp) -> Any:
     raise RuntimeError(f"Unknown grad sync op: {op}")
 
 
-def finalize_model_grads_extended(model: list[torch.nn.Module]) -> None:
+def finalize_model_grads_extended(
+    model: list[torch.nn.Module],
+    num_tokens: torch.Tensor | None = None,
+) -> None:
     """Run Megatron finalize, then apply extra LoRA grad-sync reductions.
 
     Megatron finalize handles DP/CP(via `param.allreduce=True`)(and expert-DP via `param.allreduce=False`) internally.
@@ -68,7 +71,7 @@ def finalize_model_grads_extended(model: list[torch.nn.Module]) -> None:
     """
     # All-reduce all model grads across DP replicas, layernorm grads for sequence parallelism,
     # embedding grads across first and last pipeline stages (if not tied)
-    finalize_model_grads(model)
+    finalize_model_grads(model, num_tokens=num_tokens)
 
     buckets: dict[
         tuple[GradSyncDomain, GradSyncOp, torch.dtype, torch.device],
@@ -111,6 +114,13 @@ def finalize_model_grads_extended(model: list[torch.nn.Module]) -> None:
 
         grads = [grad for _name, grad in entries]
         coalesced = _flatten_dense_tensors(grads)
-        torch.distributed.all_reduce(coalesced, op=_resolve_reduce_op(op), group=group)
-        for grad, synced in zip(grads, _unflatten_dense_tensors(coalesced, grads)):
+        reduced = (
+            coalesced.float()
+            if torch.is_floating_point(coalesced) and coalesced.dtype != torch.float32
+            else coalesced
+        )
+        torch.distributed.all_reduce(reduced, op=_resolve_reduce_op(op), group=group)
+        if reduced is not coalesced:
+            reduced = reduced.to(dtype=coalesced.dtype)
+        for grad, synced in zip(grads, _unflatten_dense_tensors(reduced, grads)):
             grad.copy_(synced)
