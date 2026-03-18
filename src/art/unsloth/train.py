@@ -39,6 +39,10 @@ _UPSTREAM_TRAIN_METRIC_KEYS = {
 }
 
 
+class StopTrainingLoop(Exception):
+    """Signal that the background trainer loop should exit cleanly."""
+
+
 def _canonicalize_upstream_metric_key(metric: str) -> str:
     if "/" in metric:
         return metric
@@ -74,7 +78,10 @@ async def train(
     if not is_train_dict:
         trainer._metrics = {"train": defaultdict(list)}
     try:
-        trainer.train()
+        try:
+            trainer.train()
+        except StopTrainingLoop:
+            return
     finally:
         trainer.compute_loss = _compute_loss
         trainer.log = _log  # ty:ignore[invalid-assignment]

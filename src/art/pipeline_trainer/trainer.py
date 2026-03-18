@@ -154,6 +154,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             total_scenarios=total_scenarios,
             num_workers=num_rollout_workers,
         )
+        self._validate_backend_support()
 
     async def train(self, *, handle_signals: bool = True) -> None:
         """Run the training pipeline over the configured scenario iterator."""
@@ -276,6 +277,72 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self._output_queue.put_nowait(None)
             except asyncio.QueueFull:
                 loop.create_task(self._output_queue.put(None))
+
+    def _is_local_backend(self) -> bool:
+        from art.local.backend import LocalBackend
+
+        return isinstance(self.backend, LocalBackend)
+
+    def _local_backend_is_dedicated(self) -> bool:
+        if not isinstance(self.model, art.TrainableModel):
+            return False
+        from art.dev.validate import is_dedicated_mode
+
+        return is_dedicated_mode(
+            self.model._internal_config or art.dev.InternalModelConfig()
+        )
+
+    def _validate_backend_support(self) -> None:
+        if not self._is_local_backend():
+            return
+        if self._local_backend_is_dedicated():
+            self._validate_local_backend_train_config()
+            return
+        raise ValueError(
+            "PipelineTrainer only supports LocalBackend in dedicated mode. "
+            "Shared LocalBackend pauses inference during training and is not "
+            "a supported async PipelineTrainer path. Set both "
+            "trainer_gpu_ids and inference_gpu_ids on the TrainableModel "
+            "_internal_config to use LocalBackend with PipelineTrainer."
+        )
+
+    def _validate_local_backend_train_config(self) -> None:
+        if self.loss_fn not in {"cispo", "ppo"}:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) only supports "
+                "loss_fn='cispo' or loss_fn='ppo'."
+            )
+        if self.loss_fn_config is not None:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires "
+                "loss_fn_config=None."
+            )
+        if not self.normalize_advantages:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires "
+                "normalize_advantages=True."
+            )
+        if self.adam_params is not None:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires adam_params=None."
+            )
+
+    def _backend_train_kwargs(self, *, save_checkpoint: bool) -> dict[str, Any]:
+        if not self._is_local_backend():
+            return {
+                "learning_rate": self.learning_rate,
+                "loss_fn": self.loss_fn,
+                "loss_fn_config": self.loss_fn_config,
+                "normalize_advantages": self.normalize_advantages,
+                "save_checkpoint": save_checkpoint,
+                "adam_params": self.adam_params,
+            }
+
+        return {
+            "learning_rate": self.learning_rate,
+            "ppo": self.loss_fn == "ppo",
+            "save_checkpoint": save_checkpoint,
+        }
 
     async def _skip_scenarios(
         self, scenarios: AsyncIterator[ScenarioT], count: int
@@ -412,18 +479,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
             self._status.note_training_start(len(batch))
             train_call_start = time.monotonic()
+            train_kwargs = self._backend_train_kwargs(save_checkpoint=should_checkpoint)
             if os.getenv("ART_TRAIN_STEP_LOG"):
                 print(f"[train] step {expected_step} starting (batch={len(batch)})")
             try:
                 result = await self.backend.train(
                     self.model,
                     batch,
-                    learning_rate=self.learning_rate,
-                    loss_fn=self.loss_fn,
-                    loss_fn_config=self.loss_fn_config,
-                    normalize_advantages=self.normalize_advantages,
-                    save_checkpoint=should_checkpoint,
-                    adam_params=self.adam_params,
+                    **train_kwargs,
                 )
             except Exception:
                 self._status.note_training_end()

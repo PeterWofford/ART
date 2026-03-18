@@ -31,8 +31,9 @@ async def pull_model_trajectories(model: ArtModel) -> None:
             "Environment variable BACKUP_BUCKET is required but was not found."
         )
 
-    # Use the LocalBackend context manager to work with the on-disk artefacts.
-    with LocalBackend() as backend:
+    # Use the LocalBackend async context manager so backend cleanup can await
+    # any background service shutdown before returning.
+    async with LocalBackend() as backend:
         print(
             f"Pulling trajectories for model '{model.name}' from S3 bucket '{bucket}'…",
             flush=True,

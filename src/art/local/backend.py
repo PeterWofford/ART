@@ -159,19 +159,59 @@ class LocalBackend(Backend):
     def __enter__(self) -> Self:
         return self
 
+    async def __aenter__(self) -> Self:
+        return self
+
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            running_loop = False
+        else:
+            running_loop = True
+
+        if running_loop or any(
+            getattr(service, "aclose", None) is not None
+            for service in self._services.values()
+        ):
+            warnings.warn(
+                "LocalBackend used as a sync context manager. Cleanup uses the "
+                "best-effort sync shutdown path and cannot await service "
+                "teardown safely here; use `async with LocalBackend(...)` or "
+                "`await backend.close()` instead.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self._close()
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.close()
 
     async def close(self) -> None:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
-        self._close()
+        for _, service in self._services.items():
+            # Keep this logic aligned with _close(), but avoid double-closing
+            # services that expose an awaited aclose() path.
+            aclose = getattr(service, "aclose", None)
+            if aclose is not None:
+                await aclose()
+            else:
+                close = getattr(service, "close", None)
+                if close is not None:
+                    close()
+            close_proxy(service)
 
     def _close(self) -> None:
         for _, service in self._services.items():
@@ -219,21 +259,31 @@ class LocalBackend(Backend):
                   If None, returns name for latest checkpoint (step 0 initially).
         """
 
+        def _served_step() -> int | None:
+            if not isinstance(model, TrainableModel):
+                return None
+            if model.name not in self._services:
+                return None
+            from ..dev.validate import is_dedicated_mode
+
+            if not is_dedicated_mode(
+                model._internal_config or dev.InternalModelConfig()
+            ):
+                return None
+            loaded_step = getattr(self._services[model.name], "_latest_step", None)
+            return loaded_step if isinstance(loaded_step, int) else None
+
         # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
         # Default to step 0 when not specified (the initial checkpoint created at registration)
         if step is not None:
             actual_step = step
-        elif model.name in self._services and self._in_process:
-            # In dedicated mode the service tracks which adapter vLLM has
-            # actually loaded.  Reading the filesystem would race: the
-            # checkpoint directory appears before the HTTP reload completes.
-            svc = self._services[model.name]
-            loaded_step = getattr(svc, "_latest_step", None)
-            actual_step = (
-                loaded_step if loaded_step is not None else self.__get_step(model)
-            )
         else:
-            actual_step = self.__get_step(model)
+            # In dedicated mode the service tracks which adapter vLLM has
+            # actually loaded. Reading the filesystem would race: the checkpoint
+            # directory appears before the HTTP reload completes.
+            actual_step = _served_step()
+            if actual_step is None:
+                actual_step = self.__get_step(model)
         name = f"{model.name}@{actual_step}"
         logger.debug(
             f"[BACKEND] _model_inference_name: step_arg={step} "

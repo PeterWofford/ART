@@ -35,7 +35,7 @@ from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, get_worker, openai_server_task, run_on_workers
-from .train import gc_and_empty_cuda_cache, train
+from .train import StopTrainingLoop, gc_and_empty_cuda_cache, train
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +53,15 @@ class SupportsLoadLora(Protocol):
     """Protocol for models that support the optimized load_lora method."""
 
     def load_lora(self, lora_path: str, load_tensors: bool = True) -> LoRARequest: ...
+
+
+class _StopTrainInputs:
+    """Dedicated sentinel for stopping the background trainer loop."""
+
+
+_STOP_TRAIN_INPUT = _StopTrainInputs()
+_TRAIN_TASK_GRACEFUL_SHUTDOWN_TIMEOUT_S = 5.0
+_TRAIN_TASK_CANCEL_TIMEOUT_S = 1.0
 
 
 def precalculate_new_logprobs(
@@ -91,7 +100,7 @@ async def process_train_batch(
     packed_tensors: PackedTensors,
     config: types.TrainConfig,
     _config: dev.TrainConfig,
-    inputs_queue: asyncio.Queue[TrainInputs],
+    inputs_queue: asyncio.Queue[TrainInputs | _StopTrainInputs],
     results_queue: asyncio.Queue[dict[str, float]],
     train_task: asyncio.Task[None],
     trainer: "GRPOTrainer",
@@ -215,7 +224,7 @@ class UnslothState:
     tokenizer: PreTrainedTokenizerBase
     peft_model: peft.peft_model.PeftModelForCausalLM
     trainer: GRPOTrainer
-    inputs_queue: asyncio.Queue[TrainInputs]
+    inputs_queue: asyncio.Queue[TrainInputs | _StopTrainInputs]
     results_queue: asyncio.Queue[dict[str, float]]
     _is_offloaded: bool = False
     _pinned_buffers: dict[str, torch.Tensor] | None = None
@@ -316,6 +325,7 @@ class UnslothService:
     _vllm_log_file: Any = field(default=None, repr=False)
     _vllm_host: str = "127.0.0.1"
     _vllm_port: int = 0
+    _train_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     @property
     def is_dedicated(self) -> bool:
@@ -325,6 +335,46 @@ class UnslothService:
         """Return a new unique LoRA ID to avoid collisions in vLLM."""
         self._lora_id_counter += 1
         return self._lora_id_counter
+
+    def _request_train_task_stop(self) -> asyncio.Task[None] | None:
+        train_task = self._train_task
+        if train_task is None:
+            return None
+        if train_task.done():
+            return train_task
+
+        # `_state` is a cached_property. Read from __dict__ directly so shutdown
+        # does not instantiate the full trainer state solely to stop a task.
+        state = self.__dict__.get("_state")
+        if isinstance(state, UnslothState):
+            state.inputs_queue.put_nowait(_STOP_TRAIN_INPUT)
+        return train_task
+
+    async def _shutdown_train_task(self) -> None:
+        train_task = self._request_train_task_stop()
+        if train_task is None:
+            return
+
+        try:
+            # Give the trainer loop time to consume the stop sentinel and exit
+            # normally before falling back to cancellation.
+            await asyncio.wait_for(
+                train_task, timeout=_TRAIN_TASK_GRACEFUL_SHUTDOWN_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            train_task.cancel()
+            try:
+                await asyncio.wait_for(train_task, timeout=_TRAIN_TASK_CANCEL_TIMEOUT_S)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._train_task = None
+
+    async def aclose(self) -> None:
+        await self._shutdown_train_task()
+        self.close()
 
     # =========================================================================
     # Dedicated mode: vLLM subprocess lifecycle
@@ -450,6 +500,7 @@ class UnslothService:
 
     def close(self) -> None:
         """Terminate vLLM subprocess if running."""
+        self._request_train_task_stop()
         if self._vllm_process is None:
             return
         self._vllm_process.terminate()
@@ -981,17 +1032,19 @@ class UnslothService:
             trainer.create_optimizer()
 
         # Initialize queues
-        inputs_queue: asyncio.Queue[TrainInputs] = asyncio.Queue()
+        inputs_queue: asyncio.Queue[TrainInputs | _StopTrainInputs] = asyncio.Queue()
         results_queue: asyncio.Queue[dict[str, float]] = asyncio.Queue()
 
         # Patch trainer _prepare_inputs() to pull from queue
         def _async_prepare_inputs(*_: Any, **__: Any) -> dict[str, torch.Tensor]:
-            async def get_inputs() -> TrainInputs:
+            async def get_inputs() -> TrainInputs | _StopTrainInputs:
                 return await inputs_queue.get()
 
             # Force otherwise synchronous _prepare_inputs() to yield
             # with nested asyncio.run() call
             inputs = asyncio.run(get_inputs())
+            if isinstance(inputs, _StopTrainInputs):
+                raise StopTrainingLoop()
 
             return cast(dict[str, torch.Tensor], inputs)
 
