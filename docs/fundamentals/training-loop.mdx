@@ -22,6 +22,8 @@ ART's functionality is divided into a [**client**](/fundamentals/art-client) and
 
 This training loop runs until a specified number of inference and training iterations have completed.
 
+This describes the default shared-resource loop. `PipelineTrainer` can also run with `LocalBackend` in dedicated mode, where training and inference stay on separate GPUs and the latest served step advances only after vLLM reloads the new LoRA.
+
 Training and inference use both the ART **client** and **backend**. Learn more by following the links below!
 
 <div className="cards-container">

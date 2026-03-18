@@ -73,6 +73,30 @@ backend = LocalBackend(
 )
 ```
 
+If you're using `PipelineTrainer`, `LocalBackend` is currently supported only in dedicated mode, where training and inference run on separate GPUs.
+
+```python
+from art import TrainableModel
+from art.dev import InternalModelConfig
+from art.local import LocalBackend
+
+backend = LocalBackend(path="./.art")
+model = TrainableModel(
+    name="pipeline-localbackend",
+    project="my-project",
+    base_model="Qwen/Qwen3-0.6B",
+    _internal_config=InternalModelConfig(
+        trainer_gpu_ids=[0],
+        inference_gpu_ids=[1],
+    ),
+)
+```
+
+Shared `LocalBackend` still pauses inference during training, so ART rejects that configuration for `PipelineTrainer`.
+
+In dedicated mode, a new checkpoint becomes the default inference target only after its LoRA has been reloaded into vLLM. That checkpoint publication flow is backend-specific, so `save_checkpoint` does not have identical semantics across every ART backend.
+Requests that are already in flight keep using the adapter they started with; the reload only affects subsequent routing to the latest served step.
+
 ## Using a backend
 
 Once initialized, a backend can be used in the same way regardless of whether it runs locally or remotely.
