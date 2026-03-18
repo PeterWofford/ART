@@ -106,39 +106,6 @@ async def test_pipeline_trainer_local_backend_dedicated_smoke() -> None:
         "Say yes again",
         "Say no again",
     ]
-    client: openai.AsyncOpenAI | None = None
-
-    async def rollout_fn(
-        model: art.TrainableModel,
-        scenario: dict[str, str],
-        _config: None,
-    ) -> art.TrajectoryGroup:
-        await asyncio.sleep(0.2)
-        messages: art.Messages = [{"role": "user", "content": scenario["prompt"]}]
-        assert client is not None
-        completion = await client.chat.completions.create(
-            messages=messages,
-            model=model.get_inference_name(),
-            max_tokens=10,
-            timeout=60,
-            temperature=1,
-            n=2,
-            logprobs=True,
-            top_logprobs=0,
-        )
-        return art.TrajectoryGroup(
-            [
-                art.Trajectory(
-                    messages_and_choices=[*messages, choice],
-                    reward=reward_for_answer(choice.message.content or ""),
-                )
-                for choice in completion.choices
-            ]
-        )
-
-    async def scenario_iter():
-        for prompt in prompts:
-            yield {"prompt": prompt}
 
     with tempfile.TemporaryDirectory() as tmpdir:
         async with LocalBackend(path=tmpdir) as backend:
@@ -148,10 +115,44 @@ async def test_pipeline_trainer_local_backend_dedicated_smoke() -> None:
                 base_model=get_base_model(),
                 _internal_config=get_dedicated_vllm_test_config(),
             )
-            client: openai.AsyncOpenAI | None = None
+
+            async def scenario_iter():
+                for prompt in prompts:
+                    yield {"prompt": prompt}
+
+            await model.register(backend)
+            client = model.openai_client()
             try:
-                await model.register(backend)
-                client = model.openai_client()
+
+                async def rollout_fn(
+                    rollout_model: art.TrainableModel,
+                    scenario: dict[str, str],
+                    _config: None,
+                ) -> art.TrajectoryGroup:
+                    await asyncio.sleep(0.2)
+                    messages: art.Messages = [
+                        {"role": "user", "content": scenario["prompt"]}
+                    ]
+                    completion = await client.chat.completions.create(
+                        messages=messages,
+                        model=rollout_model.get_inference_name(),
+                        max_tokens=10,
+                        timeout=60,
+                        temperature=1,
+                        n=2,
+                        logprobs=True,
+                        top_logprobs=0,
+                    )
+                    return art.TrajectoryGroup(
+                        [
+                            art.Trajectory(
+                                messages_and_choices=[*messages, choice],
+                                reward=reward_for_answer(choice.message.content or ""),
+                            )
+                            for choice in completion.choices
+                        ]
+                    )
+
                 trainer = PipelineTrainer(
                     model=model,
                     backend=backend,
@@ -180,5 +181,4 @@ async def test_pipeline_trainer_local_backend_dedicated_smoke() -> None:
                 assert f"{model.name}@0" in model_ids
                 assert f"{model.name}@{latest_step}" in model_ids
             finally:
-                if client is not None:
-                    await client.close()
+                await client.close()

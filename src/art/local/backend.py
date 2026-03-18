@@ -168,25 +168,6 @@ class LocalBackend(Backend):
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        try:
-            asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = False
-        else:
-            running_loop = True
-
-        if running_loop or any(
-            getattr(service, "aclose", None) is not None
-            for service in self._services.values()
-        ):
-            warnings.warn(
-                "LocalBackend used as a sync context manager. Cleanup uses the "
-                "best-effort sync shutdown path and cannot await service "
-                "teardown safely here; use `async with LocalBackend(...)` or "
-                "`await backend.close()` instead.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
         self._close()
 
     async def __aexit__(
@@ -201,20 +182,18 @@ class LocalBackend(Backend):
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
-        for _, service in self._services.items():
-            # Keep this logic aligned with _close(), but avoid double-closing
-            # services that expose an awaited aclose() path.
+        for service in self._services.values():
             aclose = getattr(service, "aclose", None)
-            if aclose is not None:
-                await aclose()
-            else:
+            if aclose is None:
                 close = getattr(service, "close", None)
                 if close is not None:
                     close()
+            else:
+                await aclose()
             close_proxy(service)
 
     def _close(self) -> None:
-        for _, service in self._services.items():
+        for service in self._services.values():
             close = getattr(service, "close", None)
             if close is not None:
                 close()
@@ -259,35 +238,27 @@ class LocalBackend(Backend):
                   If None, returns name for latest checkpoint (step 0 initially).
         """
 
-        def _served_step() -> int | None:
-            if not isinstance(model, TrainableModel):
-                return None
-            if model.name not in self._services:
-                return None
+        requested_step = step
+
+        if step is None and isinstance(model, TrainableModel):
             from ..dev.validate import is_dedicated_mode
 
-            if not is_dedicated_mode(
+            service = self._services.get(model.name)
+            if service is not None and is_dedicated_mode(
                 model._internal_config or dev.InternalModelConfig()
             ):
-                return None
-            loaded_step = getattr(self._services[model.name], "_latest_step", None)
-            return loaded_step if isinstance(loaded_step, int) else None
+                loaded_step = getattr(service, "_latest_step", None)
+                if isinstance(loaded_step, int):
+                    step = loaded_step
 
-        # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
-        # Default to step 0 when not specified (the initial checkpoint created at registration)
-        if step is not None:
-            actual_step = step
-        else:
-            # In dedicated mode the service tracks which adapter vLLM has
-            # actually loaded. Reading the filesystem would race: the checkpoint
-            # directory appears before the HTTP reload completes.
-            actual_step = _served_step()
-            if actual_step is None:
-                actual_step = self.__get_step(model)
-        name = f"{model.name}@{actual_step}"
+        if step is None:
+            # The checkpoint directory is written before dedicated-mode
+            # vLLM finishes reloading the new adapter.
+            step = self.__get_step(model)
+        name = f"{model.name}@{step}"
         logger.debug(
-            f"[BACKEND] _model_inference_name: step_arg={step} "
-            f"actual_step={actual_step} -> {name}"
+            f"[BACKEND] _model_inference_name: step_arg={requested_step} "
+            f"actual_step={step} -> {name}"
         )
         return name
 
@@ -552,12 +523,14 @@ class LocalBackend(Backend):
         *,
         # Core training parameters
         learning_rate: float = 5e-6,
+        loss_fn: Literal["cispo", "ppo", "importance_sampling", "dro"] = "cispo",
+        loss_fn_config: dict | None = None,
+        normalize_advantages: bool = True,
+        adam_params: object | None = None,
         # KL-penalized advantage adjustment
         kl_penalty_coef: float = 0.0,
         kl_penalty_reference_step: int | None = None,
         kl_ref_adapter_path: str | None = None,
-        # RL algorithm settings
-        ppo: bool = False,
         epsilon: float | None = None,
         epsilon_high: float | None = None,
         # Advantage computation
@@ -594,6 +567,14 @@ class LocalBackend(Backend):
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
+            loss_fn: RL loss function. LocalBackend currently supports
+                "cispo" and "ppo".
+            loss_fn_config: Additional loss-function config. Not supported by
+                LocalBackend.
+            normalize_advantages: Whether to normalize advantages. LocalBackend
+                currently requires True.
+            adam_params: Custom optimizer params. Not supported by
+                LocalBackend.
             kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
                 Tokens diverging more from the reference get reduced advantages.
                 Defaults to 0.0 (disabled).
@@ -603,7 +584,6 @@ class LocalBackend(Backend):
             kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
                 checkpoint to use as the KL reference. Alternative to
                 kl_penalty_reference_step.
-            ppo: Whether to use PPO clipping. Defaults to False.
             epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
             advantage_balance: Balance between negative and positive advantages
@@ -647,6 +627,14 @@ class LocalBackend(Backend):
             # await model.log(metrics=result.metrics, step=result.step)
         """
         groups_list = list(trajectory_groups)
+        if loss_fn not in {"cispo", "ppo"}:
+            raise ValueError("LocalBackend only supports loss_fn='cispo' or 'ppo'.")
+        if loss_fn_config is not None:
+            raise ValueError("LocalBackend requires loss_fn_config=None.")
+        if not normalize_advantages:
+            raise ValueError("LocalBackend requires normalize_advantages=True.")
+        if adam_params is not None:
+            raise ValueError("LocalBackend requires adam_params=None.")
 
         # Build config objects from explicit kwargs
         config = TrainConfig(
@@ -659,7 +647,7 @@ class LocalBackend(Backend):
             "kl_penalty_coef": kl_penalty_coef,
             "mask_prob_ratio": mask_prob_ratio,
             "plot_tensors": plot_tensors,
-            "ppo": ppo,
+            "ppo": loss_fn == "ppo",
             "precalculate_logprobs": precalculate_logprobs,
             "scale_learning_rate_by_reward_std_dev": scale_learning_rate_by_reward_std_dev,
             "scale_rewards": scale_rewards,

@@ -78,10 +78,9 @@ async def train(
     if not is_train_dict:
         trainer._metrics = {"train": defaultdict(list)}
     try:
-        try:
-            trainer.train()
-        except StopTrainingLoop:
-            return
+        trainer.train()
+    except StopTrainingLoop:
+        return
     finally:
         trainer.compute_loss = _compute_loss
         trainer.log = _log  # ty:ignore[invalid-assignment]

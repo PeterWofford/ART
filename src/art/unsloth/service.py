@@ -60,8 +60,8 @@ class _StopTrainInputs:
 
 
 _STOP_TRAIN_INPUT = _StopTrainInputs()
-_TRAIN_TASK_GRACEFUL_SHUTDOWN_TIMEOUT_S = 5.0
-_TRAIN_TASK_CANCEL_TIMEOUT_S = 1.0
+_TRAIN_TASK_SHUTDOWN_TIMEOUT_S = 5.0
+_TrainLoopInput = TrainInputs | _StopTrainInputs
 
 
 def precalculate_new_logprobs(
@@ -100,7 +100,7 @@ async def process_train_batch(
     packed_tensors: PackedTensors,
     config: types.TrainConfig,
     _config: dev.TrainConfig,
-    inputs_queue: asyncio.Queue[TrainInputs | _StopTrainInputs],
+    inputs_queue: asyncio.Queue[_TrainLoopInput],
     results_queue: asyncio.Queue[dict[str, float]],
     train_task: asyncio.Task[None],
     trainer: "GRPOTrainer",
@@ -224,7 +224,7 @@ class UnslothState:
     tokenizer: PreTrainedTokenizerBase
     peft_model: peft.peft_model.PeftModelForCausalLM
     trainer: GRPOTrainer
-    inputs_queue: asyncio.Queue[TrainInputs | _StopTrainInputs]
+    inputs_queue: asyncio.Queue[_TrainLoopInput]
     results_queue: asyncio.Queue[dict[str, float]]
     _is_offloaded: bool = False
     _pinned_buffers: dict[str, torch.Tensor] | None = None
@@ -336,44 +336,22 @@ class UnslothService:
         self._lora_id_counter += 1
         return self._lora_id_counter
 
-    def _request_train_task_stop(self) -> asyncio.Task[None] | None:
+    async def aclose(self) -> None:
         train_task = self._train_task
-        if train_task is None:
-            return None
-        if train_task.done():
-            return train_task
-
-        # `_state` is a cached_property. Read from __dict__ directly so shutdown
-        # does not instantiate the full trainer state solely to stop a task.
-        state = self.__dict__.get("_state")
-        if isinstance(state, UnslothState):
-            state.inputs_queue.put_nowait(_STOP_TRAIN_INPUT)
-        return train_task
-
-    async def _shutdown_train_task(self) -> None:
-        train_task = self._request_train_task_stop()
-        if train_task is None:
+        self._train_task = None
+        if train_task is None or train_task.done():
+            self.close()
             return
 
+        # `_state` is a cached_property. Read from __dict__ directly so
+        # closing does not instantiate trainer state only to stop a task.
+        state = self.__dict__.get("_state")
+        assert isinstance(state, UnslothState)
+        state.inputs_queue.put_nowait(_STOP_TRAIN_INPUT)
         try:
-            # Give the trainer loop time to consume the stop sentinel and exit
-            # normally before falling back to cancellation.
-            await asyncio.wait_for(
-                train_task, timeout=_TRAIN_TASK_GRACEFUL_SHUTDOWN_TIMEOUT_S
-            )
+            await asyncio.wait_for(train_task, timeout=_TRAIN_TASK_SHUTDOWN_TIMEOUT_S)
         except asyncio.TimeoutError:
             train_task.cancel()
-            try:
-                await asyncio.wait_for(train_task, timeout=_TRAIN_TASK_CANCEL_TIMEOUT_S)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self._train_task = None
-
-    async def aclose(self) -> None:
-        await self._shutdown_train_task()
         self.close()
 
     # =========================================================================
@@ -500,7 +478,6 @@ class UnslothService:
 
     def close(self) -> None:
         """Terminate vLLM subprocess if running."""
-        self._request_train_task_stop()
         if self._vllm_process is None:
             return
         self._vllm_process.terminate()
@@ -646,7 +623,7 @@ class UnslothService:
 
         await self._state.results_queue.join()
 
-        if not hasattr(self, "_train_task") or self._train_task is None:
+        if self._train_task is None:
             self._train_task = asyncio.create_task(
                 train(
                     trainer=self._state.trainer,
@@ -736,7 +713,7 @@ class UnslothService:
         await self._state.results_queue.join()
 
         # If we haven't already, start the training task
-        if not hasattr(self, "_train_task") or self._train_task is None:
+        if self._train_task is None:
             self._train_task = asyncio.create_task(
                 train(
                     trainer=self._state.trainer,
@@ -1032,12 +1009,12 @@ class UnslothService:
             trainer.create_optimizer()
 
         # Initialize queues
-        inputs_queue: asyncio.Queue[TrainInputs | _StopTrainInputs] = asyncio.Queue()
+        inputs_queue: asyncio.Queue[_TrainLoopInput] = asyncio.Queue()
         results_queue: asyncio.Queue[dict[str, float]] = asyncio.Queue()
 
         # Patch trainer _prepare_inputs() to pull from queue
         def _async_prepare_inputs(*_: Any, **__: Any) -> dict[str, torch.Tensor]:
-            async def get_inputs() -> TrainInputs | _StopTrainInputs:
+            async def get_inputs() -> _TrainLoopInput:
                 return await inputs_queue.get()
 
             # Force otherwise synchronous _prepare_inputs() to yield
