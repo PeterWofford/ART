@@ -523,7 +523,7 @@ class LocalBackend(Backend):
         *,
         # Core training parameters
         learning_rate: float = 5e-6,
-        loss_fn: Literal["cispo", "ppo", "importance_sampling", "dro"] = "cispo",
+        loss_fn: Literal["cispo", "ppo"] = "cispo",
         loss_fn_config: dict | None = None,
         normalize_advantages: bool = True,
         adam_params: object | None = None,
@@ -584,7 +584,7 @@ class LocalBackend(Backend):
             kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
                 checkpoint to use as the KL reference. Alternative to
                 kl_penalty_reference_step.
-            epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
+            epsilon: Clip epsilon for importance sampling. Defaults based on loss_fn.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
             advantage_balance: Balance between negative and positive advantages
                 in range [-1.0, 1.0]. Defaults to 0.0 (balanced).
