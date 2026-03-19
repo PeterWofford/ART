@@ -1,18 +1,12 @@
-from typing import Any, cast
-
 import pytest
 import tinker
 
 from art import TrainableModel
-from art.tinker_native.backend import (
-    ModelState,
-    TinkerNativeBackend,
-    _apply_kl_penalty,
-)
+from art.tinker_native.backend import TinkerNativeBackend, _apply_kl_penalty
 from art.tinker_native.data import build_datum
 
 
-class FakeSamplingClient:
+class FakeSamplingClient(tinker.SamplingClient):
     def __init__(self, responses: dict[tuple[int, ...], list[float | None]]) -> None:
         self._responses = responses
 
@@ -48,7 +42,7 @@ async def test_incorporate_kl_penalty_rewrites_advantages_in_place() -> None:
 
     metrics = await _apply_kl_penalty(
         [datum_a, datum_b],
-        sampling_client,  # type: ignore[arg-type]
+        sampling_client,
         kl_penalty_coef=2.0,
     )
 
@@ -70,28 +64,14 @@ async def test_tinker_native_backend_rejects_current_learner_kl_source(
         base_model="test-model",
         base_path=str(tmp_path),
     )
-    backend._model_state[model.name] = ModelState(
-        service_client=cast(Any, object()),
-        rest_client=cast(Any, object()),
-        training_client=cast(Any, object()),
-        sampler_clients={},
-        sampler_checkpoint_paths={},
-        training_checkpoint_paths={},
-        current_step=0,
-        renderer=cast(Any, object()),
-        tokenizer=cast(Any, object()),
-        output_dir=str(tmp_path),
-        tinker_run_ids=[],
-        model_name=model.name,
-    )
 
     with pytest.raises(
         AssertionError,
         match="only supports kl_penalty_source='sample'",
     ):
-        await cast(Any, backend).train(
+        await backend.train(
             model,
             [],
             kl_penalty_coef=0.25,
-            kl_penalty_source="current_learner",
+            kl_penalty_source="current_learner",  # ty:ignore[invalid-argument-type]
         )
