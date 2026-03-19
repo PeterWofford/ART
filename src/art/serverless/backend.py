@@ -194,8 +194,13 @@ class ServerlessBackend(Backend):
         *,
         # Core training parameters
         learning_rate: float = 5e-6,
+        loss_fn: Literal["cispo", "ppo"] | None = None,
+        loss_fn_config: dict | None = None,
+        normalize_advantages: bool = True,
+        save_checkpoint: bool = True,
+        adam_params: object | None = None,
         # RL algorithm settings
-        ppo: bool = False,
+        ppo: bool | None = None,
         epsilon: float | None = None,
         epsilon_high: float | None = None,
         # Advantage computation
@@ -223,7 +228,17 @@ class ServerlessBackend(Backend):
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
-            ppo: Whether to use PPO clipping. Defaults to False.
+            loss_fn: RL objective name. Serverless supports "cispo" and "ppo".
+                Defaults to "cispo" unless `ppo=True`.
+            loss_fn_config: Additional loss config. Not supported by the
+                serverless backend.
+            normalize_advantages: Whether to normalize advantages. Serverless
+                currently requires this to remain enabled.
+            save_checkpoint: Accepted for PipelineTrainer compatibility. The
+                serverless backend always persists the resulting step artifact.
+            adam_params: Custom Adam parameters. Not supported by the serverless
+                backend.
+            ppo: Legacy PPO selector. When omitted, it is inferred from `loss_fn`.
             epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
             advantage_balance: Balance between negative and positive advantages
@@ -254,13 +269,38 @@ class ServerlessBackend(Backend):
         """
         groups_list = list(trajectory_groups)
 
+        if loss_fn is None:
+            loss_fn = "ppo" if ppo else "cispo"
+        if loss_fn not in {"cispo", "ppo"}:
+            raise ValueError(
+                "Serverless backend only supports loss_fn='cispo' or 'ppo'."
+            )
+
+        expected_ppo = loss_fn == "ppo"
+        if ppo is not None and ppo != expected_ppo:
+            raise ValueError(
+                "Conflicting RL config: loss_fn and ppo must select the same algorithm."
+            )
+        if loss_fn_config is not None:
+            raise ValueError("Serverless backend requires loss_fn_config=None.")
+        if not normalize_advantages:
+            raise ValueError("Serverless backend requires normalize_advantages=True.")
+        if adam_params is not None:
+            raise ValueError("Serverless backend requires adam_params=None.")
+        if not save_checkpoint:
+            warnings.warn(
+                "ServerlessBackend always persists a step artifact; "
+                "save_checkpoint=False is ignored.",
+                stacklevel=2,
+            )
+
         # Build config objects from explicit kwargs
         config = TrainConfig(learning_rate=learning_rate)
         dev_config: dev.TrainConfig = {
             "advantage_balance": advantage_balance,
             "importance_sampling_level": importance_sampling_level,
             "mask_prob_ratio": mask_prob_ratio,
-            "ppo": ppo,
+            "ppo": expected_ppo,
             "precalculate_logprobs": precalculate_logprobs,
             "scale_rewards": scale_rewards,
         }

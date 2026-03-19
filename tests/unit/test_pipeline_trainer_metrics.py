@@ -84,3 +84,44 @@ async def test_pipeline_trainer_logs_explicit_stale_and_zero_variance_metrics(
     assert "train/discarded_stale_groups" in train_row
     assert "train/discarded_stale_samples" not in train_row
     assert "discarded/reward" in zero_variance_row
+
+
+@pytest.mark.asyncio
+async def test_collect_batch_respects_max_batch_size(tmp_path: Path) -> None:
+    model = TrainableModel(
+        name="pipeline-max-batch-size-test",
+        project="pipeline-max-batch-size-test",
+        base_model="test-model",
+        base_path=str(tmp_path),
+        report_metrics=[],
+    )
+    backend = MagicMock()
+    backend.train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))
+
+    trainer = PipelineTrainer(
+        model=model,
+        backend=backend,
+        rollout_fn=lambda *_args, **_kwargs: asyncio.sleep(0),
+        scenarios=[],
+        config={},
+        num_rollout_workers=1,
+        min_batch_size=1,
+        max_batch_size=2,
+        eval_fn=None,
+        max_steps=1,
+    )
+    trainer._output_queue = asyncio.Queue()
+
+    await trainer._output_queue.put(_make_group([0.0, 1.0], initial_policy_version=0))
+    await trainer._output_queue.put(_make_group([0.25, 0.75], initial_policy_version=0))
+    await trainer._output_queue.put(_make_group([0.1, 0.9], initial_policy_version=0))
+    await trainer._output_queue.put(None)
+
+    batch, discarded, saw_sentinel = await trainer._collect_batch(current_step=0)
+
+    assert len(batch) == 2
+    assert discarded == 0
+    assert saw_sentinel is False
+
+    remaining = trainer._output_queue.get_nowait()
+    assert isinstance(remaining, TrajectoryGroup)
