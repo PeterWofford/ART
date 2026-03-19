@@ -314,6 +314,10 @@ class TinkerNativeBackend(Backend):
         kl_penalty_reference_step: int | None = None,
         kl_penalty_source: Literal["sample"] = "sample",
     ) -> TrainResult:
+        assert kl_penalty_source == "sample", (
+            "TinkerNativeBackend only supports kl_penalty_source='sample'."
+        )
+
         state = self._model_state[model.name]
         groups_list = list(trajectory_groups)
         summary = summarize_trajectory_groups(groups_list)
@@ -332,10 +336,6 @@ class TinkerNativeBackend(Backend):
             ),
             "data/step_num_datums": float(len(datums)),
         }
-
-        assert kl_penalty_source == "sample", (
-            "TinkerNativeBackend only supports kl_penalty_source='sample'."
-        )
 
         if not datums:
             return TrainResult(step=state.current_step, metrics=metrics)
