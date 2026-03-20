@@ -350,23 +350,23 @@ class TinkerNativeBackend(Backend):
                 train_tokens, pricing
             )
         trainer_started = time.monotonic()
+        sampled_kl_policy_ref: float | None = None
 
         if kl_penalty_coef > 0:
-            reference_sampling_client = await self._get_kl_reference_sampling_client(
-                state,
-                model.base_model,
-                kl_penalty_reference_step,
-            )
-            metrics.update(
-                await self._tinker_sample_call(
-                    "apply_kl_penalty",
-                    _apply_kl_penalty(
-                        datums,
-                        reference_sampling_client,
-                        kl_penalty_coef,
+            kl_metrics = await self._tinker_sample_call(
+                "apply_kl_penalty",
+                _apply_kl_penalty(
+                    datums,
+                    await self._get_kl_reference_sampling_client(
+                        state,
+                        model.base_model,
+                        kl_penalty_reference_step,
                     ),
-                )
+                    kl_penalty_coef,
+                ),
             )
+            sampled_kl_policy_ref = kl_metrics["loss/kl_policy_ref"]
+            metrics.update(kl_metrics)
 
         if adam_params is None:
             adam_params = tinker.AdamParams(
@@ -405,6 +405,11 @@ class TinkerNativeBackend(Backend):
                 if value is None:
                     continue
                 canonical_key = _canonicalize_upstream_metric_key(key)
+                if (
+                    sampled_kl_policy_ref is not None
+                    and canonical_key == "loss/kl_policy_ref"
+                ):
+                    continue
                 if canonical_key:
                     metrics[canonical_key] = float(value)
         if optim_output.metrics:
@@ -412,6 +417,11 @@ class TinkerNativeBackend(Backend):
                 if value is None:
                     continue
                 canonical_key = _canonicalize_upstream_metric_key(key)
+                if (
+                    sampled_kl_policy_ref is not None
+                    and canonical_key == "loss/kl_policy_ref"
+                ):
+                    continue
                 if canonical_key:
                     metrics[canonical_key] = float(value)
 
