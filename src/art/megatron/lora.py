@@ -15,11 +15,12 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.attention import SelfAttention
-from megatron.core.transformer.moe import grouped_gemm_util
 from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict
 import torch
+
+from .cute_grouped_lora_quack import quack_grouped_lora
 
 ShardDomain = Literal["tp", "expert_tp"]
 GradSyncDomain = Literal["tp_default", "expert_tp"]
@@ -366,9 +367,7 @@ class LoRA(torch.nn.Module):
             # If no tokens routed locally, return zeros.
             if isinstance(bsz, torch.Tensor) and int(torch.count_nonzero(bsz)) == 0:
                 return x.new_zeros((x.shape[0], self.B_T.shape[-1]))
-            tmp = grouped_gemm_util.ops.gmm(x, self.A_T, bsz, trans_b=False)  # type: ignore[attr-defined]
-            out = grouped_gemm_util.ops.gmm(tmp, self.B_T, bsz, trans_b=False)  # type: ignore[attr-defined]
-            return out * self.scale
+            return quack_grouped_lora(x, self.A_T, self.B_T, bsz) * self.scale
         return ((x @ self.A_T) @ self.B_T) * self.scale
 
 
