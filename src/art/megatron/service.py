@@ -1,10 +1,11 @@
 import asyncio
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 import datetime
 from functools import cached_property
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import subprocess
 from typing import Any, AsyncIterator
@@ -26,6 +27,7 @@ from ..unsloth.service import do_sleep, do_wake_up, gc_and_empty_cuda_cache
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, openai_server_task, run_on_workers
+from .routing_replay import MoeRoutingReplayBundle
 
 
 class MegatronTrainingJob(BaseModel):
@@ -38,6 +40,11 @@ class MegatronTrainingJob(BaseModel):
     experimental_config: dev.TrainConfig
     moe_routing_replay_path: str | None = None
     moe_routing_replay_strict: bool = True
+
+
+MegatronTrainingJob.model_rebuild(
+    force=True, _types_namespace={"MoeRoutingReplayBundle": MoeRoutingReplayBundle}
+)
 
 
 @dataclass
@@ -66,6 +73,7 @@ class MegatronService:
     def _default_lora_adapter_config(self) -> LoraConfig:
         # Keep in sync with LoRA settings in megatron/train.py.
         return LoraConfig(
+            base_model_name_or_path=self.base_model,
             r=1,
             lora_alpha=32,
             target_modules=[
@@ -135,8 +143,7 @@ class MegatronService:
             if os.path.exists(source_config):
                 shutil.copy(source_config, config_path)
                 return
-        with open(config_path, "w") as f:
-            json.dump(asdict(self._default_lora_adapter_config()), f)
+        self._default_lora_adapter_config().save_pretrained(lora_path)
 
     async def _add_lora_aliases(
         self, llm: AsyncLLM, step: int, checkpoint_dir: str
@@ -175,13 +182,18 @@ class MegatronService:
 
         subprocess.run(["pkill", "-9", "megatron-service"], check=False)
         train_script = Path(__file__).parent / "train.py"
+        project_root = Path(__file__).resolve().parents[3]
         num_gpus = torch.cuda.device_count()
         os.environ["MODEL_IDENTIFIER"] = self.base_model
 
         command = (
-            f"{setup_cmd}uv run torchrun --nproc_per_node {num_gpus} {train_script}"
+            f"{setup_cmd}uv run --project {shlex.quote(str(project_root))} "
+            f"torchrun --nproc_per_node {num_gpus} {shlex.quote(str(train_script))}"
         )
-        self._megatron_process = await asyncio.create_subprocess_shell(command)
+        self._megatron_process = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(project_root),
+        )
 
     async def start_openai_server(
         self, config: dev.OpenAIServerConfig | None
@@ -234,6 +246,8 @@ class MegatronService:
         lora_path = get_last_checkpoint_dir(self.output_dir)
         if lora_path is None:
             lora_path = get_step_checkpoint_dir(self.output_dir, 0)
+            self._latest_step = 0
+        self._ensure_identity_lora(lora_path)
         self._ensure_lora_adapter_config(lora_path)
 
         self._optimizer_state_path = self._get_optimizer_state_path()

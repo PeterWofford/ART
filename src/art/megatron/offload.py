@@ -1,3 +1,4 @@
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 import gc
 from typing import Any, Sequence
@@ -9,6 +10,25 @@ import torch
 class OffloadState:
     pinned_buffers: dict[str, torch.Tensor] = field(default_factory=dict)
     is_offloaded: bool = False
+
+
+def _iter_megatron_optimizers(optimizer: Any) -> Iterator[Any]:
+    chained_optimizers = getattr(optimizer, "chained_optimizers", None)
+    if chained_optimizers is None:
+        yield optimizer
+        return
+    for child_optimizer in chained_optimizers:
+        yield from _iter_megatron_optimizers(child_optimizer)
+
+
+def iter_optimizer_state_items(optimizer: Any) -> Iterator[tuple[Any, dict[str, Any]]]:
+    for megatron_optimizer in _iter_megatron_optimizers(optimizer):
+        yield from megatron_optimizer.state.items()
+
+
+def clear_optimizer_state(optimizer: Any) -> None:
+    for megatron_optimizer in _iter_megatron_optimizers(optimizer):
+        megatron_optimizer.state.clear()
 
 
 def offload_to_cpu(
@@ -62,7 +82,7 @@ def offload_to_cpu(
             pinned_buffers[key].copy_(param.data, non_blocking=True)
             param.data = pinned_buffers[key]
 
-    for param_id, opt_state in optimizer.optimizer.state.items():
+    for param_id, opt_state in iter_optimizer_state_items(optimizer):
         for k, v in opt_state.items():
             if isinstance(v, torch.Tensor) and v.device.type == "cuda":
                 key = f"opt_{id(param_id)}_{k}"
@@ -125,7 +145,7 @@ def reload_to_gpu(
             gpu_tensor.copy_(param.data, non_blocking=True)
             param.data = gpu_tensor
 
-    for opt_state in optimizer.optimizer.state.values():
+    for _param_id, opt_state in iter_optimizer_state_items(optimizer):
         for k, v in opt_state.items():
             if isinstance(v, torch.Tensor) and v.device.type == "cpu":
                 gpu_tensor = torch.empty(v.shape, dtype=v.dtype, device=device)

@@ -37,7 +37,12 @@ from art.loss import loss_fn, shift_tensor
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.lora import apply_lora_adapters
-from art.megatron.offload import OffloadState, offload_to_cpu, reload_to_gpu
+from art.megatron.offload import (
+    OffloadState,
+    clear_optimizer_state,
+    offload_to_cpu,
+    reload_to_gpu,
+)
 from art.megatron.provider import get_provider
 from art.megatron.routing_replay import (
     MoeRoutingReplayBundle,
@@ -60,6 +65,12 @@ class TrainingJob(BaseModel):
     experimental_config: dev.TrainConfig
     moe_routing_replay_path: str | None = None
     moe_routing_replay_strict: bool = True
+
+
+TrainingJob.model_rebuild(
+    force=True,
+    _types_namespace={"MoeRoutingReplayBundle": MoeRoutingReplayBundle},
+)
 
 
 class TrainingRuntime(BaseModel):
@@ -593,7 +604,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
                 optimizer_shard_path,
                 "- resetting optimizer for new run",
             )
-            runtime.optimizer.optimizer.state.clear()
+            clear_optimizer_state(runtime.optimizer)
             runtime.optimizer.reload_model_params()
 
         print0(
@@ -614,18 +625,21 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             micro_inputs = select_micro_inputs(
                 packed_tensors, micro_indices, zero_template
             )
-            step_result = run_training_step(
-                model_chunks=runtime.model,
-                optimizer=runtime.optimizer,
-                learning_rate=config.learning_rate,
-                inputs=micro_inputs,
-                config=config,
-                experimental_config=experimental_config,
-                ref_logprobs=None,
-                step_index=step_index,
-                sample_index=micro_indices,
-                moe_routing_replay_controller=runtime.moe_routing_replay_controller,
-            )
+            try:
+                step_result = run_training_step(
+                    model_chunks=runtime.model,
+                    optimizer=runtime.optimizer,
+                    learning_rate=config.learning_rate,
+                    inputs=micro_inputs,
+                    config=config,
+                    experimental_config=experimental_config,
+                    ref_logprobs=None,
+                    step_index=step_index,
+                    sample_index=micro_indices,
+                    moe_routing_replay_controller=runtime.moe_routing_replay_controller,
+                )
+            except Exception:
+                raise
             print0(
                 runtime.rank,
                 "Correlation between old and new probabilities:",
