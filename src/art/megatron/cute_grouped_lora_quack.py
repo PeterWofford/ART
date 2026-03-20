@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any, cast
+
 from quack.gemm import gemm as quack_gemm
 import torch
 
@@ -227,10 +229,15 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
+    def backward(ctx, *grad_outputs: Any):
+        if len(grad_outputs) != 1:
+            raise RuntimeError(
+                f"Expected exactly one gradient output, got {len(grad_outputs)}"
+            )
         x, a_t_eff, b_t_eff, tmp, expert_offsets = ctx.saved_tensors
         effective_rank = ctx.effective_rank
         actual_rank = ctx.actual_rank
+        grad_out = cast(torch.Tensor, grad_outputs[0])
         grad_out_c = grad_out.contiguous()
 
         grad_tmp = _varlen_quack_gemm(

@@ -8,6 +8,12 @@ pytest.importorskip("quack")
 from art.megatron.lora import LoRA
 
 
+def _require_grad(grad: torch.Tensor | None, *, name: str) -> torch.Tensor:
+    if grad is None:
+        raise AssertionError(f"{name}.grad unexpectedly None")
+    return grad
+
+
 def _eager_grouped_lora(
     x: torch.Tensor,
     a_t: torch.Tensor,
@@ -77,7 +83,14 @@ def test_lora_grouped_forward_cutover_matches_reference(rank: int) -> None:
     got_loss = (got_out.float() * loss_grad.float()).sum() / max(1, loss_grad.numel())
     got_loss.backward()
 
+    x_ref_grad = _require_grad(x_ref.grad, name="x_ref")
+    x_test_grad = _require_grad(x_test.grad, name="x_test")
+    a_ref_grad = _require_grad(a_ref.grad, name="a_ref")
+    a_test_grad = _require_grad(lora.A_T.grad, name="lora.A_T")
+    b_ref_grad = _require_grad(b_ref.grad, name="b_ref")
+    b_test_grad = _require_grad(lora.B_T.grad, name="lora.B_T")
+
     assert torch.allclose(ref_out, got_out.detach(), atol=5e-2, rtol=5e-2)
-    assert torch.allclose(x_ref.grad, x_test.grad, atol=5e-2, rtol=5e-2)
-    assert torch.allclose(a_ref.grad, lora.A_T.grad, atol=5e-2, rtol=5e-2)
-    assert torch.allclose(b_ref.grad, lora.B_T.grad, atol=5e-2, rtol=5e-2)
+    assert torch.allclose(x_ref_grad, x_test_grad, atol=5e-2, rtol=5e-2)
+    assert torch.allclose(a_ref_grad, a_test_grad, atol=5e-2, rtol=5e-2)
+    assert torch.allclose(b_ref_grad, b_test_grad, atol=5e-2, rtol=5e-2)

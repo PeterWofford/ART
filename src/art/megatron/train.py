@@ -611,7 +611,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
             runtime.rank, "Loading packed tensors from", job.disk_packed_tensors["dir"]
         )
         packed_tensors = packed_tensors_from_dir(**job.disk_packed_tensors)
-        template = select_indexed_inputs(packed_tensors, 0)
+        template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
         zero_template = _zero_contribution_inputs(template)
         num_sequences = job.disk_packed_tensors["num_sequences"]
         global_grad_accumulation_sequences = config.grad_accumulation_sequences
@@ -685,6 +685,8 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
 
         del packed_tensors
+        del template
+        del zero_template
         del adapter_model
         if "micro_inputs" in locals():
             del micro_inputs
