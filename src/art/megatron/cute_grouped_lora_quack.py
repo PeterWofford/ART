@@ -246,10 +246,12 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         actual_rank = ctx.actual_rank
         scale = ctx.scale
         grad_out = cast(torch.Tensor, grad_outputs[0])
-        grad_out_c = grad_out.contiguous()
+        assert grad_out.stride(-1) == 1, (
+            "QuACK grouped LoRA backward requires grad_out stride(-1) == 1"
+        )
 
         grad_tmp = _varlen_quack_gemm(
-            grad_out_c,
+            grad_out,
             b_t_eff.contiguous(),
             out_features=effective_rank,
             expert_offsets=expert_offsets,
@@ -277,7 +279,7 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         )
         grad_b_eff = _varlen_quack_gemm_k(
             tmp.transpose(0, 1),
-            grad_out_c.transpose(0, 1),
+            grad_out.transpose(0, 1),
             batch_count=b_t_eff.shape[0],
             out_shape_m=effective_rank,
             out_shape_n=b_t_eff.shape[-1],
