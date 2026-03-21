@@ -132,6 +132,7 @@ def _varlen_quack_gemm(
     expert_offsets: torch.Tensor,
     tile_m: int,
     tile_n: int,
+    alpha: float = 1.0,
 ) -> torch.Tensor:
     out = torch.empty(
         a.shape[0],
@@ -150,6 +151,7 @@ def _varlen_quack_gemm(
         cluster_M=1,
         cluster_N=1,
         persistent=True,
+        alpha=alpha,
         cu_seqlens_m=expert_offsets,
     )
     return out
@@ -165,6 +167,7 @@ def _varlen_quack_gemm_k(
     expert_offsets: torch.Tensor,
     tile_m: int,
     tile_n: int,
+    alpha: float = 1.0,
 ) -> torch.Tensor:
     out = torch.empty(
         batch_count,
@@ -184,6 +187,7 @@ def _varlen_quack_gemm_k(
         cluster_M=1,
         cluster_N=1,
         persistent=True,
+        alpha=alpha,
         cu_seqlens_k=expert_offsets,
     )
     return out
@@ -197,6 +201,7 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         a_t: torch.Tensor,
         b_t: torch.Tensor,
         counts: torch.Tensor,
+        scale: float,
     ) -> torch.Tensor:
         expert_offsets = _build_expert_offsets(counts, device=x.device)
         actual_rank = a_t.shape[-1]
@@ -221,11 +226,13 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
             expert_offsets=expert_offsets,
             tile_m=64,
             tile_n=_matmul_tile_n(b_t.shape[-1]),
+            alpha=scale,
         )
 
         ctx.save_for_backward(x, a_t_eff, b_t_eff, tmp, expert_offsets)
         ctx.actual_rank = actual_rank
         ctx.effective_rank = effective_rank
+        ctx.scale = scale
         return out
 
     @staticmethod
@@ -237,6 +244,7 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         x, a_t_eff, b_t_eff, tmp, expert_offsets = ctx.saved_tensors
         effective_rank = ctx.effective_rank
         actual_rank = ctx.actual_rank
+        scale = ctx.scale
         grad_out = cast(torch.Tensor, grad_outputs[0])
         grad_out_c = grad_out.contiguous()
 
@@ -247,6 +255,7 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
             expert_offsets=expert_offsets,
             tile_m=64,
             tile_n=_proj_tile_n(effective_rank),
+            alpha=scale,
         )
         grad_x = _varlen_quack_gemm(
             grad_tmp,
@@ -275,11 +284,13 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
             expert_offsets=expert_offsets,
             tile_m=_grad_b_tile_m(effective_rank),
             tile_n=_matmul_tile_n(b_t_eff.shape[-1]),
+            alpha=scale,
         )
         return (
             grad_x,
             grad_a_eff[:, :, :actual_rank].contiguous(),
             grad_b_eff[:, :actual_rank, :].contiguous(),
+            None,
             None,
         )
 
@@ -289,6 +300,7 @@ def quack_grouped_lora(
     a_t: torch.Tensor,
     b_t: torch.Tensor,
     counts: list[int] | torch.Tensor,
+    scale: float = 1.0,
 ) -> torch.Tensor:
     """Run grouped LoRA with the QuACK varlen GEMM backend.
 
@@ -302,4 +314,4 @@ def quack_grouped_lora(
     synchronization in the hot path.
     """
     counts_tensor = _validate_inputs(x, a_t, b_t, counts)
-    return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor)
+    return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale)

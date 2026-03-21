@@ -367,8 +367,11 @@ class LoRA(torch.nn.Module):
             # If no tokens routed locally, return zeros.
             if isinstance(bsz, torch.Tensor) and int(torch.count_nonzero(bsz)) == 0:
                 return x.new_zeros((x.shape[0], self.B_T.shape[-1]))
-            return quack_grouped_lora(x, self.A_T, self.B_T, bsz) * self.scale
-        return ((x @ self.A_T) @ self.B_T) * self.scale
+            return quack_grouped_lora(x, self.A_T, self.B_T, bsz, scale=self.scale)
+        out = (x @ self.A_T) @ self.B_T
+        if self.scale == 1.0:
+            return out
+        return out * self.scale
 
 
 class SelfAttentionLinearProjLoRA(torch.nn.Module):
