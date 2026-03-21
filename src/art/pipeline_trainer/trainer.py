@@ -552,7 +552,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 continue
             batch.append(item)
 
-        while not saw_sentinel:
+        while not saw_sentinel and len(batch) < self.max_batch_size:
             try:
                 item = self._output_queue.get_nowait()
             except asyncio.QueueEmpty:
