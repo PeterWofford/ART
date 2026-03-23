@@ -86,6 +86,45 @@ def _validate_inputs(
     return counts
 
 
+def _validate_dual_inputs(
+    x: torch.Tensor,
+    gate_a_t: torch.Tensor,
+    gate_b_t: torch.Tensor,
+    up_a_t: torch.Tensor,
+    up_b_t: torch.Tensor,
+    tokens_per_expert: list[int] | torch.Tensor,
+) -> torch.Tensor:
+    counts = _validate_inputs(x, gate_a_t, gate_b_t, tokens_per_expert)
+    if up_a_t.ndim != 3:
+        raise ValueError(f"up_a_t must be 3D, got shape {tuple(up_a_t.shape)}")
+    if up_b_t.ndim != 3:
+        raise ValueError(f"up_b_t must be 3D, got shape {tuple(up_b_t.shape)}")
+    up_rank = up_a_t.shape[-1]
+    _validate_supported_rank(up_rank)
+    if up_b_t.shape[-2] != up_rank:
+        raise ValueError(
+            f"Expected up_b_t rank dim {up_rank}, got shape {tuple(up_b_t.shape)}"
+        )
+    if up_a_t.shape[0] != gate_a_t.shape[0] or up_b_t.shape[0] != gate_b_t.shape[0]:
+        raise ValueError(
+            "Gate and up tensors must have the same number of experts, "
+            f"got gate={gate_a_t.shape[0]} up={up_a_t.shape[0]}"
+        )
+    if up_a_t.shape[1] != x.shape[1]:
+        raise ValueError(
+            f"up_a_t input dim must match x.shape[1], got {up_a_t.shape[1]} and {x.shape[1]}"
+        )
+    if up_a_t.device != x.device or up_b_t.device != x.device:
+        raise ValueError(
+            "x, up_a_t, and up_b_t must be CUDA tensors on the same device"
+        )
+    if up_a_t.dtype != x.dtype or up_b_t.dtype != x.dtype:
+        raise ValueError(
+            f"Dtype mismatch: x={x.dtype}, up_a_t={up_a_t.dtype}, up_b_t={up_b_t.dtype}"
+        )
+    return counts
+
+
 def _effective_rank(rank: int) -> int:
     if rank in _PADDED_LOW_RANKS:
         return _PADDED_LOW_RANK_TARGET
@@ -133,13 +172,24 @@ def _varlen_quack_gemm(
     tile_m: int,
     tile_n: int,
     alpha: float = 1.0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    out = torch.empty(
-        a.shape[0],
-        out_features,
-        device=a.device,
-        dtype=a.dtype,
-    )
+    if out is None:
+        out = torch.empty(
+            a.shape[0],
+            out_features,
+            device=a.device,
+            dtype=a.dtype,
+        )
+    else:
+        if out.shape != (a.shape[0], out_features):
+            raise ValueError(
+                f"Expected output shape {(a.shape[0], out_features)}, got {tuple(out.shape)}"
+            )
+        if out.device != a.device or out.dtype != a.dtype:
+            raise ValueError(
+                f"Output tensor must match input device/dtype, got {out.device}/{out.dtype}"
+            )
     quack_gemm(
         a,
         b,
@@ -297,6 +347,197 @@ class _QuackGroupedLoraFn(torch.autograd.Function):
         )
 
 
+class _QuackGroupedLoraDualFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        gate_a_t: torch.Tensor,
+        gate_b_t: torch.Tensor,
+        up_a_t: torch.Tensor,
+        up_b_t: torch.Tensor,
+        counts: torch.Tensor,
+        scale_gate: float,
+        scale_up: float,
+    ) -> torch.Tensor:
+        expert_offsets = _build_expert_offsets(counts, device=x.device)
+        gate_actual_rank = gate_a_t.shape[-1]
+        up_actual_rank = up_a_t.shape[-1]
+        gate_effective_rank = _effective_rank(gate_actual_rank)
+        up_effective_rank = _effective_rank(up_actual_rank)
+
+        gate_a_t_eff = _pad_a_t(gate_a_t, gate_effective_rank)
+        up_a_t_eff = _pad_a_t(up_a_t, up_effective_rank)
+        gate_b_t_eff = _pad_b_t(gate_b_t, gate_effective_rank)
+        up_b_t_eff = _pad_b_t(up_b_t, up_effective_rank)
+
+        a_cat_eff = torch.cat((gate_a_t_eff, up_a_t_eff), dim=-1).contiguous()
+        proj_weights = a_cat_eff.permute(0, 2, 1).contiguous()
+        gate_apply_weights = gate_b_t_eff.permute(0, 2, 1).contiguous()
+        up_apply_weights = up_b_t_eff.permute(0, 2, 1).contiguous()
+
+        total_effective_rank = gate_effective_rank + up_effective_rank
+        tmp_cat = _varlen_quack_gemm(
+            x.contiguous(),
+            proj_weights,
+            out_features=total_effective_rank,
+            expert_offsets=expert_offsets,
+            tile_m=64,
+            tile_n=_proj_tile_n(total_effective_rank),
+        )
+        tmp_gate, tmp_up = torch.split(
+            tmp_cat, [gate_effective_rank, up_effective_rank], dim=1
+        )
+
+        gate_out_features = gate_b_t.shape[-1]
+        up_out_features = up_b_t.shape[-1]
+        out = torch.empty(
+            x.shape[0],
+            gate_out_features + up_out_features,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        _varlen_quack_gemm(
+            tmp_gate,
+            gate_apply_weights,
+            out_features=gate_out_features,
+            expert_offsets=expert_offsets,
+            tile_m=64,
+            tile_n=_matmul_tile_n(gate_out_features),
+            alpha=scale_gate,
+            out=out[:, :gate_out_features],
+        )
+        _varlen_quack_gemm(
+            tmp_up,
+            up_apply_weights,
+            out_features=up_out_features,
+            expert_offsets=expert_offsets,
+            tile_m=64,
+            tile_n=_matmul_tile_n(up_out_features),
+            alpha=scale_up,
+            out=out[:, gate_out_features:],
+        )
+
+        ctx.save_for_backward(
+            x,
+            a_cat_eff,
+            gate_b_t_eff,
+            up_b_t_eff,
+            tmp_cat,
+            expert_offsets,
+        )
+        ctx.gate_actual_rank = gate_actual_rank
+        ctx.up_actual_rank = up_actual_rank
+        ctx.gate_effective_rank = gate_effective_rank
+        ctx.up_effective_rank = up_effective_rank
+        ctx.gate_out_features = gate_out_features
+        ctx.scale_gate = scale_gate
+        ctx.scale_up = scale_up
+        return out
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: Any):
+        if len(grad_outputs) != 1:
+            raise RuntimeError(
+                f"Expected exactly one gradient output, got {len(grad_outputs)}"
+            )
+        x, a_cat_eff, gate_b_t_eff, up_b_t_eff, tmp_cat, expert_offsets = (
+            ctx.saved_tensors
+        )
+        gate_actual_rank = ctx.gate_actual_rank
+        up_actual_rank = ctx.up_actual_rank
+        gate_effective_rank = ctx.gate_effective_rank
+        up_effective_rank = ctx.up_effective_rank
+        gate_out_features = ctx.gate_out_features
+        scale_gate = ctx.scale_gate
+        scale_up = ctx.scale_up
+
+        grad_out = cast(torch.Tensor, grad_outputs[0])
+        assert grad_out.stride(-1) == 1, (
+            "QuACK grouped FC1 dual LoRA backward requires grad_out stride(-1) == 1"
+        )
+        grad_gate = grad_out[:, :gate_out_features]
+        grad_up = grad_out[:, gate_out_features:]
+        tmp_gate, tmp_up = torch.split(
+            tmp_cat, [gate_effective_rank, up_effective_rank], dim=1
+        )
+
+        grad_tmp_gate = _varlen_quack_gemm(
+            grad_gate,
+            gate_b_t_eff.contiguous(),
+            out_features=gate_effective_rank,
+            expert_offsets=expert_offsets,
+            tile_m=64,
+            tile_n=_proj_tile_n(gate_effective_rank),
+            alpha=scale_gate,
+        )
+        grad_tmp_up = _varlen_quack_gemm(
+            grad_up,
+            up_b_t_eff.contiguous(),
+            out_features=up_effective_rank,
+            expert_offsets=expert_offsets,
+            tile_m=64,
+            tile_n=_proj_tile_n(up_effective_rank),
+            alpha=scale_up,
+        )
+        grad_tmp_cat = torch.cat((grad_tmp_gate, grad_tmp_up), dim=1).contiguous()
+
+        total_effective_rank = gate_effective_rank + up_effective_rank
+        grad_x = _varlen_quack_gemm(
+            grad_tmp_cat,
+            a_cat_eff.contiguous(),
+            out_features=x.shape[-1],
+            expert_offsets=expert_offsets,
+            tile_m=64,
+            tile_n=_matmul_tile_n(x.shape[-1]),
+        )
+        grad_a_cat_eff = _varlen_quack_gemm_k(
+            x.transpose(0, 1),
+            grad_tmp_cat.transpose(0, 1),
+            batch_count=a_cat_eff.shape[0],
+            out_shape_m=a_cat_eff.shape[1],
+            out_shape_n=total_effective_rank,
+            expert_offsets=expert_offsets,
+            tile_m=_grad_a_tile_m(total_effective_rank),
+            tile_n=_proj_tile_n(total_effective_rank),
+        )
+        grad_b_gate_eff = _varlen_quack_gemm_k(
+            tmp_gate.transpose(0, 1),
+            grad_gate.transpose(0, 1),
+            batch_count=gate_b_t_eff.shape[0],
+            out_shape_m=gate_effective_rank,
+            out_shape_n=gate_b_t_eff.shape[-1],
+            expert_offsets=expert_offsets,
+            tile_m=_grad_b_tile_m(gate_effective_rank),
+            tile_n=_matmul_tile_n(gate_b_t_eff.shape[-1]),
+            alpha=scale_gate,
+        )
+        grad_b_up_eff = _varlen_quack_gemm_k(
+            tmp_up.transpose(0, 1),
+            grad_up.transpose(0, 1),
+            batch_count=up_b_t_eff.shape[0],
+            out_shape_m=up_effective_rank,
+            out_shape_n=up_b_t_eff.shape[-1],
+            expert_offsets=expert_offsets,
+            tile_m=_grad_b_tile_m(up_effective_rank),
+            tile_n=_matmul_tile_n(up_b_t_eff.shape[-1]),
+            alpha=scale_up,
+        )
+        grad_a_gate_eff, grad_a_up_eff = torch.split(
+            grad_a_cat_eff, [gate_effective_rank, up_effective_rank], dim=2
+        )
+        return (
+            grad_x,
+            grad_a_gate_eff[:, :, :gate_actual_rank].contiguous(),
+            grad_b_gate_eff[:, :gate_actual_rank, :].contiguous(),
+            grad_a_up_eff[:, :, :up_actual_rank].contiguous(),
+            grad_b_up_eff[:, :up_actual_rank, :].contiguous(),
+            None,
+            None,
+            None,
+        )
+
+
 def quack_grouped_lora(
     x: torch.Tensor,
     a_t: torch.Tensor,
@@ -317,3 +558,28 @@ def quack_grouped_lora(
     """
     counts_tensor = _validate_inputs(x, a_t, b_t, counts)
     return _QuackGroupedLoraFn.apply(x, a_t, b_t, counts_tensor, scale)
+
+
+def quack_grouped_lora_dual(
+    x: torch.Tensor,
+    gate_a_t: torch.Tensor,
+    gate_b_t: torch.Tensor,
+    up_a_t: torch.Tensor,
+    up_b_t: torch.Tensor,
+    counts: list[int] | torch.Tensor,
+    *,
+    scale_gate: float = 1.0,
+    scale_up: float = 1.0,
+) -> torch.Tensor:
+    """Run grouped FC1 gate/up LoRA with a shared QuACK projection path."""
+    counts_tensor = _validate_dual_inputs(x, gate_a_t, gate_b_t, up_a_t, up_b_t, counts)
+    return _QuackGroupedLoraDualFn.apply(
+        x,
+        gate_a_t,
+        gate_b_t,
+        up_a_t,
+        up_b_t,
+        counts_tensor,
+        scale_gate,
+        scale_up,
+    )

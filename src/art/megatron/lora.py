@@ -20,7 +20,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from pydantic import BaseModel, ConfigDict
 import torch
 
-from .cute_grouped_lora_quack import quack_grouped_lora
+from .cute_grouped_lora_quack import quack_grouped_lora, quack_grouped_lora_dual
 
 ShardDomain = Literal["tp", "expert_tp"]
 GradSyncDomain = Literal["tp_default", "expert_tp"]
@@ -572,6 +572,34 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         return linear_output + adapter_output, bias
 
 
+class FusedExpertsFC1LoRA(torch.nn.Module):
+    def __init__(self, adapter_model_prefix: str) -> None:
+        super().__init__()
+        self.adapter_model_prefix = f"{adapter_model_prefix}.fused_fc1"
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        tokens_per_expert: list[int] | torch.Tensor,
+        gate_a_t: torch.Tensor,
+        gate_b_t: torch.Tensor,
+        up_a_t: torch.Tensor,
+        up_b_t: torch.Tensor,
+        scale_gate: float,
+        scale_up: float,
+    ) -> torch.Tensor:
+        return quack_grouped_lora_dual(
+            x,
+            gate_a_t,
+            gate_b_t,
+            up_a_t,
+            up_b_t,
+            tokens_per_expert,
+            scale_gate=scale_gate,
+            scale_up=scale_up,
+        )
+
+
 class MLPExpertsLinearFC1LoRA(torch.nn.Module):
     def __init__(
         self,
@@ -598,6 +626,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             alpha=alpha,
             num_local_experts=num_local_experts,
         )
+        self.fused_lora = FusedExpertsFC1LoRA(adapter_model_prefix=adapter_model_prefix)
 
     @staticmethod
     def _build_fc1_lora(
@@ -644,9 +673,22 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         self, x: torch.Tensor, tokens_per_expert: list[int] | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
-        gate_out = self.gate_lora(x, tokens_per_expert=tokens_per_expert)
-        up_out = self.up_lora(x, tokens_per_expert=tokens_per_expert)
-        adapter_out = torch.cat([gate_out, up_out], dim=1)
+        counts = tokens_per_expert
+        if isinstance(counts, list):
+            counts = torch.tensor(counts, dtype=torch.int64, device="cpu")
+        if isinstance(counts, torch.Tensor) and int(torch.count_nonzero(counts)) == 0:
+            adapter_out = x.new_zeros((x.shape[0], self.linear_fc1.out_features))
+        else:
+            adapter_out = self.fused_lora(
+                x,
+                counts,
+                self.gate_lora.A_T,
+                self.gate_lora.B_T,
+                self.up_lora.A_T,
+                self.up_lora.B_T,
+                self.gate_lora.scale,
+                self.up_lora.scale,
+            )
         return base_out + adapter_out, bias_out
 
 

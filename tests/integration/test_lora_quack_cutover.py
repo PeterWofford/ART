@@ -5,6 +5,7 @@ import torch
 
 pytest.importorskip("quack")
 
+from art.megatron.cute_grouped_lora_quack import quack_grouped_lora_dual
 from art.megatron.lora import LoRA
 
 
@@ -35,6 +36,34 @@ def _eager_grouped_lora(
             f"Grouped split mismatch: consumed {start} rows for shape {tuple(x.shape)}"
         )
     return torch.cat(outputs, dim=0) * scale
+
+
+def _eager_grouped_lora_dual(
+    x: torch.Tensor,
+    gate_a_t: torch.Tensor,
+    gate_b_t: torch.Tensor,
+    up_a_t: torch.Tensor,
+    up_b_t: torch.Tensor,
+    counts: torch.Tensor,
+    *,
+    scale_gate: float,
+    scale_up: float,
+) -> torch.Tensor:
+    outputs: list[torch.Tensor] = []
+    start = 0
+    for expert_idx, token_count in enumerate(counts.tolist()):
+        if token_count == 0:
+            continue
+        stop = start + int(token_count)
+        gate_out = x[start:stop] @ gate_a_t[expert_idx] @ gate_b_t[expert_idx]
+        up_out = x[start:stop] @ up_a_t[expert_idx] @ up_b_t[expert_idx]
+        outputs.append(torch.cat((gate_out * scale_gate, up_out * scale_up), dim=1))
+        start = stop
+    if start != x.shape[0]:
+        raise RuntimeError(
+            f"Grouped split mismatch: consumed {start} rows for shape {tuple(x.shape)}"
+        )
+    return torch.cat(outputs, dim=0)
 
 
 @pytest.mark.parametrize("rank", [1, 4, 16])
@@ -94,3 +123,91 @@ def test_lora_grouped_forward_cutover_matches_reference(rank: int) -> None:
     assert torch.allclose(x_ref_grad, x_test_grad, atol=5e-2, rtol=5e-2)
     assert torch.allclose(a_ref_grad, a_test_grad, atol=5e-2, rtol=5e-2)
     assert torch.allclose(b_ref_grad, b_test_grad, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.parametrize("rank", [1, 4, 16])
+def test_lora_grouped_dual_forward_cutover_matches_reference(rank: int) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the LoRA QuACK cutover test.")
+
+    device = torch.device("cuda:0")
+    torch.manual_seed(20260324 + rank)
+
+    counts = torch.tensor([32, 0, 16, 24], dtype=torch.int64)
+    total_tokens = int(counts.sum().item())
+    x = torch.randn(total_tokens, 64, device=device, dtype=torch.bfloat16) * 0.05
+    gate_a_t = torch.randn(4, 64, rank, device=device, dtype=torch.bfloat16) * 0.05
+    gate_b_t = torch.randn(4, rank, 64, device=device, dtype=torch.bfloat16) * 0.05
+    up_a_t = torch.randn(4, 64, rank, device=device, dtype=torch.bfloat16) * 0.05
+    up_b_t = torch.randn(4, rank, 64, device=device, dtype=torch.bfloat16) * 0.05
+    loss_grad = torch.randn(total_tokens, 128, device=device, dtype=torch.bfloat16)
+    scale_gate = 2.0
+    scale_up = 3.0
+
+    x_ref = x.detach().clone().requires_grad_(True)
+    gate_a_ref = gate_a_t.detach().clone().requires_grad_(True)
+    gate_b_ref = gate_b_t.detach().clone().requires_grad_(True)
+    up_a_ref = up_a_t.detach().clone().requires_grad_(True)
+    up_b_ref = up_b_t.detach().clone().requires_grad_(True)
+    ref_out = _eager_grouped_lora_dual(
+        x_ref,
+        gate_a_ref,
+        gate_b_ref,
+        up_a_ref,
+        up_b_ref,
+        counts,
+        scale_gate=scale_gate,
+        scale_up=scale_up,
+    )
+    ref_loss = (ref_out.float() * loss_grad.float()).sum() / max(1, loss_grad.numel())
+    ref_loss.backward()
+
+    x_test = x.detach().clone().requires_grad_(True)
+    gate_a_test = gate_a_t.detach().clone().requires_grad_(True)
+    gate_b_test = gate_b_t.detach().clone().requires_grad_(True)
+    up_a_test = up_a_t.detach().clone().requires_grad_(True)
+    up_b_test = up_b_t.detach().clone().requires_grad_(True)
+    got_out = quack_grouped_lora_dual(
+        x_test,
+        gate_a_test,
+        gate_b_test,
+        up_a_test,
+        up_b_test,
+        counts,
+        scale_gate=scale_gate,
+        scale_up=scale_up,
+    )
+    got_loss = (got_out.float() * loss_grad.float()).sum() / max(1, loss_grad.numel())
+    got_loss.backward()
+
+    assert torch.allclose(ref_out, got_out.detach(), atol=5e-2, rtol=5e-2)
+    assert torch.allclose(
+        _require_grad(x_ref.grad, name="x_ref"),
+        _require_grad(x_test.grad, name="x_test"),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+    assert torch.allclose(
+        _require_grad(gate_a_ref.grad, name="gate_a_ref"),
+        _require_grad(gate_a_test.grad, name="gate_a_test"),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+    assert torch.allclose(
+        _require_grad(gate_b_ref.grad, name="gate_b_ref"),
+        _require_grad(gate_b_test.grad, name="gate_b_test"),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+    assert torch.allclose(
+        _require_grad(up_a_ref.grad, name="up_a_ref"),
+        _require_grad(up_a_test.grad, name="up_a_test"),
+        atol=5e-2,
+        rtol=5e-2,
+    )
+    assert torch.allclose(
+        _require_grad(up_b_ref.grad, name="up_b_ref"),
+        _require_grad(up_b_test.grad, name="up_b_test"),
+        atol=5e-2,
+        rtol=5e-2,
+    )
