@@ -572,34 +572,6 @@ class SelfAttentionLinearQKVLoRA(torch.nn.Module):
         return linear_output + adapter_output, bias
 
 
-class FusedExpertsFC1LoRA(torch.nn.Module):
-    def __init__(self, adapter_model_prefix: str) -> None:
-        super().__init__()
-        self.adapter_model_prefix = f"{adapter_model_prefix}.fused_fc1"
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        tokens_per_expert: list[int] | torch.Tensor,
-        gate_a_t: torch.Tensor,
-        gate_b_t: torch.Tensor,
-        up_a_t: torch.Tensor,
-        up_b_t: torch.Tensor,
-        scale_gate: float,
-        scale_up: float,
-    ) -> torch.Tensor:
-        return quack_grouped_lora_dual(
-            x,
-            gate_a_t,
-            gate_b_t,
-            up_a_t,
-            up_b_t,
-            tokens_per_expert,
-            scale_gate=scale_gate,
-            scale_up=scale_up,
-        )
-
-
 class MLPExpertsLinearFC1LoRA(torch.nn.Module):
     def __init__(
         self,
@@ -626,7 +598,7 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
             alpha=alpha,
             num_local_experts=num_local_experts,
         )
-        self.fused_lora = FusedExpertsFC1LoRA(adapter_model_prefix=adapter_model_prefix)
+        self.uses_direct_quack_grouped_lora_dual = True
 
     @staticmethod
     def _build_fc1_lora(
@@ -679,15 +651,15 @@ class MLPExpertsLinearFC1LoRA(torch.nn.Module):
         if isinstance(counts, torch.Tensor) and int(torch.count_nonzero(counts)) == 0:
             adapter_out = x.new_zeros((x.shape[0], self.linear_fc1.out_features))
         else:
-            adapter_out = self.fused_lora(
+            adapter_out = quack_grouped_lora_dual(
                 x,
-                counts,
                 self.gate_lora.A_T,
                 self.gate_lora.B_T,
                 self.up_lora.A_T,
                 self.up_lora.B_T,
-                self.gate_lora.scale,
-                self.up_lora.scale,
+                counts,
+                scale_gate=self.gate_lora.scale,
+                scale_up=self.up_lora.scale,
             )
         return base_out + adapter_out, bias_out
 
