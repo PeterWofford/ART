@@ -1,20 +1,32 @@
 from __future__ import annotations
 
+import os
 from typing import Any, cast
 
 from quack.gemm import gemm as quack_gemm
 import torch
 
 _PADDED_LOW_RANK_TARGET = 8
-_PADDED_LOW_RANKS = frozenset({1, 2, 4})
-_SUPPORTED_RANKS = frozenset({1, 2, 4, 8, 16, 32, 64, 128})
 
 
-def _validate_supported_rank(rank: int) -> None:
-    if rank not in _SUPPORTED_RANKS:
+def _validate_rank(rank: int) -> None:
+    if rank <= 0:
+        raise ValueError(f"Grouped LoRA QuACK backend requires rank > 0, got {rank}")
+    if rank >= _PADDED_LOW_RANK_TARGET and rank % _PADDED_LOW_RANK_TARGET != 0:
         raise ValueError(
-            f"Grouped LoRA QuACK backend only supports ranks {sorted(_SUPPORTED_RANKS)}, got {rank}"
+            "Grouped LoRA QuACK backend requires rank < 8 or a multiple of 8, "
+            f"got {rank}"
         )
+
+
+def _env_positive_int(name: str) -> int | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = int(raw)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0, got {value}")
+    return value
 
 
 def _tokens_per_expert_to_tensor(
@@ -58,7 +70,7 @@ def _validate_inputs(
     if b_t.ndim != 3:
         raise ValueError(f"b_t must be 3D, got shape {tuple(b_t.shape)}")
     rank = a_t.shape[-1]
-    _validate_supported_rank(rank)
+    _validate_rank(rank)
     if b_t.shape[-2] != rank:
         raise ValueError(f"Expected b_t rank dim {rank}, got shape {tuple(b_t.shape)}")
     if a_t.shape[0] != b_t.shape[0]:
@@ -100,7 +112,7 @@ def _validate_dual_inputs(
     if up_b_t.ndim != 3:
         raise ValueError(f"up_b_t must be 3D, got shape {tuple(up_b_t.shape)}")
     up_rank = up_a_t.shape[-1]
-    _validate_supported_rank(up_rank)
+    _validate_rank(up_rank)
     if up_b_t.shape[-2] != up_rank:
         raise ValueError(
             f"Expected up_b_t rank dim {up_rank}, got shape {tuple(up_b_t.shape)}"
@@ -126,7 +138,7 @@ def _validate_dual_inputs(
 
 
 def _effective_rank(rank: int) -> int:
-    if rank in _PADDED_LOW_RANKS:
+    if rank < _PADDED_LOW_RANK_TARGET:
         return _PADDED_LOW_RANK_TARGET
     return rank
 
@@ -148,18 +160,32 @@ def _pad_b_t(b_t: torch.Tensor, effective_rank: int) -> torch.Tensor:
 
 
 def _proj_tile_n(rank: int) -> int:
+    override = _env_positive_int("ART_QUACK_PROJ_TILE_N")
+    if override is not None:
+        return override
+    if rank <= 32:
+        return 32
     return 64 if rank <= 64 else 128
 
 
 def _matmul_tile_n(out_features: int) -> int:
+    override = _env_positive_int("ART_QUACK_MATMUL_TILE_N")
+    if override is not None:
+        return override
     return 128 if out_features >= 128 else 64
 
 
 def _grad_a_tile_m(rank: int) -> int:
+    override = _env_positive_int("ART_QUACK_GRAD_A_TILE_M")
+    if override is not None:
+        return override
     return 128
 
 
 def _grad_b_tile_m(rank: int) -> int:
+    override = _env_positive_int("ART_QUACK_GRAD_B_TILE_M")
+    if override is not None:
+        return override
     return 64 if rank <= 64 else 128
 
 
