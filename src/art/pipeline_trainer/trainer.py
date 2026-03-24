@@ -154,6 +154,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             total_scenarios=total_scenarios,
             num_workers=num_rollout_workers,
         )
+        self._validate_backend_support()
 
     async def train(self, *, handle_signals: bool = True) -> None:
         """Run the training pipeline over the configured scenario iterator."""
@@ -276,6 +277,42 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self._output_queue.put_nowait(None)
             except asyncio.QueueFull:
                 loop.create_task(self._output_queue.put(None))
+
+    def _validate_backend_support(self) -> None:
+        from art.dev.validate import is_dedicated_mode
+        from art.local.backend import LocalBackend
+
+        if not isinstance(self.backend, LocalBackend):
+            return
+
+        model_config = self.model._internal_config or art.dev.InternalModelConfig()
+        if not is_dedicated_mode(model_config):
+            raise ValueError(
+                "PipelineTrainer only supports LocalBackend in dedicated mode. "
+                "Shared LocalBackend pauses inference during training and is not "
+                "a supported async PipelineTrainer path. Set both "
+                "trainer_gpu_ids and inference_gpu_ids on the TrainableModel "
+                "_internal_config to use LocalBackend with PipelineTrainer."
+            )
+        if self.loss_fn not in {"cispo", "ppo"}:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) only supports "
+                "loss_fn='cispo' or loss_fn='ppo'."
+            )
+        if self.loss_fn_config is not None:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires "
+                "loss_fn_config=None."
+            )
+        if not self.normalize_advantages:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires "
+                "normalize_advantages=True."
+            )
+        if self.adam_params is not None:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires adam_params=None."
+            )
 
     async def _skip_scenarios(
         self, scenarios: AsyncIterator[ScenarioT], count: int
@@ -515,7 +552,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 continue
             batch.append(item)
 
-        while not saw_sentinel:
+        while not saw_sentinel and len(batch) < self.max_batch_size:
             try:
                 item = self._output_queue.get_nowait()
             except asyncio.QueueEmpty:

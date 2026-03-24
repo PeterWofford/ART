@@ -44,6 +44,7 @@ from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
 from ..backend import AnyTrainableModel, Backend
+from ..costs import build_cost_calculator, get_model_pricing
 from ..metrics_taxonomy import (
     TRAIN_GRADIENT_STEPS_KEY,
     average_metric_samples,
@@ -159,6 +160,9 @@ class LocalBackend(Backend):
     def __enter__(self) -> Self:
         return self
 
+    async def __aenter__(self) -> Self:
+        return self
+
     def __exit__(
         self,
         exc_type: type[BaseException] | None,
@@ -167,14 +171,30 @@ class LocalBackend(Backend):
     ) -> None:
         self._close()
 
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.close()
+
     async def close(self) -> None:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
-        self._close()
+        for service in self._services.values():
+            aclose = getattr(service, "aclose", None)
+            if aclose is None:
+                close = getattr(service, "close", None)
+                if close is not None:
+                    close()
+            else:
+                await aclose()
+            close_proxy(service)
 
     def _close(self) -> None:
-        for _, service in self._services.items():
+        for service in self._services.values():
             close = getattr(service, "close", None)
             if close is not None:
                 close()
@@ -206,6 +226,11 @@ class LocalBackend(Backend):
         # (wandb initialization is now handled by the model's _get_wandb_run method)
         if model.trainable and "WANDB_API_KEY" in os.environ:
             _ = model._get_wandb_run()
+        if model.trainable:
+            trainable_model = cast(TrainableModel, model)
+            pricing = get_model_pricing(trainable_model.base_model)
+            if pricing is not None:
+                trainable_model.set_cost_calculator(build_cost_calculator(pricing))
 
     def _model_inference_name(self, model: Model, step: int | None = None) -> str:
         """Return the inference name for a model checkpoint.
@@ -219,25 +244,27 @@ class LocalBackend(Backend):
                   If None, returns name for latest checkpoint (step 0 initially).
         """
 
-        # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
-        # Default to step 0 when not specified (the initial checkpoint created at registration)
-        if step is not None:
-            actual_step = step
-        elif model.name in self._services and self._in_process:
-            # In dedicated mode the service tracks which adapter vLLM has
-            # actually loaded.  Reading the filesystem would race: the
-            # checkpoint directory appears before the HTTP reload completes.
-            svc = self._services[model.name]
-            loaded_step = getattr(svc, "_latest_step", None)
-            actual_step = (
-                loaded_step if loaded_step is not None else self.__get_step(model)
-            )
-        else:
-            actual_step = self.__get_step(model)
-        name = f"{model.name}@{actual_step}"
+        requested_step = step
+
+        if step is None and isinstance(model, TrainableModel):
+            from ..dev.validate import is_dedicated_mode
+
+            service = self._services.get(model.name)
+            if service is not None and is_dedicated_mode(
+                model._internal_config or dev.InternalModelConfig()
+            ):
+                loaded_step = getattr(service, "_latest_step", None)
+                if isinstance(loaded_step, int):
+                    step = loaded_step
+
+        if step is None:
+            # The checkpoint directory is written before dedicated-mode
+            # vLLM finishes reloading the new adapter.
+            step = self.__get_step(model)
+        name = f"{model.name}@{step}"
         logger.debug(
-            f"[BACKEND] _model_inference_name: step_arg={step} "
-            f"actual_step={actual_step} -> {name}"
+            f"[BACKEND] _model_inference_name: step_arg={requested_step} "
+            f"actual_step={step} -> {name}"
         )
         return name
 
@@ -502,12 +529,14 @@ class LocalBackend(Backend):
         *,
         # Core training parameters
         learning_rate: float = 5e-6,
+        loss_fn: Literal["cispo", "ppo"] = "cispo",
+        loss_fn_config: dict | None = None,
+        normalize_advantages: bool = True,
+        adam_params: object | None = None,
         # KL-penalized advantage adjustment
         kl_penalty_coef: float = 0.0,
         kl_penalty_reference_step: int | None = None,
         kl_ref_adapter_path: str | None = None,
-        # RL algorithm settings
-        ppo: bool = False,
         epsilon: float | None = None,
         epsilon_high: float | None = None,
         # Advantage computation
@@ -544,6 +573,14 @@ class LocalBackend(Backend):
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
+            loss_fn: RL loss function. LocalBackend currently supports
+                "cispo" and "ppo".
+            loss_fn_config: Additional loss-function config. Not supported by
+                LocalBackend.
+            normalize_advantages: Whether to normalize advantages. LocalBackend
+                currently requires True.
+            adam_params: Custom optimizer params. Not supported by
+                LocalBackend.
             kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
                 Tokens diverging more from the reference get reduced advantages.
                 Defaults to 0.0 (disabled).
@@ -553,8 +590,7 @@ class LocalBackend(Backend):
             kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
                 checkpoint to use as the KL reference. Alternative to
                 kl_penalty_reference_step.
-            ppo: Whether to use PPO clipping. Defaults to False.
-            epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
+            epsilon: Clip epsilon for importance sampling. Defaults based on loss_fn.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
             advantage_balance: Balance between negative and positive advantages
                 in range [-1.0, 1.0]. Defaults to 0.0 (balanced).
@@ -597,6 +633,14 @@ class LocalBackend(Backend):
             # await model.log(metrics=result.metrics, step=result.step)
         """
         groups_list = list(trajectory_groups)
+        if loss_fn not in {"cispo", "ppo"}:
+            raise ValueError("LocalBackend only supports loss_fn='cispo' or 'ppo'.")
+        if loss_fn_config is not None:
+            raise ValueError("LocalBackend requires loss_fn_config=None.")
+        if not normalize_advantages:
+            raise ValueError("LocalBackend requires normalize_advantages=True.")
+        if adam_params is not None:
+            raise ValueError("LocalBackend requires adam_params=None.")
 
         # Build config objects from explicit kwargs
         config = TrainConfig(
@@ -609,7 +653,7 @@ class LocalBackend(Backend):
             "kl_penalty_coef": kl_penalty_coef,
             "mask_prob_ratio": mask_prob_ratio,
             "plot_tensors": plot_tensors,
-            "ppo": ppo,
+            "ppo": loss_fn == "ppo",
             "precalculate_logprobs": precalculate_logprobs,
             "scale_learning_rate_by_reward_std_dev": scale_learning_rate_by_reward_std_dev,
             "scale_rewards": scale_rewards,

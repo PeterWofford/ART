@@ -36,6 +36,47 @@ ModelConfig = TypeVar("ModelConfig", bound=BaseModel | None)
 StateType = TypeVar("StateType", bound=dict[str, Any], default=dict[str, Any])
 
 METRICS_BUILDER_STATE_KEY = "_metrics_builder_state"
+
+
+class _OpenAIChatCompletionsProxy:
+    def __init__(self, completions: Any, record_costs: Any) -> None:
+        self._completions = completions
+        self._record_costs = record_costs
+
+    async def create(self, *args: Any, **kwargs: Any) -> Any:
+        response = await self._completions.create(*args, **kwargs)
+        self._record_costs(response)
+        return response
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._completions, name)
+
+
+class _OpenAIChatProxy:
+    def __init__(self, chat: Any, record_costs: Any) -> None:
+        self._chat = chat
+        self.completions = _OpenAIChatCompletionsProxy(chat.completions, record_costs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._chat, name)
+
+
+class _OpenAIClientProxy:
+    def __init__(self, client: Any, record_costs: Any) -> None:
+        self._client = client
+        self._record_costs = record_costs
+        self.chat = _OpenAIChatProxy(client.chat, record_costs)
+
+    def with_options(self, *args: Any, **kwargs: Any) -> "_OpenAIClientProxy":
+        return _OpenAIClientProxy(
+            self._client.with_options(*args, **kwargs),
+            self._record_costs,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._client, name)
+
+
 METRIC_SECTIONS = frozenset(
     {
         "reward",
@@ -233,6 +274,12 @@ class Model(
     def openai_client(
         self,
     ) -> AsyncOpenAI:
+        """Return ART's managed inference client.
+
+        For trainable models with configured pricing, chat completion calls made
+        through this client automatically emit Tinker inference costs when an
+        ART metrics context is active.
+        """
         if self._openai_client is not None:
             return self._openai_client
 
@@ -245,7 +292,7 @@ class Model(
                 raise ValueError(
                     "In order to create an OpenAI client you must provide an `inference_api_key` and `inference_base_url`."
                 )
-        self._openai_client = AsyncOpenAI(
+        raw_client = AsyncOpenAI(
             base_url=self.inference_base_url,
             api_key=self.inference_api_key,
             http_client=DefaultAsyncHttpxClient(
@@ -254,6 +301,13 @@ class Model(
                     max_connections=100_000, max_keepalive_connections=100_000
                 ),
             ),
+        )
+        # Wrap the raw OpenAI client so ART-owned inference calls can add
+        # split-scoped Tinker costs without rollout code needing to do it
+        # manually.
+        self._openai_client = cast(
+            AsyncOpenAI,
+            _OpenAIClientProxy(raw_client, self._record_openai_completion_costs),
         )
         return self._openai_client
 
@@ -303,6 +357,10 @@ class Model(
         if step is not None:
             return f"{base_name}@{step}"
         return base_name
+
+    def _record_openai_completion_costs(self, _response: Any) -> None:
+        """Hook for subclasses that want to auto-log managed inference costs."""
+        return
 
     def _get_output_dir(self) -> str:
         """Get the output directory for this model."""
@@ -470,6 +528,7 @@ class Model(
                 id=self.name,
                 config=self._wandb_config or None,
                 resume="allow",
+                reinit="create_new",
                 settings=wandb.Settings(
                     x_stats_open_metrics_endpoints={
                         "vllm": "http://localhost:8000/metrics",
@@ -492,18 +551,18 @@ class Model(
 
             # Define training_step as the x-axis for all metrics.
             # This allows out-of-order logging (e.g., async validation for previous steps).
-            wandb.define_metric("training_step")
-            wandb.define_metric("time/wall_clock_sec")
-            wandb.define_metric("reward/*", step_metric="training_step")
-            wandb.define_metric("loss/*", step_metric="training_step")
-            wandb.define_metric("throughput/*", step_metric="training_step")
-            wandb.define_metric("costs/*", step_metric="training_step")
-            wandb.define_metric("time/*", step_metric="training_step")
-            wandb.define_metric("data/*", step_metric="training_step")
-            wandb.define_metric("train/*", step_metric="training_step")
-            wandb.define_metric("val/*", step_metric="training_step")
-            wandb.define_metric("test/*", step_metric="training_step")
-            wandb.define_metric("discarded/*", step_metric="training_step")
+            run.define_metric("training_step")
+            run.define_metric("time/wall_clock_sec")
+            run.define_metric("reward/*", step_metric="training_step")
+            run.define_metric("loss/*", step_metric="training_step")
+            run.define_metric("throughput/*", step_metric="training_step")
+            run.define_metric("costs/*", step_metric="training_step")
+            run.define_metric("time/*", step_metric="training_step")
+            run.define_metric("data/*", step_metric="training_step")
+            run.define_metric("train/*", step_metric="training_step")
+            run.define_metric("val/*", step_metric="training_step")
+            run.define_metric("test/*", step_metric="training_step")
+            run.define_metric("discarded/*", step_metric="training_step")
             self._sync_wandb_config(run)
         return self._wandb_run
 
@@ -562,14 +621,16 @@ class Model(
                 run.log(prefixed)
 
     def _define_wandb_step_metrics(self, keys: Iterable[str]) -> None:
-        import wandb
+        run = self._wandb_run
+        if run is None or run._is_finished:
+            return
 
         for key in keys:
             if not key.startswith("costs/"):
                 continue
             if key in self._wandb_defined_metrics:
                 continue
-            wandb.define_metric(key, step_metric="training_step")
+            run.define_metric(key, step_metric="training_step")
             self._wandb_defined_metrics.add(key)
 
     def _route_metrics_and_collect_non_costs(
@@ -942,6 +1003,34 @@ class TrainableModel(Model[ModelConfig, StateType], Generic[ModelConfig, StateTy
         _cost_context: str,
     ) -> dict[str, float]:
         return {}
+
+    def _record_openai_completion_costs(self, _response: Any) -> None:
+        try:
+            builder = MetricsBuilder.get_active()
+        except LookupError:
+            return
+
+        usage = getattr(_response, "usage", None)
+        prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+        num_choices = len(getattr(_response, "choices", None) or [])
+        effective_prompt_tokens = prompt_tokens * max(num_choices, 1)
+        cost_context = builder.cost_context.strip("/")
+        if not cost_context:
+            return
+
+        cost_metrics = self._cost_calculator(
+            effective_prompt_tokens,
+            completion_tokens,
+            cost_context,
+        )
+        if not cost_metrics:
+            return
+
+        for key, value in cost_metrics.items():
+            if not key.startswith("costs/"):
+                continue
+            builder.add_cost(key[len("costs/") :], float(value))
 
     @overload
     def __new__(

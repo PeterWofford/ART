@@ -44,7 +44,7 @@ async def test_step_skipping():
         # Set up backend with custom art path
         art_path = os.path.join(tmpdir, ".art")
 
-        with LocalBackend(path=art_path) as backend:
+        async with LocalBackend(path=art_path) as backend:
             # Create a test model
             model = TrainableModel(
                 name=f"test-step-skip-{uuid.uuid4()}",
