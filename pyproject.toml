@@ -3,7 +3,7 @@ name = "openpipe-art"
 version = "0.5.17"
 description = "The OpenPipe Agent Reinforcement Training (ART) library"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "openai>=2.14.0",
     "typer>=0.15.2",
@@ -159,7 +159,7 @@ requires-dist = [
 ]
 
 [tool.ty.environment]
-python-version = "3.12"
+python-version = "3.11"
 
 [tool.ty.rules]
 # Ignore unused-ignore-comment warnings because they vary depending on whether
