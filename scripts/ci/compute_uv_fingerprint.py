@@ -66,7 +66,7 @@ def main() -> int:
             "uv_lock_sha256": _sha256_file(args.uv_lock),
         },
         "ci_context": {
-            "fingerprint_schema_version": 4,
+            "fingerprint_schema_version": 5,
             "cache_kind": "full_uv_cache",
             "cache_scope": "prek_all_extras_group_dev",
             "cache_target": "uv_cache",
