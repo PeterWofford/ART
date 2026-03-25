@@ -9,6 +9,7 @@ PYTHON_MM="${PYTHON_MM:-3.11}"
 UV_CACHE_RELEASE_TAG="${UV_CACHE_RELEASE_TAG:-prek-uv-cache}"
 UV_CACHE_ASSET_PREFIX="${UV_CACHE_ASSET_PREFIX:-prek-uv-cache}"
 BUILD_JOBS="${BUILD_JOBS:-auto}"
+AUTO_BUILD_JOBS_MAX="${AUTO_BUILD_JOBS_MAX:-4}"
 KEEP_COUNT="${KEEP_COUNT:-4}"
 PART_SIZE_MB="${PART_SIZE_MB:-1900}"
 SKIP_BUILD=0
@@ -111,6 +112,43 @@ require_cmd() {
   command -v "${cmd}" >/dev/null 2>&1 || fail "Required command not found: ${cmd}"
 }
 
+detect_mem_info() {
+  local out_source_var="$1"
+  local out_kib_var="$2"
+  local detected_source="proc_meminfo"
+  local detected_kib="0"
+
+  local cgroup_v2_mem_max="/sys/fs/cgroup/memory.max"
+  if [[ -r "${cgroup_v2_mem_max}" ]]; then
+    local cgroup_v2_value
+    cgroup_v2_value="$(<"${cgroup_v2_mem_max}")"
+    if [[ "${cgroup_v2_value}" =~ ^[0-9]+$ ]] && ((cgroup_v2_value > 0)); then
+      detected_source="cgroup_v2"
+      detected_kib="$((cgroup_v2_value / 1024))"
+      printf -v "${out_source_var}" '%s' "${detected_source}"
+      printf -v "${out_kib_var}" '%s' "${detected_kib}"
+      return
+    fi
+  fi
+
+  local cgroup_v1_mem_limit="/sys/fs/cgroup/memory/memory.limit_in_bytes"
+  if [[ -r "${cgroup_v1_mem_limit}" ]]; then
+    local cgroup_v1_value
+    cgroup_v1_value="$(<"${cgroup_v1_mem_limit}")"
+    if [[ "${cgroup_v1_value}" =~ ^[0-9]+$ ]] && ((cgroup_v1_value > 0)); then
+      detected_source="cgroup_v1"
+      detected_kib="$((cgroup_v1_value / 1024))"
+      printf -v "${out_source_var}" '%s' "${detected_source}"
+      printf -v "${out_kib_var}" '%s' "${detected_kib}"
+      return
+    fi
+  fi
+
+  detected_kib="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  printf -v "${out_source_var}" '%s' "${detected_source}"
+  printf -v "${out_kib_var}" '%s' "${detected_kib}"
+}
+
 compute_fingerprint() {
   python3 "${REPO_ROOT}/scripts/ci/compute_uv_fingerprint.py" \
     --pyproject "${REPO_ROOT}/pyproject.toml" \
@@ -131,8 +169,9 @@ resolve_build_jobs() {
 
   local cpu_count
   cpu_count="$(nproc 2>/dev/null || echo 1)"
+  local mem_source
   local mem_kib
-  mem_kib="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+  detect_mem_info mem_source mem_kib
   local mem_gib="$((mem_kib / 1024 / 1024))"
   local mem_limited_jobs=1
   if ((mem_gib > 0)); then
@@ -145,6 +184,18 @@ resolve_build_jobs() {
   if ((mem_limited_jobs > cpu_count)); then
     mem_limited_jobs="${cpu_count}"
   fi
+  if ! [[ "${AUTO_BUILD_JOBS_MAX}" =~ ^[1-9][0-9]*$ ]]; then
+    fail "AUTO_BUILD_JOBS_MAX must be a positive integer."
+  fi
+  if ((mem_limited_jobs > AUTO_BUILD_JOBS_MAX)); then
+    mem_limited_jobs="${AUTO_BUILD_JOBS_MAX}"
+  fi
+  printf '[ci-cache] Auto build jobs resolved: cpu_count=%s mem_source=%s mem_gib=%s cap=%s resolved=%s\n' \
+    "${cpu_count}" \
+    "${mem_source}" \
+    "${mem_gib}" \
+    "${AUTO_BUILD_JOBS_MAX}" \
+    "${mem_limited_jobs}" >&2
   printf '%s\n' "${mem_limited_jobs}"
 }
 

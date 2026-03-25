@@ -107,6 +107,40 @@ def freeze_model(model_chunks: list[MegatronModule]) -> list[MegatronModule]:
     return model_chunks
 
 
+def _frozen_linear_grad_input(
+    grad_output: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    if grad_output.dim() <= 2 or weight.dim() != 2:
+        return grad_output.matmul(weight)
+    try:
+        grad_output_2d = grad_output.view(-1, int(grad_output.shape[-1]))
+    except RuntimeError:
+        grad_output_2d = grad_output.reshape(-1, int(grad_output.shape[-1]))
+    grad_input_2d = grad_output_2d.matmul(weight)
+    return grad_input_2d.reshape(*grad_output.shape[:-1], int(weight.shape[-1]))
+
+
+def _install_fast_frozen_output_backward() -> None:
+    from megatron.core.tensor_parallel.layers import LinearWithFrozenWeight
+
+    if getattr(LinearWithFrozenWeight.backward, "__art_fast_output_backward__", False):
+        return
+
+    def _fast_backward(
+        ctx: Any,
+        grad_output: torch.Tensor,
+    ) -> tuple[torch.Tensor, None, None, None, None]:
+        (weight,) = ctx.saved_tensors
+        grad_input = _frozen_linear_grad_input(grad_output, weight)
+        if ctx.allreduce_dgrad:
+            torch.distributed.all_reduce(grad_input, group=ctx.tp_group)
+        return grad_input, None, None, None, None
+
+    setattr(_fast_backward, "__art_fast_output_backward__", True)
+    LinearWithFrozenWeight.backward = staticmethod(_fast_backward)
+
+
 def _install_gpt_preprocess_hook(model_chunks: list[MegatronModule]) -> None:
     for chunk in model_chunks:
         module: Any = chunk
@@ -193,6 +227,7 @@ def build_training_runtime(
     print_env: bool = True,
     print_optimizer_stats: bool = True,
 ) -> TrainingRuntime:
+    _install_fast_frozen_output_backward()
     provider = get_provider(
         model_identifier
         or os.environ.get("MODEL_IDENTIFIER", DEFAULT_MODEL_IDENTIFIER),
