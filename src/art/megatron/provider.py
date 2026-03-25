@@ -111,4 +111,5 @@ def get_provider(
     provider.calculate_per_token_loss = True
     if provider.tensor_model_parallel_size > 1:
         provider.sequence_parallel = True
+    provider.finalize()
     return provider
