@@ -9,7 +9,8 @@ PYTHON_MM="${PYTHON_MM:-3.11}"
 UV_CACHE_RELEASE_TAG="${UV_CACHE_RELEASE_TAG:-prek-uv-cache}"
 UV_CACHE_ASSET_PREFIX="${UV_CACHE_ASSET_PREFIX:-prek-uv-cache}"
 BUILD_JOBS="${BUILD_JOBS:-auto}"
-AUTO_BUILD_JOBS_MAX="${AUTO_BUILD_JOBS_MAX:-4}"
+AUTO_BUILD_JOBS_MAX="${AUTO_BUILD_JOBS_MAX:-8}"
+UV_BUILD_SLOTS="${UV_BUILD_SLOTS:-2}"
 KEEP_COUNT="${KEEP_COUNT:-4}"
 PART_SIZE_MB="${PART_SIZE_MB:-1900}"
 UPLOAD_JOBS="${UPLOAD_JOBS:-4}"
@@ -218,21 +219,21 @@ ensure_release_exists() {
 
 constrain_temp_pyproject_for_ci_build() {
   local pyproject_path="$1"
-  local jobs="$2"
+  local compile_jobs="$2"
   local nvcc_threads=1
 
   [[ -f "${pyproject_path}" ]] || fail "pyproject not found: ${pyproject_path}"
 
-  log "Applying cache-build overrides: APEX_PARALLEL_BUILD=${jobs}, NVCC_APPEND_FLAGS=--threads ${nvcc_threads}."
+  log "Applying cache-build overrides: APEX_PARALLEL_BUILD=${compile_jobs}, NVCC_APPEND_FLAGS=--threads ${nvcc_threads}."
   sed -i -E \
-    -e "s/APEX_PARALLEL_BUILD = \"[0-9]+\"/APEX_PARALLEL_BUILD = \"${jobs}\"/" \
+    -e "s/APEX_PARALLEL_BUILD = \"[0-9]+\"/APEX_PARALLEL_BUILD = \"${compile_jobs}\"/" \
     -e "s/NVCC_APPEND_FLAGS = \"--threads [0-9]+\"/NVCC_APPEND_FLAGS = \"--threads ${nvcc_threads}\"/" \
     "${pyproject_path}"
 }
 
 build_cache_archive() {
   local archive_path="$1"
-  local jobs="$2"
+  local compile_jobs="$2"
 
   TMP_DIR="$(mktemp -d)"
   UV_CACHE_DIR="${TMP_DIR}/uv-cache"
@@ -240,15 +241,16 @@ build_cache_archive() {
 
   cp "${REPO_ROOT}/pyproject.toml" "${TMP_DIR}/pyproject.toml"
   cp "${REPO_ROOT}/uv.lock" "${TMP_DIR}/uv.lock"
-  constrain_temp_pyproject_for_ci_build "${TMP_DIR}/pyproject.toml" "${jobs}"
+  constrain_temp_pyproject_for_ci_build "${TMP_DIR}/pyproject.toml" "${compile_jobs}"
 
   pushd "${TMP_DIR}" >/dev/null
   export UV_CACHE_DIR
   export UV_LINK_MODE=copy
-  export UV_CONCURRENT_BUILDS="${jobs}"
-  export CMAKE_BUILD_PARALLEL_LEVEL="${jobs}"
-  export MAX_JOBS="${jobs}"
-  export NINJAFLAGS="-j${jobs}"
+  [[ "${UV_BUILD_SLOTS}" =~ ^[1-9][0-9]*$ ]] || fail "UV_BUILD_SLOTS must be a positive integer."
+  export UV_CONCURRENT_BUILDS="${UV_BUILD_SLOTS}"
+  export CMAKE_BUILD_PARALLEL_LEVEL="${compile_jobs}"
+  export MAX_JOBS="${compile_jobs}"
+  export NINJAFLAGS="-j${compile_jobs}"
   export TORCH_CUDA_ARCH_LIST=8.0
 
   local cudnn_path="${TMP_DIR}/.venv/lib/python${PYTHON_MM}/site-packages/nvidia/cudnn"
@@ -260,13 +262,13 @@ build_cache_archive() {
   export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
   export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-  log "Building full uv cache with ${jobs} parallel jobs."
+  log "Building full uv cache with compile_jobs=${compile_jobs} and uv_concurrent_builds=${UV_BUILD_SLOTS}."
   uv sync --frozen --all-extras --group dev --no-install-project --python "${PYTHON_MM}"
   rm -rf .venv
 
   log "Packing uv cache archive to ${archive_path}."
   rm -f "${archive_path}"
-  tar -C "${UV_CACHE_DIR}" -cf - . | zstd -6 -T"${jobs}" -f -o "${archive_path}"
+  tar -C "${UV_CACHE_DIR}" -cf - . | zstd -6 -T"${compile_jobs}" -f -o "${archive_path}"
   popd >/dev/null
 
   rm -rf "${TMP_DIR}"
