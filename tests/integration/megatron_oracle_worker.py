@@ -514,11 +514,12 @@ def _patch_lora_for_fp32(
     torch grouped_gemm is bf16 only, so we have a simple custom fp32 path
     to make the numbers match closely
     """
-    from art.megatron.lora import LoRA
+    from art.megatron.lora import LoRA, MLPExpertsLinearFC1LoRA
 
     del model_chunks
     del optimizer
     original_forward = LoRA.forward
+    original_fc1_forward = MLPExpertsLinearFC1LoRA.forward
 
     def _reference_forward(
         self: Any,
@@ -564,11 +565,24 @@ def _patch_lora_for_fp32(
 
         return (out * self.scale).to(dtype=x.dtype)
 
+    def _reference_fc1_forward(self: Any, x: torch.Tensor, tokens_per_expert: Any):
+        base_out, bias_out = self.linear_fc1(x, tokens_per_expert)
+        adapter_out = torch.cat(
+            (
+                self.gate_lora(x, tokens_per_expert),
+                self.up_lora(x, tokens_per_expert),
+            ),
+            dim=1,
+        )
+        return base_out + adapter_out, bias_out
+
     LoRA.forward = _reference_forward  # ty: ignore[invalid-assignment]
+    MLPExpertsLinearFC1LoRA.forward = _reference_fc1_forward  # ty: ignore[invalid-assignment]
     try:
         yield
     finally:
         LoRA.forward = original_forward
+        MLPExpertsLinearFC1LoRA.forward = original_fc1_forward
 
 
 @contextmanager

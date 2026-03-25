@@ -58,6 +58,31 @@ def _suite_world_size() -> int:
     return max(topology.world_size() for topology in suite_topologies)
 
 
+def test_megatron_lora_topology_suite(capsys: pytest.CaptureFixture[str]) -> None:
+    """
+    Runs the suite of topologies and expects each to pass (numerical differences within our thresholds)
+    """
+    _announce_report_log(log_path=CORRECTNESS_LOG_PATH, capsys=capsys)
+    suite_world_size = _suite_world_size()
+    gpu_count = available_gpu_count()
+    if gpu_count < suite_world_size:
+        CORRECTNESS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CORRECTNESS_LOG_PATH.write_text(
+            (
+                "Topology suite skipped. "
+                f"Need {suite_world_size} GPUs, found {gpu_count}.\n"
+            ),
+            encoding="utf-8",
+        )
+    _require_gpus_for(suite_world_size)
+    _run_suite_with_log(
+        log_path=CORRECTNESS_LOG_PATH,
+        run=lambda: run_suite(
+            case_config=case_config(),
+        ),
+    )
+
+
 def test_megatron_lora_diff_sensitivity(capsys: pytest.CaptureFixture[str]) -> None:
     """
     Runs a each of the sensitivity mutations (e.g. drop megatron finalize grads)
@@ -97,30 +122,5 @@ def test_megatron_lora_diff_sensitivity(capsys: pytest.CaptureFixture[str]) -> N
         run=lambda: run_sensitivity_suite(
             case_config=case_config(),
             mutations=mutations,
-        ),
-    )
-
-
-def test_megatron_lora_topology_suite(capsys: pytest.CaptureFixture[str]) -> None:
-    """
-    Runs the suite of topologies and expects each to pass (numerical differences within our thresholds)
-    """
-    _announce_report_log(log_path=CORRECTNESS_LOG_PATH, capsys=capsys)
-    suite_world_size = _suite_world_size()
-    gpu_count = available_gpu_count()
-    if gpu_count < suite_world_size:
-        CORRECTNESS_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CORRECTNESS_LOG_PATH.write_text(
-            (
-                "Topology suite skipped. "
-                f"Need {suite_world_size} GPUs, found {gpu_count}.\n"
-            ),
-            encoding="utf-8",
-        )
-    _require_gpus_for(suite_world_size)
-    _run_suite_with_log(
-        log_path=CORRECTNESS_LOG_PATH,
-        run=lambda: run_suite(
-            case_config=case_config(),
         ),
     )

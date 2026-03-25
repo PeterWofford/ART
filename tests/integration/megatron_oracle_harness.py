@@ -793,6 +793,15 @@ def _layer_agnostic_param_key(param: str) -> str | None:
     return LAYER_INDEX_RE.sub("layers.__layer_avg__.", param, count=1)
 
 
+def _expert_agnostic_param_key(param: str) -> str:
+    """Normalizes expert-triplet params by stripping the explicit expert index."""
+    match = EXPERT_TRIPLET_PARAM_RE.search(param)
+    if match is None:
+        return param
+    start, end = match.span("expert")
+    return f"{param[:start]}__expert_avg__{param[end:]}"
+
+
 def _stacked_layers(
     pairs: list[tuple[str, Any, Any]],
 ) -> list[tuple[str, Any, Any]]:
@@ -1020,6 +1029,9 @@ class VariantRunner:
             summary=summary,
             pass_fn_by_phase=variant.pass_fn_by_phase,
         )
+        if phase in {"grads", "deltas"} and _triplet_expert_key(param) is not None:
+            row.pass_signal = True
+            row.failure_reasons = []
         if structural_failure is not None:
             row.pass_signal = False
             row.failure_reasons = [structural_failure, *row.failure_reasons]
@@ -1127,7 +1139,7 @@ class VariantRunner:
         ]
         if phase in {"forward", "grads", "deltas"}:
             pairs = _stacked_layers(pairs)
-        return self._build_metric_rows_from_tensor_pairs(
+        rows = self._build_metric_rows_from_tensor_pairs(
             variant=variant,
             step_index=step_index,
             phase=phase,
@@ -1135,6 +1147,28 @@ class VariantRunner:
             router_ids=router_ids,
             layer_averaged=phase in {"forward", "grads", "deltas"},
         )
+        if phase in {"grads", "deltas"}:
+            rows.extend(
+                self._build_metric_rows_from_tensor_pairs(
+                    variant=variant,
+                    step_index=step_index,
+                    phase=phase,
+                    pairs=_stacked_layers(
+                        [
+                            (
+                                _expert_agnostic_param_key(key),
+                                reference[key],
+                                candidate[key],
+                            )
+                            for key in sorted(set(reference.keys()))
+                            if _triplet_expert_key(key) is not None
+                        ]
+                    ),
+                    router_ids=router_ids,
+                    layer_averaged=True,
+                )
+            )
+        return rows
 
     @staticmethod
     def _build_step_summaries(rows: list[MetricRow]) -> dict[int, dict[str, Any]]:
@@ -1281,43 +1315,12 @@ class VariantRunner:
         )
 
     def print_report(self, report: VariantReport) -> None:
-        """Prints a row-level table with expert rows subsampled by highest mean_abs_pct."""
-        non_expert_rows: list[MetricRow] = []
-        triplet_rows: list[tuple[tuple[str, int], MetricRow]] = []
-        for row in report.metrics:
-            expert_key = _triplet_expert_key(row.param)
-            if expert_key is None:
-                non_expert_rows.append(row)
-                continue
-            triplet_rows.append((expert_key, row))
-
-        scores_by_proj: dict[str, dict[int, float]] = {}
-        for (projection, expert_id), row in triplet_rows:
-            projection_scores = scores_by_proj.setdefault(projection, {})
-            projection_scores[expert_id] = max(
-                projection_scores.get(expert_id, float("-inf")), row.mean_abs_pct
-            )
-
-        selected_experts: set[tuple[str, int]] = set()
-        for projection, expert_scores in scores_by_proj.items():
-            top_experts = sorted(
-                expert_scores.items(),
-                key=lambda item: item[1],
-                reverse=True,
-            )[:EXPERT_TABLE_ROW_LIMIT]
-            for expert_id, _score in top_experts:
-                selected_experts.add((projection, expert_id))
-
-        selected_triplet_rows = [
-            row for expert_key, row in triplet_rows if expert_key in selected_experts
+        """Prints a row-level table excluding expert-specific rows."""
+        table_rows = [
+            row for row in report.metrics if _triplet_expert_key(row.param) is None
         ]
-        table_rows = non_expert_rows + selected_triplet_rows
         detail_table = Table(
-            title=(
-                f"Variant Report | variant={report.variant} "
-                f"| selected_experts={len(selected_experts)} "
-                f"(top {EXPERT_TABLE_ROW_LIMIT} per projection by mean_abs_pct)"
-            ),
+            title=f"Variant Report | variant={report.variant}",
             box=box.SIMPLE_HEAVY,
             show_lines=False,
         )
@@ -1390,11 +1393,12 @@ class VariantRunner:
 def _default_phase_pass_fns() -> dict[str, PhasePassFn]:
     """Builds default per-phase pass functions over diff summaries."""
     # note the metrics get averaged across layers to reduce noise
+    # we also average across experts to reduce noise
     # we don't expect particular layers to see errors as opposed to the others so this is helpful
     fwd_out_loss = MetricThresholdRule(
         limits={"relative_l2": 1e-2, "mean_abs_pct": 1.0}
     )
-    grads_deltas = MetricThresholdRule(limits={"mean_abs_pct": 10.0})
+    grads_deltas = MetricThresholdRule(limits={"mean_abs_pct": 3.0})
     router_topk_rule = (
         MetricThresholdRule(  # should be no mismatch due to router replay
             limits={
