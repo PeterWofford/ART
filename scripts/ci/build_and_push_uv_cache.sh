@@ -12,6 +12,7 @@ BUILD_JOBS="${BUILD_JOBS:-auto}"
 AUTO_BUILD_JOBS_MAX="${AUTO_BUILD_JOBS_MAX:-4}"
 KEEP_COUNT="${KEEP_COUNT:-4}"
 PART_SIZE_MB="${PART_SIZE_MB:-1900}"
+UPLOAD_JOBS="${UPLOAD_JOBS:-4}"
 SKIP_BUILD=0
 SKIP_PRUNE=0
 ARCHIVE_PATH=""
@@ -215,6 +216,20 @@ ensure_release_exists() {
     --notes "Managed cache assets for prek CI dependency bootstrap."
 }
 
+constrain_temp_pyproject_for_ci_build() {
+  local pyproject_path="$1"
+  local jobs="$2"
+  local nvcc_threads=1
+
+  [[ -f "${pyproject_path}" ]] || fail "pyproject not found: ${pyproject_path}"
+
+  log "Applying cache-build overrides: APEX_PARALLEL_BUILD=${jobs}, NVCC_APPEND_FLAGS=--threads ${nvcc_threads}."
+  sed -i -E \
+    -e "s/APEX_PARALLEL_BUILD = \"[0-9]+\"/APEX_PARALLEL_BUILD = \"${jobs}\"/" \
+    -e "s/NVCC_APPEND_FLAGS = \"--threads [0-9]+\"/NVCC_APPEND_FLAGS = \"--threads ${nvcc_threads}\"/" \
+    "${pyproject_path}"
+}
+
 build_cache_archive() {
   local archive_path="$1"
   local jobs="$2"
@@ -225,6 +240,7 @@ build_cache_archive() {
 
   cp "${REPO_ROOT}/pyproject.toml" "${TMP_DIR}/pyproject.toml"
   cp "${REPO_ROOT}/uv.lock" "${TMP_DIR}/uv.lock"
+  constrain_temp_pyproject_for_ci_build "${TMP_DIR}/pyproject.toml" "${jobs}"
 
   pushd "${TMP_DIR}" >/dev/null
   export UV_CACHE_DIR
@@ -249,7 +265,8 @@ build_cache_archive() {
   rm -rf .venv
 
   log "Packing uv cache archive to ${archive_path}."
-  tar -C "${UV_CACHE_DIR}" -cf - . | zstd -6 -T0 -o "${archive_path}"
+  rm -f "${archive_path}"
+  tar -C "${UV_CACHE_DIR}" -cf - . | zstd -6 -T"${jobs}" -f -o "${archive_path}"
   popd >/dev/null
 
   rm -rf "${TMP_DIR}"
@@ -302,6 +319,7 @@ upload_cache_assets() {
   if ((PART_SIZE_MB > 1900)); then
     fail "--part-size-mb must be <= 1900 to stay within GitHub release asset limits."
   fi
+  [[ "${UPLOAD_JOBS}" =~ ^[1-9][0-9]*$ ]] || fail "UPLOAD_JOBS must be a positive integer."
 
   delete_assets_for_fingerprint "${repo}" "${fingerprint}"
 
@@ -311,23 +329,32 @@ upload_cache_assets() {
   split --numeric-suffixes=0 --suffix-length=3 --bytes="${PART_SIZE_MB}m" "${archive_path}" "${split_prefix}"
 
   shopt -s nullglob
-  local part_count=0
   local chunk
-  for chunk in "${parts_dir}"/"${UV_CACHE_ASSET_PREFIX}-${fingerprint}.tar.zst.part-"*; do
-    local part_asset="${chunk##*/}"
-    log "Uploading cache part ${part_asset}."
-    gh release upload "${UV_CACHE_RELEASE_TAG}" \
-      --repo "${repo}" \
-      "${chunk}" \
-      --clobber
-    part_count=$((part_count + 1))
-  done
+  local parts=("${parts_dir}"/"${UV_CACHE_ASSET_PREFIX}-${fingerprint}.tar.zst.part-"*)
   shopt -u nullglob
 
+  local part_count="${#parts[@]}"
   if ((part_count == 0)); then
     rm -rf "${parts_dir}"
     fail "No cache parts produced from archive ${archive_path}."
   fi
+
+  local upload_jobs="${UPLOAD_JOBS}"
+  if ((upload_jobs > part_count)); then
+    upload_jobs="${part_count}"
+  fi
+
+  log "Uploading ${part_count} cache parts with ${upload_jobs} parallel upload jobs."
+  printf '%s\0' "${parts[@]}" | xargs -0 -n 1 -P "${upload_jobs}" sh -c '
+    chunk="$1"
+    part_asset="${chunk##*/}"
+    printf "[ci-cache] Uploading cache part %s\n" "${part_asset}"
+    gh release upload "'"${UV_CACHE_RELEASE_TAG}"'" \
+      --repo "'"${repo}"'" \
+      "${chunk}" \
+      --clobber
+  ' sh
+
   rm -rf "${parts_dir}"
   printf '%s\n' "${part_count}"
 }
