@@ -14,9 +14,9 @@ from openai.types import Model
 from openai.types.chat.chat_completion import Choice
 from openai.types.completion_usage import CompletionUsage
 
-from art.types import MessageOrChoice, MessagesAndChoices, Tools
+from art.types import Message, MessageOrChoice, MessagesAndChoices, Tools
 
-ParsedMessageOrChoice = Choice | dict[str, Any]
+ParsedMessageOrChoice = Choice | Message
 ParsedMessagesAndChoices = list[ParsedMessageOrChoice]
 
 
