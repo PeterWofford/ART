@@ -737,7 +737,7 @@ def _patch_alltoall_dispatcher_preprocess() -> None:
             self,
             num_local_tokens=int(routing_map.shape[0]),
         )
-        permuted_local_uids, _, _ = permute(
+        permuted_local_uids = permute(
             local_token_uids.to(
                 device=hidden_states.device, dtype=torch.int64
             ).unsqueeze(-1),
@@ -745,7 +745,7 @@ def _patch_alltoall_dispatcher_preprocess() -> None:
             num_out_tokens=self.num_out_tokens,
             fused=False,
             drop_and_pad=self.drop_and_pad,
-        )
+        )[0]
         self._art_replay_permuted_local_token_uids = permuted_local_uids.reshape(
             -1
         ).contiguous()
@@ -813,12 +813,12 @@ def _patch_alltoall_dispatcher_preprocess() -> None:
 
         expert_token_uids = global_input_token_uids
         if self.num_local_experts > 1:
-            sorted_token_uids, _ = sort_chunks_by_idxs(
+            sorted_token_uids = sort_chunks_by_idxs(
                 expert_token_uids.unsqueeze(-1),
                 self.num_global_tokens_per_local_expert.ravel(),
                 self.sort_input_by_local_experts,
                 fused=False,
-            )
+            )[0]
             expert_token_uids = sorted_token_uids.reshape(-1).contiguous()
 
         (

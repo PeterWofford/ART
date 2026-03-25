@@ -24,6 +24,7 @@ from ..local.checkpoints import get_last_checkpoint_dir
 from ..preprocessing.pack import DiskPackedTensors
 from ..preprocessing.tokenize import SFTBatch
 from ..unsloth.service import do_sleep, do_wake_up, gc_and_empty_cuda_cache
+from ..utils.convert_moe_lora import convert_checkpoint_if_needed
 from ..utils.get_model_step import get_step_from_dir
 from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, openai_server_task, run_on_workers
@@ -103,24 +104,56 @@ class MegatronService:
         return False
 
     def _create_identity_lora(self, lora_path: str) -> None:
-        # Create an identity (zero) LoRA using PEFT so vLLM can load it.
-        from peft import get_peft_model
-        from transformers import AutoModelForCausalLM
+        from unittest.mock import patch
 
-        lora_config = self._default_lora_adapter_config()
-        model = AutoModelForCausalLM.from_pretrained(
+        from accelerate import init_empty_weights
+        from peft import get_peft_model
+        from transformers import AutoConfig, AutoModelForCausalLM
+
+        base_config = AutoConfig.from_pretrained(
             self.base_model,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
             trust_remote_code=True,
         )
-        peft_model = get_peft_model(model, lora_config)
-        # Keep LoRA A initialized (trainable) and zero only B for identity.
-        for name, param in peft_model.named_parameters():
-            if "lora_B" in name:
-                param.data.zero_()
+        with init_empty_weights():
+            model = AutoModelForCausalLM.from_config(
+                base_config,
+                torch_dtype=torch.bfloat16,
+                trust_remote_code=True,
+            )
+        model.name_or_path = self.base_model
+        lora_config = self._default_lora_adapter_config()
+        lora_config.target_modules = []
+        lora_config.target_parameters = [
+            name
+            for name, _ in model.named_parameters()
+            if name.endswith(
+                (
+                    "q_proj.weight",
+                    "k_proj.weight",
+                    "v_proj.weight",
+                    "o_proj.weight",
+                    "mlp.experts.gate_up_proj",
+                    "mlp.experts.down_proj",
+                )
+            )
+        ]
+
+        meta = torch.device("meta")
+        orig_to = torch.nn.Module.to
+
+        def _skip_meta_to(module: torch.nn.Module, *args: Any, **kwargs: Any):
+            device = kwargs.get("device") or (args[0] if args else None)
+            if device == meta or str(device) == "meta":
+                return module
+            return orig_to(module, *args, **kwargs)
+
+        with patch.object(torch.nn.Module, "to", _skip_meta_to):
+            peft_model = get_peft_model(model, lora_config)
+
         os.makedirs(lora_path, exist_ok=True)
         peft_model.save_pretrained(lora_path)
+        convert_checkpoint_if_needed(lora_path)
+        self._default_lora_adapter_config().save_pretrained(lora_path)
         del peft_model, model
         if torch.cuda.is_available():
             torch.cuda.synchronize()

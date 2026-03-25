@@ -166,7 +166,10 @@ def test_controller_patches_router_and_replays() -> None:
     controller.set_step(step_index=0, sample_index=0)
 
     logits = torch.randn((4, 3), dtype=torch.float32)
-    router = cast(_FakeRouter, chunk.decoder.layers[0].mlp.router)
+    router = cast(
+        _FakeRouter,
+        chunk.decoder.layers[0].mlp.router,  # ty: ignore[possibly-missing-attribute]
+    )
     replay_probs, replay_map = router.routing(logits)
     expected_probs, expected_map = _dense_from_compact(route, dtype=logits.dtype)
 
