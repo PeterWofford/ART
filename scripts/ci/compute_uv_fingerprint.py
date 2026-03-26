@@ -48,6 +48,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=16,
         help="Fingerprint length (hex chars)",
     )
+    parser.add_argument(
+        "--ci-apex-parallel-build",
+        type=int,
+        default=8,
+        help="CI override for APEX_PARALLEL_BUILD used by cache build and restore.",
+    )
+    parser.add_argument(
+        "--ci-apex-nvcc-threads",
+        type=int,
+        default=1,
+        help="CI override for NVCC_APPEND_FLAGS=--threads <n> used by cache build and restore.",
+    )
     return parser
 
 
@@ -66,7 +78,7 @@ def main() -> int:
             "uv_lock_sha256": _sha256_file(args.uv_lock),
         },
         "ci_context": {
-            "fingerprint_schema_version": 7,
+            "fingerprint_schema_version": 8,
             "cache_kind": "full_uv_cache",
             "cache_scope": "prek_all_extras_group_dev",
             "cache_target": "uv_cache",
@@ -80,6 +92,8 @@ def main() -> int:
         {
             "base_image": args.base_image,
             "python_mm": args.python_mm,
+            "ci_apex_parallel_build": args.ci_apex_parallel_build,
+            "ci_apex_nvcc_threads": args.ci_apex_nvcc_threads,
         }
     )
     canonical = json.dumps(payload, separators=(",", ":"), sort_keys=True)

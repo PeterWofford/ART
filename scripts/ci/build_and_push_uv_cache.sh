@@ -11,6 +11,8 @@ UV_CACHE_ASSET_PREFIX="${UV_CACHE_ASSET_PREFIX:-prek-uv-cache}"
 BUILD_JOBS="${BUILD_JOBS:-auto}"
 AUTO_BUILD_JOBS_MAX="${AUTO_BUILD_JOBS_MAX:-8}"
 UV_BUILD_SLOTS="${UV_BUILD_SLOTS:-2}"
+CI_APEX_PARALLEL_BUILD="${CI_APEX_PARALLEL_BUILD:-8}"
+CI_APEX_NVCC_THREADS="${CI_APEX_NVCC_THREADS:-1}"
 KEEP_COUNT="${KEEP_COUNT:-4}"
 PART_SIZE_MB="${PART_SIZE_MB:-1900}"
 UPLOAD_JOBS="${UPLOAD_JOBS:-4}"
@@ -217,23 +219,40 @@ ensure_release_exists() {
     --notes "Managed cache assets for prek CI dependency bootstrap."
 }
 
+resolve_apex_parallel_build() {
+  local compile_jobs="$1"
+
+  [[ "${compile_jobs}" =~ ^[1-9][0-9]*$ ]] || fail "compile_jobs must be a positive integer."
+  [[ "${CI_APEX_PARALLEL_BUILD}" =~ ^[1-9][0-9]*$ ]] || fail "CI_APEX_PARALLEL_BUILD must be a positive integer."
+
+  local apex_parallel_build="${CI_APEX_PARALLEL_BUILD}"
+  if ((apex_parallel_build > compile_jobs)); then
+    apex_parallel_build="${compile_jobs}"
+  fi
+  printf '%s\n' "${apex_parallel_build}"
+}
+
 constrain_temp_pyproject_for_ci_build() {
   local pyproject_path="$1"
-  local compile_jobs="$2"
-  local nvcc_threads=1
+  local apex_parallel_build="$2"
+  local nvcc_threads="$3"
 
   [[ -f "${pyproject_path}" ]] || fail "pyproject not found: ${pyproject_path}"
+  [[ "${apex_parallel_build}" =~ ^[1-9][0-9]*$ ]] || fail "apex_parallel_build must be a positive integer."
+  [[ "${nvcc_threads}" =~ ^[1-9][0-9]*$ ]] || fail "CI_APEX_NVCC_THREADS must be a positive integer."
 
-  log "Applying cache-build overrides: APEX_PARALLEL_BUILD=${compile_jobs}, NVCC_APPEND_FLAGS=--threads ${nvcc_threads}."
-  sed -i -E \
-    -e "s/APEX_PARALLEL_BUILD = \"[0-9]+\"/APEX_PARALLEL_BUILD = \"${compile_jobs}\"/" \
-    -e "s/NVCC_APPEND_FLAGS = \"--threads [0-9]+\"/NVCC_APPEND_FLAGS = \"--threads ${nvcc_threads}\"/" \
-    "${pyproject_path}"
+  log "Applying cache-build overrides: APEX_PARALLEL_BUILD=${apex_parallel_build}, NVCC_APPEND_FLAGS=--threads ${nvcc_threads}."
+  python3 "${SCRIPT_DIR}/apply_ci_uv_build_overrides.py" \
+    --pyproject "${pyproject_path}" \
+    --apex-parallel-build "${apex_parallel_build}" \
+    --apex-nvcc-threads "${nvcc_threads}"
 }
 
 build_cache_archive() {
   local archive_path="$1"
   local compile_jobs="$2"
+  local apex_parallel_build
+  apex_parallel_build="$(resolve_apex_parallel_build "${compile_jobs}")"
 
   TMP_DIR="$(mktemp -d)"
   UV_CACHE_DIR="${TMP_DIR}/uv-cache"
@@ -241,7 +260,7 @@ build_cache_archive() {
 
   cp "${REPO_ROOT}/pyproject.toml" "${TMP_DIR}/pyproject.toml"
   cp "${REPO_ROOT}/uv.lock" "${TMP_DIR}/uv.lock"
-  constrain_temp_pyproject_for_ci_build "${TMP_DIR}/pyproject.toml" "${compile_jobs}"
+  constrain_temp_pyproject_for_ci_build "${TMP_DIR}/pyproject.toml" "${apex_parallel_build}" "${CI_APEX_NVCC_THREADS}"
 
   pushd "${TMP_DIR}" >/dev/null
   export UV_CACHE_DIR
@@ -262,7 +281,7 @@ build_cache_archive() {
   export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
   export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 
-  log "Building full uv cache with compile_jobs=${compile_jobs} and uv_concurrent_builds=${UV_BUILD_SLOTS}."
+  log "Building full uv cache with compile_jobs=${compile_jobs}, apex_parallel_build=${apex_parallel_build}, nvcc_threads=${CI_APEX_NVCC_THREADS}, and uv_concurrent_builds=${UV_BUILD_SLOTS}."
   uv sync --frozen --all-extras --group dev --no-install-project --python "${PYTHON_MM}"
   rm -rf .venv
 

@@ -13,6 +13,9 @@ env:
   CI_PYTHON_MM: "3.11"
   CI_UV_CACHE_RELEASE_TAG: "prek-uv-cache"
   CI_UV_CACHE_ASSET_PREFIX: "prek-uv-cache"
+  CI_APEX_PARALLEL_BUILD: "8"
+  CI_APEX_NVCC_THREADS: "1"
+  CI_UV_BUILD_SLOTS: "2"
   UV_CACHE_DIR: "/root/.cache/uv"
   UV_LINK_MODE: "copy"
   TORCH_CUDA_ARCH_LIST: "8.0"
@@ -34,7 +37,9 @@ jobs:
             --pyproject pyproject.toml \
             --uv-lock uv.lock \
             --base-image "${CI_BASE_IMAGE}" \
-            --python-mm "${CI_PYTHON_MM}")"
+            --python-mm "${CI_PYTHON_MM}" \
+            --ci-apex-parallel-build "${CI_APEX_PARALLEL_BUILD}" \
+            --ci-apex-nvcc-threads "${CI_APEX_NVCC_THREADS}")"
           echo "fingerprint=${fp}" >> "${GITHUB_OUTPUT}"
           echo "Expected uv cache fingerprint: ${fp}"
 
@@ -198,6 +203,13 @@ jobs:
 
       - name: Install dependencies (with all optional extras for complete type checking)
         run: |
+          original_pyproject="$(mktemp)"
+          cp pyproject.toml "${original_pyproject}"
+          cleanup() {
+            mv "${original_pyproject}" pyproject.toml
+          }
+          trap cleanup EXIT
+
           py_mm="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
           cudnn_path="${GITHUB_WORKSPACE}/.venv/lib/python${py_mm}/site-packages/nvidia/cudnn"
           export CUDNN_PATH="${cudnn_path}"
@@ -207,13 +219,22 @@ jobs:
           export CPLUS_INCLUDE_PATH="${CUDNN_INCLUDE_PATH}${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
           export LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LIBRARY_PATH:+:${LIBRARY_PATH}}"
           export LD_LIBRARY_PATH="${CUDNN_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+          export UV_CONCURRENT_BUILDS="${CI_UV_BUILD_SLOTS}"
+          export CMAKE_BUILD_PARALLEL_LEVEL="${CI_APEX_PARALLEL_BUILD}"
+          export MAX_JOBS="${CI_APEX_PARALLEL_BUILD}"
+          export NINJAFLAGS="-j${CI_APEX_PARALLEL_BUILD}"
+          python3 scripts/ci/apply_ci_uv_build_overrides.py \
+            --pyproject pyproject.toml \
+            --apex-parallel-build "${CI_APEX_PARALLEL_BUILD}" \
+            --apex-nvcc-threads "${CI_APEX_NVCC_THREADS}"
+          echo "CI uv build overrides: APEX_PARALLEL_BUILD=${CI_APEX_PARALLEL_BUILD}, NVCC_APPEND_FLAGS=--threads ${CI_APEX_NVCC_THREADS}, UV_CONCURRENT_BUILDS=${CI_UV_BUILD_SLOTS}"
           uv --version
           uv sync --all-extras --group dev --frozen
 
       - name: Run prek hooks (lint, format, typecheck, uv.lock, tests)
         run: |
-          uv run prek run --all-files
+          uv run --no-sync prek run --all-files
 
       - name: Run unit tests (via prek)
         run: |
-          uv run prek run pytest
+          uv run --no-sync prek run pytest
