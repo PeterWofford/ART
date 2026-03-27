@@ -114,6 +114,12 @@ Write a complete, runnable Python script. Use the patterns below. Every script M
 - Call `await backend.close()` at the end so the process doesn't hang
 - Print post-training info and usage examples (see shared block below)
 
+Important API note:
+- Do not rewrite SFT examples to use `backend.train(...)`. That API is for RL, not SFT.
+- For JSONL-based SFT, use `train_sft_from_file(...)`.
+- For trajectory-based or distillation SFT, use the current public `model.train_sft(...)` API.
+- Do not use private backend methods such as `_train_sft(...)` in generated scripts.
+
 ### Post-training block (append to ALL scripts before `backend.close()`):
 ```python
     # --- Training complete ---
@@ -276,6 +282,7 @@ async def main():
         schedule_type="<SCHEDULE_TYPE>",
         warmup_ratio=<WARMUP_RATIO>,
     ):
+        # For trajectory-based SFT, use the public model.train_sft(...) API.
         await model.train_sft(chunk.trajectories, chunk.config, verbose=True)
 
     # ... post-training block + backend.close() ...
