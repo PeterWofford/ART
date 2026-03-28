@@ -759,7 +759,6 @@ class UnslothService:
             self._state,
             batches,
             verbose=verbose,
-            weight_decay=0.01,
             max_grad_norm=1.0,
         ):
             yield {
