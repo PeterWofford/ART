@@ -1,23 +1,14 @@
 # isort: off
-import os
+from art.megatron.runtime_env import configure_megatron_runtime_env
 
-
-def _set_cache_dir(env_var: str, default_path: str) -> None:
-    if not os.environ.get(env_var):
-        os.environ[env_var] = os.path.expanduser(default_path)
-    os.makedirs(os.environ[env_var], exist_ok=True)
-
-
-os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
-_set_cache_dir("TORCHINDUCTOR_CACHE_DIR", "~/.cache/torchinductor")
-_set_cache_dir("TRITON_CACHE_DIR", "~/.triton/cache")
+configure_megatron_runtime_env()
 # isort: on
 
 import gc
+import importlib
 import json
 import math
+import os
 import shutil
 import time
 from typing import Any, Callable, cast
@@ -28,7 +19,6 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer.module import MegatronModule
 from pydantic import BaseModel, ConfigDict
-from safetensors.torch import load_file, save_file
 import torch
 from torch._inductor.runtime.cache_dir_utils import cache_dir as inductor_cache_dir
 
@@ -36,6 +26,11 @@ from art import dev, types
 from art.loss import loss_fn, shift_tensor
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
+from art.megatron.jobs import (
+    DEFAULT_JOBS_DIR,
+    DEFAULT_TRAINING_LOG_PATH,
+    DEFAULT_VLLM_WAKE_LOCK_PATH,
+)
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.offload import (
     OffloadState,
@@ -53,6 +48,10 @@ from art.preprocessing.pack import (
     PackedTensors,
     packed_tensors_from_dir,
 )
+
+safetensors_torch = importlib.import_module("safetensors.torch")
+load_file = safetensors_torch.load_file
+save_file = safetensors_torch.save_file
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
 
@@ -588,23 +587,23 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
 
     while True:
         torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
-        jobs_dir = "/tmp/megatron_training_jobs"
-        os.makedirs(jobs_dir, exist_ok=True)
+        os.makedirs(DEFAULT_JOBS_DIR, exist_ok=True)
         job_names = sorted(
-            job_name for job_name in os.listdir(jobs_dir) if job_name.endswith(".json")
+            job_name
+            for job_name in os.listdir(DEFAULT_JOBS_DIR)
+            if job_name.endswith(".json")
         )
         if not job_names:
             time.sleep(1)
             continue
 
-        wake_lock_path = "/tmp/megatron_vllm_waking"
-        while os.path.exists(wake_lock_path):
+        while os.path.exists(DEFAULT_VLLM_WAKE_LOCK_PATH):
             time.sleep(0.2)
 
         reload_to_gpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
 
         job_name = job_names[0]
-        job_path = os.path.join(jobs_dir, job_name)
+        job_path = os.path.join(DEFAULT_JOBS_DIR, job_name)
         with open(job_path, "rb") as handle:
             job = TrainingJob.model_validate_json(handle.read())
         config = job.config
@@ -683,7 +682,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
 
             if runtime.rank == 0:
                 with open(
-                    "/tmp/megatron_training_log.jsonl", "a+", encoding="utf-8"
+                    DEFAULT_TRAINING_LOG_PATH, "a+", encoding="utf-8"
                 ) as log_file:
                     log_msg = json.dumps(
                         {
@@ -731,9 +730,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
         if runtime.rank == 0:
             os.remove(job_path)
-            with open(
-                "/tmp/megatron_training_log.jsonl", "a+", encoding="utf-8"
-            ) as log_file:
+            with open(DEFAULT_TRAINING_LOG_PATH, "a+", encoding="utf-8") as log_file:
                 log_file.write("all done\n")
             shutil.rmtree(job.disk_packed_tensors["dir"])
 
