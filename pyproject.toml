@@ -139,7 +139,7 @@ override-dependencies = [
     "quack-kernels==0.2.5",
 ]
 exclude-dependencies = ["pynvml", "emerging-optimizers"]
-no-build-isolation-package = ["apex", "transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-core", "megatron-bridge", "nv-grouped-gemm", "mamba-ssm", "causal-conv1d"]
+no-build-isolation-package = ["transformer-engine", "transformer-engine-cu12", "transformer-engine-torch", "megatron-core", "megatron-bridge", "nv-grouped-gemm", "mamba-ssm", "causal-conv1d"]
 
 [tool.uv.extra-build-dependencies]
 apex = ["torch>=2.8.0"]
