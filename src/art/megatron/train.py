@@ -6,10 +6,8 @@ configure_megatron_runtime_env()
 
 import gc
 import importlib
-import json
 import math
 import os
-import shutil
 import time
 from typing import Any, Callable, cast
 
@@ -30,6 +28,7 @@ from art.megatron.jobs import (
     DEFAULT_JOBS_DIR,
     DEFAULT_TRAINING_LOG_PATH,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
+    MegatronTrainingJob,
 )
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.offload import (
@@ -44,32 +43,12 @@ from art.megatron.routing_replay import (
     MoeRoutingReplayController,
 )
 from art.preprocessing.pack import (
-    DiskPackedTensors,
     PackedTensors,
-    packed_tensors_from_dir,
 )
 
 safetensors_torch = importlib.import_module("safetensors.torch")
-load_file = safetensors_torch.load_file
-save_file = safetensors_torch.save_file
 
 DEFAULT_MODEL_IDENTIFIER = "Qwen/Qwen3-30B-A3B-Instruct-2507"
-
-
-class TrainingJob(BaseModel):
-    lora_path: str
-    optimizer_state_path: str
-    disk_packed_tensors: DiskPackedTensors
-    config: types.TrainConfig
-    experimental_config: dev.TrainConfig
-    moe_routing_replay_path: str | None = None
-    moe_routing_replay_strict: bool = True
-
-
-TrainingJob.model_rebuild(
-    force=True,
-    _types_namespace={"MoeRoutingReplayBundle": MoeRoutingReplayBundle},
-)
 
 
 class TrainingRuntime(BaseModel):
@@ -586,6 +565,8 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
     offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
 
     while True:
+        from .shared import run_megatron_rl_job
+
         torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
         os.makedirs(DEFAULT_JOBS_DIR, exist_ok=True)
         job_names = sorted(
@@ -605,134 +586,12 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
         job_name = job_names[0]
         job_path = os.path.join(DEFAULT_JOBS_DIR, job_name)
         with open(job_path, "rb") as handle:
-            job = TrainingJob.model_validate_json(handle.read())
-        config = job.config
-        experimental_config = job.experimental_config
-
-        configure_moe_routing_replay(
-            runtime,
-            replay_bundle_path=job.moe_routing_replay_path,
-            strict=job.moe_routing_replay_strict,
-        )
+            job = MegatronTrainingJob.model_validate_json(handle.read())
 
         print0(runtime.rank, "Loaded job from", job_path)
         print0(runtime.rank, "Job:", job)
-
-        adapter_model_path = f"{job.lora_path}/adapter_model.safetensors"
-        if not os.path.exists(adapter_model_path):
-            raise FileNotFoundError(f"No adapter model found at {adapter_model_path}")
-        print0(runtime.rank, "Loading adapter model from", adapter_model_path)
-        adapter_model = load_file(adapter_model_path)
-        load_adapter_into_model(runtime.model, adapter_model, runtime.optimizer)
-
-        optimizer_shard_path = os.path.join(
-            job.optimizer_state_path,
-            f"{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.pt",
-        )
-        if os.path.exists(optimizer_shard_path):
-            print("Loading optimizer state from", optimizer_shard_path)
-            runtime.optimizer.load_state_dict(torch.load(optimizer_shard_path))
-        else:
-            print(
-                "No optimizer state found at",
-                optimizer_shard_path,
-                "- resetting optimizer for new run",
-            )
-            clear_optimizer_state(runtime.optimizer)
-            runtime.optimizer.reload_model_params()
-
-        print0(
-            runtime.rank, "Loading packed tensors from", job.disk_packed_tensors["dir"]
-        )
-        packed_tensors = packed_tensors_from_dir(**job.disk_packed_tensors)
-        template = _clone_packed_tensors(select_indexed_inputs(packed_tensors, 0))
-        zero_template = _zero_contribution_inputs(template)
-        num_sequences = job.disk_packed_tensors["num_sequences"]
-        global_grad_accumulation_sequences = config.grad_accumulation_sequences
-        num_steps = math.ceil(num_sequences / global_grad_accumulation_sequences)
-        for step_index in range(num_steps):
-            micro_indices = build_micro_sample_indices(
-                step_index=step_index,
-                num_sequences=num_sequences,
-                global_grad_accumulation_sequences=global_grad_accumulation_sequences,
-            )
-            micro_inputs = select_micro_inputs(
-                packed_tensors, micro_indices, zero_template
-            )
-            try:
-                step_result = run_training_step(
-                    model_chunks=runtime.model,
-                    optimizer=runtime.optimizer,
-                    learning_rate=config.learning_rate,
-                    inputs=micro_inputs,
-                    config=config,
-                    experimental_config=experimental_config,
-                    ref_logprobs=None,
-                    step_index=step_index,
-                    sample_index=micro_indices,
-                    moe_routing_replay_controller=runtime.moe_routing_replay_controller,
-                )
-            except Exception:
-                raise
-            print0(
-                runtime.rank,
-                "Correlation between old and new probabilities:",
-                step_result.probs_corr,
-            )
-
-            if runtime.rank == 0:
-                with open(
-                    DEFAULT_TRAINING_LOG_PATH, "a+", encoding="utf-8"
-                ) as log_file:
-                    log_msg = json.dumps(
-                        {
-                            "loss": step_result.reduced_loss.item(),
-                            "grad_norm": step_result.grad_norm,
-                            "probs_corr": step_result.probs_corr,
-                        }
-                    )
-                    print("Logging", log_msg)
-                    log_file.write(log_msg + "\n")
-
-        sharded_state_dict, sharded_state_manifest = collect_sharded_lora_state(
-            runtime.model,
-            adapter_model,
-        )
-        shard_path = os.path.join(
-            job.lora_path,
-            f"adapter_model-{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.safetensors",
-        )
-        manifest_path = os.path.join(
-            job.lora_path,
-            f"adapter_manifest-{runtime.rank + 1:02d}-of-{runtime.world_size:02d}.json",
-        )
-        print("Saving adapter shard to", shard_path)
-        save_file(sharded_state_dict, shard_path)
-        print("Saving adapter shard manifest to", manifest_path)
-        with open(manifest_path, "w", encoding="utf-8") as manifest_file:
-            json.dump(sharded_state_manifest, manifest_file, sort_keys=True)
-
-        print("Saving optimizer shard to", optimizer_shard_path)
-        os.makedirs(job.optimizer_state_path, exist_ok=True)
-        torch.save(runtime.optimizer.state_dict(), optimizer_shard_path)
-
+        run_megatron_rl_job(runtime, job, job_path=job_path)
         offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
-
-        del packed_tensors
-        del template
-        del zero_template
-        del adapter_model
-        if "micro_inputs" in locals():
-            del micro_inputs
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
-        if runtime.rank == 0:
-            os.remove(job_path)
-            with open(DEFAULT_TRAINING_LOG_PATH, "a+", encoding="utf-8") as log_file:
-                log_file.write("all done\n")
-            shutil.rmtree(job.disk_packed_tensors["dir"])
 
 
 def main() -> None:

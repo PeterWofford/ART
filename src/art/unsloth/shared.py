@@ -21,9 +21,18 @@ from ..preprocessing.pack import (
     packed_tensors_from_dir,
 )
 from ..preprocessing.tokenize import SFTBatch
-from .train import gc_and_empty_cuda_cache, train
+from .train import StopTrainingLoop, gc_and_empty_cuda_cache, train
 
 nest_asyncio.apply()
+_TRAIN_TASK_SHUTDOWN_TIMEOUT_S = 5.0
+
+
+class _StopTrainInputs:
+    """Sentinel used to stop the background trainer loop cleanly."""
+
+
+_STOP_TRAIN_INPUT = _StopTrainInputs()
+_TrainLoopInput = TrainInputs | _StopTrainInputs
 
 
 class CausalLM(PreTrainedModel, GenerationMixin):
@@ -38,7 +47,7 @@ class UnslothTrainContext:
     tokenizer: PreTrainedTokenizerBase
     peft_model: peft.peft_model.PeftModelForCausalLM
     trainer: GRPOTrainer
-    inputs_queue: asyncio.Queue[TrainInputs]
+    inputs_queue: asyncio.Queue[_TrainLoopInput]
     results_queue: asyncio.Queue[dict[str, float]]
     train_task: asyncio.Task[None] | None = None
     warmup_pending: bool = True
@@ -218,6 +227,22 @@ class UnslothTrainContext:
         optimizer_path = os.path.join(checkpoint_dir, "optimizer.pt")
         torch.save(self.trainer.optimizer.state_dict(), optimizer_path)
 
+    async def stop_background_training(
+        self,
+        *,
+        timeout_s: float = _TRAIN_TASK_SHUTDOWN_TIMEOUT_S,
+    ) -> None:
+        train_task = self.train_task
+        self.train_task = None
+        if train_task is None or train_task.done():
+            return
+
+        self.inputs_queue.put_nowait(_STOP_TRAIN_INPUT)
+        try:
+            await asyncio.wait_for(train_task, timeout=timeout_s)
+        except asyncio.TimeoutError:
+            train_task.cancel()
+
 
 def create_unsloth_train_context(
     *,
@@ -258,14 +283,16 @@ def create_unsloth_train_context(
     if trainer.optimizer is None:
         trainer.create_optimizer()
 
-    inputs_queue: asyncio.Queue[TrainInputs] = asyncio.Queue()
+    inputs_queue: asyncio.Queue[_TrainLoopInput] = asyncio.Queue()
     results_queue: asyncio.Queue[dict[str, float]] = asyncio.Queue()
 
     def _async_prepare_inputs(*_: Any, **__: Any) -> dict[str, torch.Tensor]:
-        async def get_inputs() -> TrainInputs:
+        async def get_inputs() -> _TrainLoopInput:
             return await inputs_queue.get()
 
         inputs = asyncio.run(get_inputs())
+        if isinstance(inputs, _StopTrainInputs):
+            raise StopTrainingLoop()
         return cast(dict[str, torch.Tensor], inputs)
 
     trainer._prepare_inputs = _async_prepare_inputs
