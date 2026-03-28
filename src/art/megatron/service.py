@@ -33,7 +33,7 @@ from .jobs import (
     DEFAULT_VLLM_WAKE_LOCK_PATH,
     MegatronTrainingJob,
 )
-from .shared import merge_sharded_lora_adapter
+from .shared import merge_lora_adapter
 
 safetensors = importlib.import_module("safetensors")
 safe_open = safetensors.safe_open
@@ -303,7 +303,7 @@ class MegatronService:
                     for line in lines:
                         if line := line.strip():
                             if line == "all done":
-                                merge_sharded_lora_adapter(lora_path)
+                                merge_lora_adapter(lora_path)
                                 os.remove(DEFAULT_TRAINING_LOG_PATH)
                                 break
                             num_lines += 1

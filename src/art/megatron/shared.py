@@ -270,7 +270,7 @@ def run_megatron_sft_job(
         torch.cuda.empty_cache()
 
 
-def merge_sharded_lora_adapter(lora_path: str) -> None:
+def merge_lora_adapter(lora_path: str) -> None:
     base_dir = Path(lora_path)
     shard_filenames = sorted(base_dir.glob("adapter_model-*-of-*.safetensors"))
     if not shard_filenames:
