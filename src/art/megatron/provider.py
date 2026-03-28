@@ -57,21 +57,6 @@ class _CastingStateSource(StateSource):
         return self._source.has_glob(pattern)
 
 
-def _ensure_rope_theta(bridge: AutoBridge) -> None:
-    config = bridge.hf_pretrained.config
-    if hasattr(config, "rope_theta"):
-        return
-
-    for rope_config_name in ("rope_scaling", "rope_parameters"):
-        rope_config = getattr(config, rope_config_name, None)
-        if not isinstance(rope_config, dict):
-            continue
-        rope_theta = rope_config.get("rope_theta")
-        if isinstance(rope_theta, int | float):
-            setattr(config, "rope_theta", float(rope_theta))
-            return
-
-
 def get_provider(
     model: str,
     *,
@@ -85,7 +70,6 @@ def get_provider(
     assert isinstance(bridge._model_bridge, Qwen3MoEBridge), (
         "Only Qwen3 MoE models are supported"
     )
-    _ensure_rope_theta(bridge)
     if torch_dtype != torch.bfloat16:
         model_name_or_path = bridge.hf_pretrained.model_name_or_path
         assert model_name_or_path is not None
