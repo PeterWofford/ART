@@ -51,8 +51,6 @@ def create_megatron_train_context(
 def run_megatron_rl_job(
     ctx: MegatronTrainContext,
     job: MegatronTrainingJob,
-    *,
-    job_path: str | None = None,
 ) -> None:
     packed_tensors = None
     adapter_model = None
@@ -125,12 +123,6 @@ def run_megatron_rl_job(
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
         )
-        _complete_job(
-            ctx,
-            job_path=job_path,
-            log_path=job.log_path,
-            cleanup_path=job.disk_packed_tensors["dir"],
-        )
     finally:
         if packed_tensors is not None:
             del packed_tensors
@@ -149,8 +141,6 @@ def run_megatron_rl_job(
 def run_megatron_sft_job(
     ctx: MegatronTrainContext,
     job: MegatronSFTTrainingJob,
-    *,
-    job_path: str | None = None,
 ) -> None:
     adapter_model = None
 
@@ -256,12 +246,6 @@ def run_megatron_sft_job(
             adapter_model=adapter_model,
             lora_path=job.lora_path,
             optimizer_state_path=job.optimizer_state_path,
-        )
-        _complete_job(
-            ctx,
-            job_path=job_path,
-            log_path=job.log_path,
-            cleanup_path=job.sft_data_dir,
         )
     finally:
         if adapter_model is not None:
@@ -381,19 +365,11 @@ def _load_lora_and_optimizer(
     optimizer_state_path: str,
 ) -> dict[str, torch.Tensor]:
     adapter_model_path = os.path.join(lora_path, "adapter_model.safetensors")
-    if os.path.exists(adapter_model_path):
-        print0(ctx.rank, "Loading adapter model from", adapter_model_path)
-        adapter_model = load_file(adapter_model_path)
-        load_adapter_into_model(ctx.model, adapter_model, ctx.optimizer)
-    else:
-        print0(ctx.rank, "No adapter model found at", adapter_model_path)
-        adapter_model = {}
-        with torch.no_grad():
-            for chunk in ctx.model:
-                for module in chunk.modules():
-                    if hasattr(module, "reset_lora_parameters"):
-                        module.reset_lora_parameters()  # type: ignore[attr-defined]
-        ctx.optimizer.reload_model_params()
+    if not os.path.exists(adapter_model_path):
+        raise FileNotFoundError(f"No adapter model found at {adapter_model_path}")
+    print0(ctx.rank, "Loading adapter model from", adapter_model_path)
+    adapter_model = load_file(adapter_model_path)
+    load_adapter_into_model(ctx.model, adapter_model, ctx.optimizer)
 
     optimizer_shard_path = os.path.join(
         optimizer_state_path,
@@ -449,7 +425,7 @@ def _save_lora_and_optimizer(
     torch.save(ctx.optimizer.state_dict(), optimizer_shard_path)
 
 
-def _complete_job(
+def finalize_megatron_job(
     ctx: MegatronTrainContext,
     *,
     job_path: str | None,
@@ -462,9 +438,10 @@ def _complete_job(
 
     if job_path is not None and os.path.exists(job_path):
         os.remove(job_path)
+    if os.path.exists(cleanup_path):
+        shutil.rmtree(cleanup_path)
     with open(log_path, "a+", encoding="utf-8") as log_file:
         log_file.write("all done\n")
-    shutil.rmtree(cleanup_path)
 
 
 def _placeholder_attention_mask(device: torch.device) -> torch.Tensor:

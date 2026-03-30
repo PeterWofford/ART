@@ -29,7 +29,6 @@ from ..utils.output_dirs import get_step_checkpoint_dir
 from ..vllm import get_llm, openai_server_task, run_on_workers
 from .jobs import (
     DEFAULT_JOBS_DIR,
-    DEFAULT_TRAINING_LOG_PATH,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
     MegatronTrainingJob,
 )
@@ -277,6 +276,8 @@ class MegatronService:
                 "moe_routing_replay_bundle is only supported for in-process/runtime APIs; "
                 "MegatronService subprocess jobs must use moe_routing_replay_path."
             )
+        log_dir = "/tmp/megatron_training_logs"
+        os.makedirs(log_dir, exist_ok=True)
         job = MegatronTrainingJob(
             lora_path=lora_path,
             optimizer_state_path=self._optimizer_state_path,
@@ -285,6 +286,9 @@ class MegatronService:
             experimental_config=_config,
             moe_routing_replay_path=_config.get("moe_routing_replay_path"),
             moe_routing_replay_strict=_config.get("moe_routing_replay_strict", True),
+            log_path=os.path.join(
+                log_dir, f"{datetime.datetime.now().isoformat()}.jsonl"
+            ),
         )
         job_path = os.path.join(
             DEFAULT_JOBS_DIR,
@@ -297,14 +301,14 @@ class MegatronService:
         while True:
             await asyncio.sleep(0.1)
             try:
-                with open(DEFAULT_TRAINING_LOG_PATH, "a+") as log_file:
+                with open(job.log_path, "a+") as log_file:
                     log_file.seek(0)
                     lines = log_file.readlines()[num_lines:]
                     for line in lines:
                         if line := line.strip():
                             if line == "all done":
                                 merge_lora_adapter(lora_path)
-                                os.remove(DEFAULT_TRAINING_LOG_PATH)
+                                os.remove(job.log_path)
                                 break
                             num_lines += 1
                             yield json.loads(line)

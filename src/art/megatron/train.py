@@ -26,7 +26,6 @@ from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.jobs import (
     DEFAULT_JOBS_DIR,
-    DEFAULT_TRAINING_LOG_PATH,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
     MegatronTrainingJob,
 )
@@ -565,7 +564,7 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
     offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
 
     while True:
-        from .shared import run_megatron_rl_job
+        from .shared import finalize_megatron_job, run_megatron_rl_job
 
         torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
         os.makedirs(DEFAULT_JOBS_DIR, exist_ok=True)
@@ -590,8 +589,18 @@ def _run_service_loop(runtime: TrainingRuntime) -> None:
 
         print0(runtime.rank, "Loaded job from", job_path)
         print0(runtime.rank, "Job:", job)
-        run_megatron_rl_job(runtime, job, job_path=job_path)
-        offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
+        try:
+            run_megatron_rl_job(runtime, job)
+        finally:
+            offload_to_cpu(
+                runtime.model, runtime.optimizer, runtime.rank, offload_state
+            )
+        finalize_megatron_job(
+            runtime,
+            job_path=job_path,
+            log_path=job.log_path,
+            cleanup_path=job.disk_packed_tensors["dir"],
+        )
 
 
 def main() -> None:
