@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import time
-from typing import Any
+from typing import Any, Callable
 
 from megatron.core import parallel_state as ps
 import torch
@@ -15,7 +15,7 @@ from ..loss import shift_tensor
 from ..preprocessing.pack import PackedTensors, packed_tensors_from_dir
 from .finalize_grads import finalize_model_grads_extended
 from .flex_attention import create_shared_prefix_attention_state
-from .jobs import MegatronSFTTrainingJob, MegatronTrainingJob
+from .jobs import DEFAULT_JOBS_DIR, MegatronSFTTrainingJob, MegatronTrainingJob
 from .offload import clear_optimizer_state
 from .train import (
     DEFAULT_MODEL_IDENTIFIER,
@@ -40,12 +40,57 @@ load_file = safetensors_torch.load_file
 save_file = safetensors_torch.save_file
 
 MegatronTrainContext = TrainingRuntime
+MegatronJob = MegatronTrainingJob | MegatronSFTTrainingJob
 
 
 def create_megatron_train_context(
     model_identifier: str = DEFAULT_MODEL_IDENTIFIER,
 ) -> MegatronTrainContext:
     return build_training_runtime(model_identifier=model_identifier)
+
+
+def run_megatron_worker_loop(
+    ctx: MegatronTrainContext,
+    *,
+    supports_sft: bool,
+    wait_until_ready: Callable[[], None] | None = None,
+    before_job: Callable[[], None] | None = None,
+    after_job: Callable[[], None] | None = None,
+) -> None:
+    while True:
+        torch.distributed.barrier()  # type: ignore[possibly-missing-attribute]
+        os.makedirs(DEFAULT_JOBS_DIR, exist_ok=True)
+        job_names = sorted(
+            job_name
+            for job_name in os.listdir(DEFAULT_JOBS_DIR)
+            if job_name.endswith(".json")
+        )
+        if not job_names:
+            time.sleep(1)
+            continue
+
+        if wait_until_ready is not None:
+            wait_until_ready()
+        if before_job is not None:
+            before_job()
+
+        job_path = os.path.join(DEFAULT_JOBS_DIR, job_names[0])
+        job = _load_megatron_job(job_path, supports_sft=supports_sft)
+        print0(ctx.rank, "Loaded job from", job_path)
+        print0(ctx.rank, "Job:", job)
+
+        try:
+            _run_megatron_job(ctx, job)
+        finally:
+            if after_job is not None:
+                after_job()
+
+        finalize_megatron_job(
+            ctx,
+            job_path=job_path,
+            log_path=job.log_path,
+            cleanup_path=_job_cleanup_path(job),
+        )
 
 
 def run_megatron_rl_job(
@@ -252,6 +297,29 @@ def run_megatron_sft_job(
             del adapter_model
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def _load_megatron_job(job_path: str, *, supports_sft: bool) -> MegatronJob:
+    with open(job_path, "rb") as handle:
+        job_data = json.loads(handle.read())
+    if job_data.get("job_type") == "sft":
+        if not supports_sft:
+            raise NotImplementedError("SFT jobs are not supported in this worker loop")
+        return MegatronSFTTrainingJob.model_validate(job_data)
+    return MegatronTrainingJob.model_validate(job_data)
+
+
+def _run_megatron_job(ctx: MegatronTrainContext, job: MegatronJob) -> None:
+    if isinstance(job, MegatronSFTTrainingJob):
+        run_megatron_sft_job(ctx, job)
+        return
+    run_megatron_rl_job(ctx, job)
+
+
+def _job_cleanup_path(job: MegatronJob) -> str:
+    if isinstance(job, MegatronSFTTrainingJob):
+        return job.sft_data_dir
+    return job.disk_packed_tensors["dir"]
 
 
 def merge_lora_adapter(lora_path: str) -> None:

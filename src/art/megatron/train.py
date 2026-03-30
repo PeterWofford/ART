@@ -25,9 +25,7 @@ from art.loss import loss_fn, shift_tensor
 from art.megatron.finalize_grads import finalize_model_grads_extended
 from art.megatron.flex_attention import create_shared_prefix_attention_state
 from art.megatron.jobs import (
-    DEFAULT_JOBS_DIR,
     DEFAULT_VLLM_WAKE_LOCK_PATH,
-    MegatronTrainingJob,
 )
 from art.megatron.lora import apply_lora_adapters
 from art.megatron.offload import (
@@ -562,45 +560,23 @@ def run_training_step(
 def _run_service_loop(runtime: TrainingRuntime) -> None:
     offload_state = OffloadState()
     offload_to_cpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
+    from .shared import run_megatron_worker_loop
 
-    while True:
-        from .shared import finalize_megatron_job, run_megatron_rl_job
-
-        torch.distributed.barrier()  # ty: ignore[possibly-missing-attribute]
-        os.makedirs(DEFAULT_JOBS_DIR, exist_ok=True)
-        job_names = sorted(
-            job_name
-            for job_name in os.listdir(DEFAULT_JOBS_DIR)
-            if job_name.endswith(".json")
-        )
-        if not job_names:
-            time.sleep(1)
-            continue
-
+    def wait_until_ready() -> None:
         while os.path.exists(DEFAULT_VLLM_WAKE_LOCK_PATH):
             time.sleep(0.2)
 
-        reload_to_gpu(runtime.model, runtime.optimizer, runtime.rank, offload_state)
-
-        job_name = job_names[0]
-        job_path = os.path.join(DEFAULT_JOBS_DIR, job_name)
-        with open(job_path, "rb") as handle:
-            job = MegatronTrainingJob.model_validate_json(handle.read())
-
-        print0(runtime.rank, "Loaded job from", job_path)
-        print0(runtime.rank, "Job:", job)
-        try:
-            run_megatron_rl_job(runtime, job)
-        finally:
-            offload_to_cpu(
-                runtime.model, runtime.optimizer, runtime.rank, offload_state
-            )
-        finalize_megatron_job(
-            runtime,
-            job_path=job_path,
-            log_path=job.log_path,
-            cleanup_path=job.disk_packed_tensors["dir"],
-        )
+    run_megatron_worker_loop(
+        runtime,
+        supports_sft=False,
+        wait_until_ready=wait_until_ready,
+        before_job=lambda: reload_to_gpu(
+            runtime.model, runtime.optimizer, runtime.rank, offload_state
+        ),
+        after_job=lambda: offload_to_cpu(
+            runtime.model, runtime.optimizer, runtime.rank, offload_state
+        ),
+    )
 
 
 def main() -> None:
