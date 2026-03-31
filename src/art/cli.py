@@ -227,6 +227,121 @@ def migrate(
 
 
 @app.command()
+def validate(
+    path: Path = typer.Argument(..., help="JSONL/JSON file or directory to validate"),
+    checks: str = typer.Option(
+        None, "--checks", "-c", help="Comma-separated check IDs or prefixes to include"
+    ),
+    exclude: str = typer.Option(
+        None, "--exclude", "-x", help="Comma-separated check IDs or prefixes to exclude"
+    ),
+    output: Path = typer.Option(
+        None, "--output", "-o", help="Write JSON report to file"
+    ),
+    format: str = typer.Option(
+        "text", "--format", "-f", help="Output format: text, json, or both"
+    ),
+    severity: str = typer.Option(
+        None, "--severity", "-s", help="Minimum severity: error, warning, or info"
+    ),
+) -> None:
+    """Validate training data before fine-tuning or RL.
+
+    Checks conversational datasets for schema issues, missing tool calls,
+    PII inconsistencies, and other problems that degrade training quality.
+
+    Examples:
+        art validate data.jsonl
+        art validate ./dataset/ --checks schema,tool --severity error
+        art validate data.json --format json -o report.json
+    """
+    from rich.console import Console
+
+    from .data.checks import get_all_checks, run_checks
+    from .data.loader import load_path
+    from .data.models import Severity as Sev
+    from .data.report import build_json_report, compute_readiness, print_human_report
+
+    console = Console()
+
+    if not path.exists():
+        typer.echo(f"Error: {path} does not exist", err=True)
+        raise typer.Exit(2)
+
+    console.print(f"Loading {path}...")
+    conversations, load_issues = load_path(path)
+    total_messages = sum(len(c.messages) for _, c in conversations)
+    console.print(
+        f"Loaded {len(conversations):,} conversations ({total_messages:,} messages)"
+    )
+
+    if not conversations and not load_issues:
+        typer.echo("No data found.", err=True)
+        raise typer.Exit(2)
+
+    include_set = set(checks.split(",")) if checks else None
+    exclude_set = set(exclude.split(",")) if exclude else None
+    all_issues = load_issues + run_checks(
+        conversations, include=include_set, exclude=exclude_set
+    )
+
+    if severity:
+        min_sev = {"error": 0, "warning": 1, "info": 2}.get(severity.lower(), 2)
+        sev_order = {Sev.ERROR: 0, Sev.WARNING: 1, Sev.INFO: 2}
+        all_issues = [i for i in all_issues if sev_order.get(i.severity, 9) <= min_sev]
+
+    tools_defined = len(
+        {t.function.name for _, c in conversations if c.tools for t in c.tools}
+    )
+    tools_called = len(
+        {
+            tc.function.name
+            for _, c in conversations
+            for m in c.messages
+            if m.tool_calls
+            for tc in m.tool_calls
+        }
+    )
+    readiness = compute_readiness(
+        len(conversations), all_issues, tools_defined, tools_called
+    )
+    checks_run = sorted(get_all_checks().keys())
+
+    if format in ("text", "both"):
+        print_human_report(
+            console,
+            str(path),
+            len(conversations),
+            total_messages,
+            all_issues,
+            readiness,
+        )
+
+    if format in ("json", "both") or output:
+        report = build_json_report(
+            str(path),
+            len(conversations),
+            total_messages,
+            all_issues,
+            checks_run,
+            readiness,
+        )
+        if output:
+            import json as json_mod
+
+            with open(output, "w") as f:
+                json_mod.dump(report, f, indent=2)
+            console.print(f"\nJSON report written to {output}")
+        if format == "json":
+            import json as json_mod
+
+            console.print(json_mod.dumps(report, indent=2))
+
+    has_errors = any(i.severity == Sev.ERROR for i in all_issues)
+    raise typer.Exit(1 if has_errors else 0)
+
+
+@app.command()
 def run(host: str = "0.0.0.0", port: int = 7999) -> None:
     """Run the ART CLI."""
 
