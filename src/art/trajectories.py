@@ -1,7 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
-import json
 import time
 import traceback
 from typing import (
@@ -95,31 +94,6 @@ class Trajectory(pydantic.BaseModel):
         return loggable_dict
 
 
-def _normalize_tool_call_arguments(message: dict[str, Any]) -> dict[str, Any]:
-    """Ensure tool_call arguments are dicts, not JSON strings.
-
-    Some chat templates (e.g. Qwen3.5) use Jinja2 |items on arguments,
-    which requires a mapping. OpenAI model_dump and training data often
-    store arguments as JSON strings.
-    """
-    tool_calls = message.get("tool_calls")
-    if not tool_calls:
-        return message
-    new_tool_calls = []
-    for tc in tool_calls:
-        fn = tc.get("function", {})
-        args = fn.get("arguments", {})
-        if isinstance(args, str):
-            try:
-                args = json.loads(args)
-            except (json.JSONDecodeError, ValueError):
-                args = {}
-            new_tool_calls.append({**tc, "function": {**fn, "arguments": args}})
-        else:
-            new_tool_calls.append(tc)
-    return {**message, "tool_calls": new_tool_calls}
-
-
 def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
     messages: Messages = []
     for message_or_choice in messages_and_choices:
@@ -128,22 +102,20 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
             tool_calls = message_or_choice.message.tool_calls or []
             assistant_message: Message = cast(
                 Message,
-                _normalize_tool_call_arguments(
-                    {
-                        "role": "assistant",
-                        "content": content,
-                        **(
-                            {
-                                "tool_calls": [
-                                    tool_call.model_dump(mode="json")
-                                    for tool_call in tool_calls
-                                ]
-                            }
-                            if tool_calls
-                            else {}
-                        ),
-                    }
-                ),
+                {
+                    "role": "assistant",
+                    "content": content,
+                    **(
+                        {
+                            "tool_calls": [
+                                tool_call.model_dump(mode="json")
+                                for tool_call in tool_calls
+                            ]
+                        }
+                        if tool_calls
+                        else {}
+                    ),
+                },
             )
             messages.append(assistant_message)
         else:
@@ -151,7 +123,7 @@ def get_messages(messages_and_choices: MessagesAndChoices) -> Messages:
             msg = dict(message_or_choice)
             if msg.get("content") is None:
                 msg["content"] = ""
-            messages.append(_normalize_tool_call_arguments(msg))  # type: ignore[arg-type]
+            messages.append(msg)  # type: ignore[arg-type]
     return messages
 
 
