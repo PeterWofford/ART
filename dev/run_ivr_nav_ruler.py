@@ -61,6 +61,20 @@ run_script = textwrap.dedent(
     source $HOME/.local/bin/env
     cd ~/sky_workdir
     ~/.local/bin/uv sync --extra backend
+    # Patch unsloth grouped_mm for mixed-dtype LoRA training (bf16 weights + fp32 activations).
+    # torch._grouped_mm doesn't support mixed dtypes; cast activations down to weight dtype.
+    # See: lab-log-2026-04-01.md Bug 3 in PeterWofford/method
+    python3 -c "
+import pathlib
+for p in pathlib.Path('.venv').rglob('moe_utils.py'):
+    t = p.read_text()
+    old = 'return torch._grouped_mm(inputs, weight, offs=offsets)'
+    new = 'inputs = inputs.to(weight.dtype); return torch._grouped_mm(inputs, weight, offs=offsets)'
+    if old in t:
+        p.write_text(t.replace(old, new))
+        print(f'Patched {{p}}')
+"
+    rm -rf unsloth_compiled_cache/
     PROJECT={args.project} \\
     MODEL_NAME={args.model_name} \\
     BASE_MODEL={args.base_model} \\
@@ -72,7 +86,6 @@ run_script = textwrap.dedent(
     LOAD_IN_4BIT=false \\
     LOAD_IN_16BIT=true \\
     ENABLE_THINKING=false \\
-    UNSLOTH_MOE_BACKEND=native_torch \\
     ROLLOUT_WEIGHTS_MODE=merged \\
     TRAINER_GPU_IDS={trainer_gpu_ids} \\
     INFERENCE_GPU_IDS={inference_gpu_ids} \\
