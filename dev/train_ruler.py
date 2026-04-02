@@ -101,10 +101,10 @@ BASE_MODEL = os.environ.get("BASE_MODEL", "Qwen/Qwen3.5-35B-A3B")
 MODEL_NAME = os.environ.get("MODEL_NAME", "ivr-nav-ruler-qwen3.5-049")
 PROJECT_NAME = os.environ.get("PROJECT", "genesisfi")
 
-GRPO_GROUP_SIZE = int(os.environ.get("GRPO_GROUP_SIZE", "8"))
+GRPO_GROUP_SIZE = int(os.environ.get("GRPO_GROUP_SIZE", "16"))
 BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "60"))
-LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "5e-7"))
-KL_COEFF = 1
+LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "1e-6"))
+KL_COEFF = float(os.environ.get("KL_COEFF", "0"))
 NUM_EPOCHS = int(os.environ.get("NUM_EPOCHS", "3"))
 SHUFFLE_SEED = 42
 
@@ -113,12 +113,13 @@ N_TEST_ROWS = int(os.environ.get("N_TEST_ROWS", "300"))
 N_HOLDOUT_ROWS = int(os.environ.get("N_HOLDOUT_ROWS", "300"))
 
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "128"))
+ROLLOUT_TEMPERATURE = float(os.environ.get("ROLLOUT_TEMPERATURE", "1.0"))
 GPT41_MODEL = "gpt-4.1"            # baseline for holdout win-rate
 RULER_JUDGE_MODEL = "openai/gpt-5.4"
 RULER_EVAL_CONCURRENCY = 50        # max simultaneous RULER calls during eval
 
 # Drop training groups where all RULER scores are nearly equal (no learning signal)
-MIN_REWARD_STD = float(os.environ.get("MIN_REWARD_STD", "0.3"))
+MIN_REWARD_STD = float(os.environ.get("MIN_REWARD_STD", "0.1"))
 
 EVAL_LOG_DIR = Path(f"eval_logs/{MODEL_NAME}")
 
@@ -309,6 +310,7 @@ async def generate_response(
                 model=model_name,
                 messages=messages,
                 tools=tools or None,
+                temperature=ROLLOUT_TEMPERATURE,
                 max_tokens=MAX_TOKENS,
                 n=n,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
@@ -592,6 +594,7 @@ async def train(model: art.TrainableModel) -> None:
         "eval_every": EVAL_EVERY,
         "n_holdout_rows": N_HOLDOUT_ROWS,
         "n_test_rows": N_TEST_ROWS,
+        "rollout_temperature": ROLLOUT_TEMPERATURE,
         "ruler_judge_model": RULER_JUDGE_MODEL,
         "min_reward_std": MIN_REWARD_STD,
         "gpt41_model": GPT41_MODEL,
