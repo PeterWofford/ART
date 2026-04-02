@@ -3,6 +3,7 @@
 import argparse
 import os
 import textwrap
+from pathlib import Path
 
 from dotenv import load_dotenv
 import sky
@@ -12,6 +13,14 @@ load_dotenv()
 
 DEFAULT_IMAGE_ID = "docker:nvidia/cuda:12.8.1-devel-ubuntu22.04"
 METHOD_DIR = os.path.join(os.path.dirname(__file__), "../../method")
+DEFAULT_TRAIN_FILE = os.path.join(
+    METHOD_DIR,
+    "Method - March 31, 2026 10_17_31 PM - ad874ed4-2852-42b2-b856-a4840dc473f3.jsonl",
+)
+DEFAULT_AUX_FILE = os.path.join(
+    METHOD_DIR,
+    "nav_1_3_24_gpt4o_relabeled - March 31, 2026 9_16_01 PM - c0fba847-9df3-4b8a-8190-5001cde7cc2e.jsonl",
+)
 
 parser = argparse.ArgumentParser(
     description="Launch IVR nav GRPO+RULER fine-tuning on Qwen3.5-35B-A3B."
@@ -38,6 +47,8 @@ parser.add_argument("--n-holdout-rows", type=int, default=100)
 parser.add_argument("--n-test-rows", type=int, default=100)
 parser.add_argument("--max-tokens", type=int, default=128)
 parser.add_argument("--min-reward-std", type=float, default=0.1)
+parser.add_argument("--train-file", type=str, default=DEFAULT_TRAIN_FILE)
+parser.add_argument("--aux-file", type=str, default=DEFAULT_AUX_FILE)
 parser.add_argument(
     "--save-checkpoint",
     action=argparse.BooleanOptionalAction,
@@ -51,6 +62,9 @@ cluster_name = args.cluster_name
 cluster_prefix = os.environ.get("CLUSTER_PREFIX")
 if cluster_prefix:
     cluster_name = f"{cluster_prefix}-{cluster_name}"
+
+train_file = str(Path(args.train_file).expanduser().resolve())
+aux_file = str(Path(args.aux_file).expanduser().resolve())
 
 setup_script = textwrap.dedent("""\
     echo 'Setting up environment...'
@@ -138,16 +152,8 @@ task.set_resources(
 )
 task.set_file_mounts({
     "~/sky_workdir/.env": "/Users/pwofford/src/method/.env",
-    "/tmp/method-data/method.jsonl": (
-        "/Users/pwofford/src/method/"
-        "Method - March 31, 2026 10_17_31 PM"
-        " - ad874ed4-2852-42b2-b856-a4840dc473f3.jsonl"
-    ),
-    "/tmp/method-data/nav.jsonl": (
-        "/Users/pwofford/src/method/"
-        "nav_1_3_24_gpt4o_relabeled - March 31, 2026 9_16_01 PM"
-        " - c0fba847-9df3-4b8a-8190-5001cde7cc2e.jsonl"
-    ),
+    "/tmp/method-data/method.jsonl": train_file,
+    "/tmp/method-data/nav.jsonl": aux_file,
 })
 
 print(f"Launching on cluster: {cluster_name}")
@@ -164,6 +170,8 @@ print(f"  max_steps:               {args.max_steps}")
 print(f"  learning_rate:           {args.learning_rate}")
 print(f"  eval_every:              {args.eval_every}")
 print(f"  save_checkpoint:         {args.save_checkpoint}")
+print(f"  train_file:              {train_file}")
+print(f"  aux_file:                {aux_file}")
 print(f"  trainer_gpu_ids:         {args.trainer_gpu_ids}")
 print(f"  inference_gpu_ids:       {args.inference_gpu_ids}")
 
