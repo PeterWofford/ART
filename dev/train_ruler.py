@@ -106,6 +106,10 @@ BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "60"))
 LEARNING_RATE = float(os.environ.get("LEARNING_RATE", "1e-6"))
 KL_COEFF = float(os.environ.get("KL_COEFF", "0"))
 NUM_EPOCHS = int(os.environ.get("NUM_EPOCHS", "3"))
+_TRAIN_LIMIT = os.environ.get("TRAIN_LIMIT")
+TRAIN_LIMIT = int(_TRAIN_LIMIT) if _TRAIN_LIMIT else None
+_MAX_STEPS = os.environ.get("MAX_STEPS")
+MAX_STEPS = int(_MAX_STEPS) if _MAX_STEPS else None
 SHUFFLE_SEED = 42
 
 EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "20"))
@@ -114,6 +118,9 @@ N_HOLDOUT_ROWS = int(os.environ.get("N_HOLDOUT_ROWS", "300"))
 
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "128"))
 ROLLOUT_TEMPERATURE = float(os.environ.get("ROLLOUT_TEMPERATURE", "1.0"))
+SAVE_CHECKPOINT = os.environ.get("SAVE_CHECKPOINT", "true").strip().lower() in {
+    "1", "true", "yes", "on",
+}
 GPT41_MODEL = "gpt-4.1"            # baseline for holdout win-rate
 RULER_JUDGE_MODEL = "openai/gpt-5.4"
 RULER_EVAL_CONCURRENCY = 50        # max simultaneous RULER calls during eval
@@ -590,11 +597,14 @@ async def train(model: art.TrainableModel) -> None:
         "learning_rate": LEARNING_RATE,
         "kl_coeff": KL_COEFF,
         "num_epochs": NUM_EPOCHS,
+        "train_limit": TRAIN_LIMIT,
+        "max_steps": MAX_STEPS,
         "shuffle_seed": SHUFFLE_SEED,
         "eval_every": EVAL_EVERY,
         "n_holdout_rows": N_HOLDOUT_ROWS,
         "n_test_rows": N_TEST_ROWS,
         "rollout_temperature": ROLLOUT_TEMPERATURE,
+        "save_checkpoint": SAVE_CHECKPOINT,
         "ruler_judge_model": RULER_JUDGE_MODEL,
         "min_reward_std": MIN_REWARD_STD,
         "gpt41_model": GPT41_MODEL,
@@ -612,6 +622,8 @@ async def train(model: art.TrainableModel) -> None:
 
     holdout_rows = all_train[:N_HOLDOUT_ROWS]
     train_rows = all_train[N_HOLDOUT_ROWS:]
+    if TRAIN_LIMIT is not None:
+        train_rows = train_rows[:TRAIN_LIMIT]
     print(f"  {len(train_rows)} train / {len(holdout_rows)} holdout")
 
     # -- Load and sample test data ----------------------------------------------
@@ -626,6 +638,7 @@ async def train(model: art.TrainableModel) -> None:
 
     last_eval_step = -EVAL_EVERY
     step = await model.get_step()
+    stop_training = False
 
     for epoch in range(NUM_EPOCHS):
         print(f"\n{'='*60}")
@@ -639,6 +652,10 @@ async def train(model: art.TrainableModel) -> None:
         for batch_start in range(0, len(epoch_rows), BATCH_SIZE):
             batch = epoch_rows[batch_start : batch_start + BATCH_SIZE]
             step = await model.get_step()
+            if MAX_STEPS is not None and step >= MAX_STEPS:
+                print(f"Reached MAX_STEPS={MAX_STEPS}; stopping training loop.")
+                stop_training = True
+                break
 
             print(
                 f"\n--- Step {step} | "
@@ -737,7 +754,7 @@ async def train(model: art.TrainableModel) -> None:
                 learning_rate=LEARNING_RATE,
                 # kl_penalty_coef=KL_COEFF,
                 # kl_penalty_reference_step=0,
-                save_checkpoint=True,
+                save_checkpoint=SAVE_CHECKPOINT,
             )
             await model.log(
                 scored_groups,
@@ -752,6 +769,8 @@ async def train(model: art.TrainableModel) -> None:
                 if isinstance(v, float)
             )
             print(f"  Step {result.step} metrics: {metrics_str}")
+        if stop_training:
+            break
 
     # Final eval
     step = await model.get_step()

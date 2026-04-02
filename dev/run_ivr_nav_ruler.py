@@ -30,12 +30,19 @@ parser.add_argument("--max-num-seqs", type=int, default=8)
 parser.add_argument("--grpo-group-size", type=int, default=16)
 parser.add_argument("--batch-size", type=int, default=60)
 parser.add_argument("--num-epochs", type=int, default=3)
+parser.add_argument("--train-limit", type=int, default=None)
+parser.add_argument("--max-steps", type=int, default=None)
 parser.add_argument("--learning-rate", type=float, default=1e-6)
 parser.add_argument("--eval-every", type=int, default=20)
 parser.add_argument("--n-holdout-rows", type=int, default=100)
 parser.add_argument("--n-test-rows", type=int, default=100)
 parser.add_argument("--max-tokens", type=int, default=128)
 parser.add_argument("--min-reward-std", type=float, default=0.1)
+parser.add_argument(
+    "--save-checkpoint",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+)
 parser.add_argument("--trainer-gpu-ids", type=int, nargs="+", default=[0, 1, 2])
 parser.add_argument("--inference-gpu-ids", type=int, nargs="+", default=[3])
 args = parser.parse_args()
@@ -55,6 +62,16 @@ setup_script = textwrap.dedent("""\
 
 trainer_gpu_ids = ",".join(str(i) for i in args.trainer_gpu_ids)
 inference_gpu_ids = ",".join(str(i) for i in args.inference_gpu_ids)
+train_limit_env = (
+    f"    TRAIN_LIMIT={args.train_limit} \\\n"
+    if args.train_limit is not None
+    else ""
+)
+max_steps_env = (
+    f"    MAX_STEPS={args.max_steps} \\\n"
+    if args.max_steps is not None
+    else ""
+)
 
 run_script = textwrap.dedent(
     f"""\
@@ -92,6 +109,7 @@ for p in pathlib.Path('.venv').rglob('moe_utils.py'):
     GRPO_GROUP_SIZE={args.grpo_group_size} \\
     BATCH_SIZE={args.batch_size} \\
     NUM_EPOCHS={args.num_epochs} \\
+{train_limit_env}{max_steps_env}    SAVE_CHECKPOINT={'true' if args.save_checkpoint else 'false'} \\
     LEARNING_RATE={args.learning_rate} \\
     EVAL_EVERY={args.eval_every} \\
     N_HOLDOUT_ROWS={args.n_holdout_rows} \\
@@ -141,8 +159,11 @@ print(f"  max_model_len:           {args.max_model_len}")
 print(f"  grpo_group_size:         {args.grpo_group_size}")
 print(f"  batch_size:              {args.batch_size}")
 print(f"  num_epochs:              {args.num_epochs}")
+print(f"  train_limit:             {args.train_limit}")
+print(f"  max_steps:               {args.max_steps}")
 print(f"  learning_rate:           {args.learning_rate}")
 print(f"  eval_every:              {args.eval_every}")
+print(f"  save_checkpoint:         {args.save_checkpoint}")
 print(f"  trainer_gpu_ids:         {args.trainer_gpu_ids}")
 print(f"  inference_gpu_ids:       {args.inference_gpu_ids}")
 
