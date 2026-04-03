@@ -17,13 +17,16 @@ load_dotenv()
 
 DEFAULT_IMAGE_ID = "docker:nvidia/cuda:12.8.1-devel-ubuntu22.04"
 METHOD_DIR = os.path.join(os.path.dirname(__file__), "../../method")
-DEFAULT_TRAIN_FILE = os.path.join(
-    METHOD_DIR,
-    "Method - April 2, 2026 10_01_01 PM - ad874ed4-2852-42b2-b856-a4840dc473f3.jsonl",
+DEFAULT_TRAIN_FILE = os.environ.get(
+    "DEFAULT_TRAIN_FILE",
+    os.path.join(METHOD_DIR, "data", "method_nav_prod_overnight_sample_50k.jsonl"),
 )
-DEFAULT_AUX_FILE = os.path.join(
-    METHOD_DIR,
-    "nav_1_3_24_gpt4o_relabeled - March 31, 2026 9_16_01 PM - c0fba847-9df3-4b8a-8190-5001cde7cc2e.jsonl",
+DEFAULT_AUX_FILE = os.environ.get(
+    "DEFAULT_AUX_FILE",
+    os.path.join(
+        METHOD_DIR,
+        "nav_1_3_24_gpt4o_relabeled - March 31, 2026 9_16_01 PM - c0fba847-9df3-4b8a-8190-5001cde7cc2e.jsonl",
+    ),
 )
 VALIDATION_SCRIPT = os.path.join(METHOD_DIR, "scripts", "validate_training_data.py")
 
@@ -51,11 +54,14 @@ parser.add_argument("--eval-every", type=int, default=20)
 parser.add_argument("--n-holdout-rows", type=int, default=100)
 parser.add_argument("--n-test-rows", type=int, default=100)
 parser.add_argument("--max-tokens", type=int, default=128)
+parser.add_argument("--rollout-temperature", type=float, default=1.0)
+parser.add_argument("--eval-temperature", type=float, default=0.0)
 parser.add_argument("--min-reward-std", type=float, default=0.1)
 parser.add_argument("--train-file", type=str, default=DEFAULT_TRAIN_FILE)
 parser.add_argument("--aux-file", type=str, default=DEFAULT_AUX_FILE)
 parser.add_argument("--skip-validation", action="store_true")
 parser.add_argument("--dry-run", action="store_true")
+parser.add_argument("--pipeline-pilot", action="store_true")
 parser.add_argument(
     "--tail-logs",
     action=argparse.BooleanOptionalAction,
@@ -117,6 +123,8 @@ runtime_env: dict[str, str] = {
     "N_HOLDOUT_ROWS": str(args.n_holdout_rows),
     "N_TEST_ROWS": str(args.n_test_rows),
     "MAX_TOKENS": str(args.max_tokens),
+    "ROLLOUT_TEMPERATURE": str(args.rollout_temperature),
+    "EVAL_TEMPERATURE": str(args.eval_temperature),
     "MIN_REWARD_STD": str(args.min_reward_std),
     "TRAIN_FILE": "/tmp/method-data/method.jsonl",
     "AUX_FILE": "/tmp/method-data/nav.jsonl",
@@ -136,6 +144,7 @@ def render_env_block(env: dict[str, str]) -> str:
 
 
 runtime_env_block = render_env_block(runtime_env)
+train_entrypoint = "dev/train_ruler_pipeline.py" if args.pipeline_pilot else "dev/train_ruler.py"
 
 run_script = textwrap.dedent(
     f"""\
@@ -157,7 +166,7 @@ for p in pathlib.Path('.venv').rglob('moe_utils.py'):
 "
     rm -rf unsloth_compiled_cache/
 {runtime_env_block}\
-    ~/.local/bin/uv run dev/train_ruler.py
+    ~/.local/bin/uv run {train_entrypoint}
 """
 )
 
@@ -200,14 +209,18 @@ effective_config = {
     "n_holdout_rows": args.n_holdout_rows,
     "n_test_rows": args.n_test_rows,
     "max_tokens": args.max_tokens,
+    "rollout_temperature": args.rollout_temperature,
+    "eval_temperature": args.eval_temperature,
     "min_reward_std": args.min_reward_std,
     "save_checkpoint": args.save_checkpoint,
+    "pipeline_pilot": args.pipeline_pilot,
     "skip_validation": args.skip_validation,
     "dry_run": args.dry_run,
     "tail_logs": args.tail_logs,
     "cancel_existing_jobs": args.cancel_existing_jobs,
     "train_file": train_file,
     "aux_file": aux_file,
+    "train_entrypoint": train_entrypoint,
     "trainer_gpu_ids": args.trainer_gpu_ids,
     "inference_gpu_ids": args.inference_gpu_ids,
     "runtime_env": runtime_env,

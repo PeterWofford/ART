@@ -86,15 +86,20 @@ litellm.model_cost["openai/gpt-5.4-mini"] = {
 TRAIN_PATH = Path(
     os.environ.get(
         "TRAIN_FILE",
-        "Method - April 2, 2026 10_01_01 PM"
-        " - ad874ed4-2852-42b2-b856-a4840dc473f3.jsonl",
+        os.environ.get(
+            "DEFAULT_TRAIN_FILE",
+            "data/method_nav_prod_overnight_sample_50k.jsonl",
+        ),
     )
 )
 TEST_PATH = Path(
     os.environ.get(
         "AUX_FILE",
-        "nav_1_3_24_gpt4o_relabeled - March 31, 2026 9_16_01 PM"
-        " - c0fba847-9df3-4b8a-8190-5001cde7cc2e.jsonl",
+        os.environ.get(
+            "DEFAULT_AUX_FILE",
+            "nav_1_3_24_gpt4o_relabeled - March 31, 2026 9_16_01 PM"
+            " - c0fba847-9df3-4b8a-8190-5001cde7cc2e.jsonl",
+        ),
     )
 )
 
