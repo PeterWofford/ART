@@ -42,6 +42,7 @@ import os
 import random
 import statistics
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Callable
 
@@ -85,7 +86,7 @@ litellm.model_cost["openai/gpt-5.4-mini"] = {
 TRAIN_PATH = Path(
     os.environ.get(
         "TRAIN_FILE",
-        "Method - March 31, 2026 10_17_31 PM"
+        "Method - April 2, 2026 10_01_01 PM"
         " - ad874ed4-2852-42b2-b856-a4840dc473f3.jsonl",
     )
 )
@@ -159,6 +160,44 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
             if line:
                 rows.append(json.loads(line))
     return rows
+
+
+def build_runtime_config() -> dict[str, Any]:
+    return {
+        "project": PROJECT_NAME,
+        "model_name": MODEL_NAME,
+        "base_model": BASE_MODEL,
+        "grpo_group_size": GRPO_GROUP_SIZE,
+        "batch_size": BATCH_SIZE,
+        "learning_rate": LEARNING_RATE,
+        "kl_coeff": KL_COEFF,
+        "num_epochs": NUM_EPOCHS,
+        "train_limit": TRAIN_LIMIT,
+        "max_steps": MAX_STEPS,
+        "shuffle_seed": SHUFFLE_SEED,
+        "eval_every": EVAL_EVERY,
+        "n_holdout_rows": N_HOLDOUT_ROWS,
+        "n_test_rows": N_TEST_ROWS,
+        "max_tokens": MAX_TOKENS,
+        "rollout_temperature": ROLLOUT_TEMPERATURE,
+        "save_checkpoint": SAVE_CHECKPOINT,
+        "ruler_judge_model": RULER_JUDGE_MODEL,
+        "min_reward_std": MIN_REWARD_STD,
+        "gpt41_model": GPT41_MODEL,
+        "train_path": str(TRAIN_PATH),
+        "test_path": str(TEST_PATH),
+        "max_seq_length": int(os.environ.get("MAX_SEQ_LENGTH", "8192")),
+        "load_in_4bit": _get_env_bool("LOAD_IN_4BIT", False),
+        "load_in_16bit": _get_env_bool("LOAD_IN_16BIT", True),
+        "gpu_memory_utilization": float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.8")),
+        "enforce_eager": _get_env_bool("ENFORCE_EAGER", True),
+        "max_model_len": int(os.environ.get("MAX_MODEL_LEN", "8192")),
+        "max_num_seqs": int(os.environ.get("MAX_NUM_SEQS", "8")),
+        "rollout_weights_mode": os.environ.get("ROLLOUT_WEIGHTS_MODE", "merged"),
+        "trainer_gpu_ids": _get_env_int_list("TRAINER_GPU_IDS", [0]),
+        "inference_gpu_ids": _get_env_int_list("INFERENCE_GPU_IDS", [1]),
+        "eval_split_policy": "split == 'TEST' when available",
+    }
 
 
 def split_context_and_golden(
@@ -528,6 +567,11 @@ async def run_eval(
 # -- Training loop -------------------------------------------------------------
 
 async def train(model: art.TrainableModel) -> None:
+    runtime_config = build_runtime_config()
+    print("\nRuntime config:")
+    print(json.dumps(runtime_config, indent=2, sort_keys=True))
+    model.update_wandb_config(runtime_config)
+
     backend = LocalBackend()
     gpt41_client = AsyncOpenAI(http_client=httpx.AsyncClient(timeout=90))
 
@@ -590,28 +634,6 @@ async def train(model: art.TrainableModel) -> None:
 
     print(f"Local vLLM serving model as: {get_inference_model_name()!r}")
 
-    model.update_wandb_config({
-        "base_model": BASE_MODEL,
-        "grpo_group_size": GRPO_GROUP_SIZE,
-        "batch_size": BATCH_SIZE,
-        "learning_rate": LEARNING_RATE,
-        "kl_coeff": KL_COEFF,
-        "num_epochs": NUM_EPOCHS,
-        "train_limit": TRAIN_LIMIT,
-        "max_steps": MAX_STEPS,
-        "shuffle_seed": SHUFFLE_SEED,
-        "eval_every": EVAL_EVERY,
-        "n_holdout_rows": N_HOLDOUT_ROWS,
-        "n_test_rows": N_TEST_ROWS,
-        "rollout_temperature": ROLLOUT_TEMPERATURE,
-        "save_checkpoint": SAVE_CHECKPOINT,
-        "ruler_judge_model": RULER_JUDGE_MODEL,
-        "min_reward_std": MIN_REWARD_STD,
-        "gpt41_model": GPT41_MODEL,
-        "train_path": str(TRAIN_PATH),
-        "test_path": str(TEST_PATH),
-    })
-
     # -- Load and split training data -------------------------------------------
     print(f"Loading training data from {TRAIN_PATH} ...")
     all_train = load_jsonl(TRAIN_PATH)
@@ -629,10 +651,30 @@ async def train(model: art.TrainableModel) -> None:
     # -- Load and sample test data ----------------------------------------------
     print(f"Loading test data from {TEST_PATH} ...")
     all_test = load_jsonl(TEST_PATH)
+    split_counts = Counter(str(row.get("split", "<missing>")) for row in all_test if "split" in row)
+    if split_counts:
+        print(f"  split distribution: {dict(split_counts)}")
+        candidate_test_rows = [row for row in all_test if row.get("split") == "TEST"]
+        if not candidate_test_rows:
+            raise ValueError(
+                f"Expected at least one split == 'TEST' row in {TEST_PATH}, "
+                f"found {dict(split_counts)}"
+            )
+        print(
+            f"  using split == 'TEST' rows only: "
+            f"{len(candidate_test_rows)} / {len(all_test)}"
+        )
+    else:
+        candidate_test_rows = all_test
+        print("  no split field found; using the full eval file")
     rng_test = random.Random(SHUFFLE_SEED + 1)
-    rng_test.shuffle(all_test)
-    test_rows = all_test[:N_TEST_ROWS]
-    print(f"  {len(test_rows)} test rows from {len(all_test)} total")
+    rng_test.shuffle(candidate_test_rows)
+    test_rows = candidate_test_rows[:N_TEST_ROWS]
+    print(
+        f"  {len(test_rows)} test rows sampled from "
+        f"{len(candidate_test_rows)} candidate rows "
+        f"({len(all_test)} total rows)"
+    )
 
     # -- Training loop ----------------------------------------------------------
 
