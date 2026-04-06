@@ -68,6 +68,24 @@ parser.add_argument(
     default=False,
 )
 parser.add_argument(
+    "--idle-minutes-to-autostop",
+    type=int,
+    default=None,
+    help=(
+        "Optional Sky autostop timeout in minutes. "
+        "Leave unset by default so clusters stay up and local checkpoints are preserved."
+    ),
+)
+parser.add_argument(
+    "--down",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "Whether Sky should tear the cluster down after autostop. "
+        "Disabled by default to avoid losing node-local checkpoints."
+    ),
+)
+parser.add_argument(
     "--cancel-existing-jobs",
     action=argparse.BooleanOptionalAction,
     default=False,
@@ -217,6 +235,8 @@ effective_config = {
     "skip_validation": args.skip_validation,
     "dry_run": args.dry_run,
     "tail_logs": args.tail_logs,
+    "idle_minutes_to_autostop": args.idle_minutes_to_autostop,
+    "down": args.down,
     "cancel_existing_jobs": args.cancel_existing_jobs,
     "train_file": train_file,
     "aux_file": aux_file,
@@ -252,6 +272,12 @@ if args.dry_run:
     print("\nDry run complete; not launching.")
     raise SystemExit(0)
 
+if args.down and args.idle_minutes_to_autostop is None:
+    raise SystemExit(
+        "--down requires --idle-minutes-to-autostop. "
+        "Refusing to auto-tear down a cluster without an explicit idle timeout."
+    )
+
 cluster_status = sky.stream_and_get(sky.status(cluster_names=[cluster_name]))
 if cluster_status:
     existing_status = cluster_status[0]["status"]
@@ -273,16 +299,16 @@ if cluster_status:
             "Choose a new --cluster-name or wait for the existing launch to settle first."
         )
 
-job_id, _ = sky.stream_and_get(
-    sky.launch(
-        task,
-        cluster_name=cluster_name,
-        retry_until_up=True,
-        idle_minutes_to_autostop=60,
-        down=True,
-        fast=args.fast,
-    )
-)
+launch_kwargs = {
+    "cluster_name": cluster_name,
+    "retry_until_up": True,
+    "down": args.down,
+    "fast": args.fast,
+}
+if args.idle_minutes_to_autostop is not None:
+    launch_kwargs["idle_minutes_to_autostop"] = args.idle_minutes_to_autostop
+
+job_id, _ = sky.stream_and_get(sky.launch(task, **launch_kwargs))
 
 print(f"Job submitted (ID: {job_id}).")
 if args.tail_logs:
@@ -290,4 +316,10 @@ if args.tail_logs:
     exit_code = sky.tail_logs(cluster_name=cluster_name, job_id=job_id, follow=True)
     print(f"Job {job_id} finished with exit code {exit_code}.")
 else:
-    print("Not streaming logs by default; local log/API interruptions will not affect the remote job.")
+    print(
+        "Not streaming logs by default; local log/API interruptions will not affect the remote job."
+    )
+    if args.idle_minutes_to_autostop is None:
+        print(
+            "Cluster auto-stop/auto-down is disabled by default so node-local checkpoints are preserved."
+        )
