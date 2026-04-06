@@ -754,14 +754,28 @@ async def train(model: art.TrainableModel) -> None:
             async def score_group(
                 group: art.TrajectoryGroup,
             ) -> art.TrajectoryGroup | None:
+                non_tool_trajs:list[art.Trajectory] = []
+                for t in group.trajectories:
+                    if not t.messages_and_choices[-1].message.tool_calls:
+                        non_tool_trajs.append(t)
+
+                for t in non_tool_trajs:
+                    group.trajectories.remove(t)
+
                 scored = await ruler_score_group(
                     group,
                     RULER_JUDGE_MODEL,
                     swallow_exceptions=True,
                     debug=False,
                 )
+
                 if scored is None:
                     return None
+                
+                for t in non_tool_trajs:
+                    t.reward = -0.1
+                    scored.trajectories.append(t)
+
                 if group_reward_std(scored) < MIN_REWARD_STD:
                     return None
                 return scored
