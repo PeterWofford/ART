@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict
 import torch
@@ -8,16 +8,17 @@ from art.utils.group_aggregate import group_aggregate
 from . import dev
 
 if TYPE_CHECKING:
-    from art.unsloth.service import TrainInputs
+    from art.preprocessing.inputs import TrainInputs
 
 
 class Loss(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    mean_policy_loss: torch.Tensor
-    mean_kl: torch.Tensor
-    mean_entropy: torch.Tensor | None
+    reduction: Literal["mean", "sum"]
+    policy_loss: torch.Tensor
+    entropy: torch.Tensor | None
     policy_loss_sum: torch.Tensor
     probs_corr: torch.Tensor
+    kl_policy_ref: torch.Tensor | None = None
 
 
 def loss_fn(
@@ -26,6 +27,7 @@ def loss_fn(
     ref_logprobs: torch.Tensor | None,
     entropies: torch.Tensor | None,
     experimental_config: dev.TrainConfig,
+    reduction: Literal["mean", "sum"] = "mean",
 ) -> Loss:
     old_logprobs = shift_tensor(inputs["logprobs"], float("nan"))
     advantages = shift_tensor(inputs["advantages"], 0.0)
@@ -92,6 +94,14 @@ def loss_fn(
         )
     if tau := experimental_config.get("kimi_k2_tau", None):
         advantages -= tau * logprob_diff.detach()
+    kl_policy_ref: torch.Tensor | None = None
+    kl_penalty_coef = experimental_config.get("kl_penalty_coef", 0.0)
+    if kl_penalty_coef > 0 and ref_logprobs is not None:
+        kl_per_token = (new_logprobs - ref_logprobs).detach() * assistant_mask
+        avg_kl = kl_per_token.sum() / (assistant_mask.sum() + 1e-6)
+        kl_penalty = kl_penalty_coef * (avg_kl - kl_per_token) * assistant_mask
+        advantages = advantages + kl_penalty
+        kl_policy_ref = avg_kl
     if ppo:
         policy_loss = -torch.min(
             prob_ratio * advantages,
@@ -115,30 +125,22 @@ def loss_fn(
             logprob_diff = old_logprobs - original_logprobs
             prob_ratio = torch.exp(logprob_diff)
         policy_loss *= torch.clamp(prob_ratio, max=upper_bound).detach()
-    if ref_logprobs is not None:
-        kl_div = (
-            torch.exp(ref_logprobs - new_logprobs) - (ref_logprobs - new_logprobs) - 1.0
-        )
-    else:
-        kl_div = torch.zeros_like(policy_loss)
     policy_loss = policy_loss * weights * assistant_mask
-    kl_div = kl_div * weights * assistant_mask
-    mean_policy_loss = policy_loss.sum() / (assistant_mask.sum() + 1e-6)
-    mean_kl = kl_div.sum() / (assistant_mask.sum() + 1e-6)
-    # Compute mean entropy for the current step
+    denominator = assistant_mask.sum() + 1e-6 if reduction == "mean" else 1.0
+    reduced_policy_loss = policy_loss.sum() / denominator
+    # Compute reduced entropy for the current step.
     if entropies is not None:
         shifted_entropies = shift_tensor(entropies, 0.0)
-        mean_entropy = (shifted_entropies * weights * assistant_mask).sum() / (
-            assistant_mask.sum() + 1e-6
-        )
+        entropy = (shifted_entropies * weights * assistant_mask).sum() / denominator
     else:
-        mean_entropy = None
+        entropy = None
     return Loss(
-        mean_policy_loss=mean_policy_loss,
-        mean_kl=mean_kl,
-        mean_entropy=mean_entropy,
+        reduction=reduction,
+        policy_loss=reduced_policy_loss,
+        entropy=entropy,
         policy_loss_sum=policy_loss.sum(),
         probs_corr=probs_corr,
+        kl_policy_ref=kl_policy_ref,
     )
 
 

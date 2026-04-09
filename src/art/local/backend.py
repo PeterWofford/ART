@@ -1,15 +1,26 @@
 import asyncio
 import json
+import logging
 import math
 import os
+import shutil
+import socket
 import subprocess
+import time
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
 import warnings
 
+logger = logging.getLogger(__name__)
+
+_AUTO_GPU_HOURLY_PRICING_USD = {
+    "H200": 3.0,
+}
+
 import aiohttp
 import numpy as np
 from openai import AsyncOpenAI
+import polars as pl
 import torch
 from tqdm import auto as tqdm
 from transformers import AutoImageProcessor, AutoTokenizer
@@ -23,6 +34,7 @@ from art.utils.output_dirs import (
     get_output_dir_from_model_properties,
     get_step_checkpoint_dir,
 )
+from art.utils.record_provenance import record_provenance
 from art.utils.s3 import (
     ExcludableOption,
     pull_model_from_s3,
@@ -31,7 +43,17 @@ from art.utils.s3 import (
 from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
+from .._backend_training import (
+    aggregate_rl_training_metrics,
+    build_rl_train_configs,
+)
 from ..backend import AnyTrainableModel, Backend
+from ..costs import build_cost_calculator, get_model_pricing
+from ..metrics_taxonomy import (
+    TRAIN_GRADIENT_STEPS_KEY,
+    build_training_summary_metrics,
+    summarize_trajectory_groups,
+)
 from ..model import Model, TrainableModel
 from ..preprocessing.pack import (
     PackedTensors,
@@ -39,9 +61,12 @@ from ..preprocessing.pack import (
     packed_tensors_to_dir,
     plot_packed_tensors,
 )
-from ..preprocessing.tokenize import tokenize_trajectory_groups
+from ..preprocessing.tokenize import (
+    tokenize_sft_batch,
+    tokenize_trajectory_groups,
+)
 from ..trajectories import Trajectory, TrajectoryGroup
-from ..types import LocalTrainResult, Message, TrainConfig
+from ..types import LocalTrainResult, Message, TrainConfig, TrainSFTConfig
 from ..utils import format_message, get_model_step
 from .checkpoints import (
     delete_checkpoints,
@@ -50,7 +75,13 @@ from .service import ModelService
 
 
 class LocalBackend(Backend):
-    def __init__(self, *, in_process: bool = False, path: str | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        in_process: bool = False,
+        path: str | None = None,
+        gpu_cost_per_hour_usd: float | None = None,
+    ) -> None:
         """
         Initializes a local, directory-based Backend interface at the given path.
 
@@ -61,9 +92,16 @@ class LocalBackend(Backend):
         Args:
             in_process: Whether to run the local service in-process.
             path: The path to the local directory. Defaults to "{repo_root}/.art".
+            gpu_cost_per_hour_usd: Optional per-GPU hourly price override used for
+                automatic `costs/gpu` accounting on train steps. When unset,
+                ART auto-detects supported GPU types (H200 at $3/hr today) and
+                skips GPU cost logging for unknown devices instead of guessing.
         """
         self._in_process = in_process
         self._path = path or get_default_art_path()
+        self._gpu_cost_per_hour_usd = (
+            float(gpu_cost_per_hour_usd) if gpu_cost_per_hour_usd is not None else None
+        )
         os.makedirs(self._path, exist_ok=True)
 
         # Other initialization
@@ -71,7 +109,61 @@ class LocalBackend(Backend):
         self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
 
+    def supports_automatic_train_step_metrics(self) -> bool:
+        return True
+
+    def automatic_gpu_cost_per_hour_usd(self, model: Model) -> float | None:
+        per_gpu_cost = self._resolve_gpu_cost_per_hour_usd()
+        if per_gpu_cost is None:
+            return None
+
+        gpu_count = self._allocated_gpu_count(model)
+        if gpu_count <= 0:
+            return None
+        return per_gpu_cost * gpu_count
+
+    def _resolve_gpu_cost_per_hour_usd(self) -> float | None:
+        if self._gpu_cost_per_hour_usd is not None:
+            return self._gpu_cost_per_hour_usd
+        if not torch.cuda.is_available():
+            return None
+
+        num_visible_gpus = torch.cuda.device_count()
+        if num_visible_gpus <= 0:
+            return None
+
+        resolved_costs: list[float] = []
+        for index in range(num_visible_gpus):
+            device_name = torch.cuda.get_device_name(index).upper()
+            for gpu_name, hourly_cost in _AUTO_GPU_HOURLY_PRICING_USD.items():
+                if gpu_name in device_name:
+                    resolved_costs.append(hourly_cost)
+                    break
+            else:
+                return None
+
+        if not resolved_costs:
+            return None
+        if len(set(resolved_costs)) != 1:
+            return None
+        return resolved_costs[0]
+
+    def _allocated_gpu_count(self, model: Model) -> int:
+        if isinstance(model, TrainableModel) and model._internal_config is not None:
+            trainer_gpu_ids = set(model._internal_config.get("trainer_gpu_ids", []))
+            inference_gpu_ids = set(model._internal_config.get("inference_gpu_ids", []))
+            allocated_gpu_ids = trainer_gpu_ids | inference_gpu_ids
+            if allocated_gpu_ids:
+                return len(allocated_gpu_ids)
+
+        if not torch.cuda.is_available():
+            return 0
+        return torch.cuda.device_count()
+
     def __enter__(self) -> Self:
+        return self
+
+    async def __aenter__(self) -> Self:
         return self
 
     def __exit__(
@@ -82,14 +174,33 @@ class LocalBackend(Backend):
     ) -> None:
         self._close()
 
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.close()
+
     async def close(self) -> None:
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
-        self._close()
+        for service in self._services.values():
+            aclose = getattr(service, "aclose", None)
+            if aclose is None:
+                close = getattr(service, "close", None)
+                if close is not None:
+                    close()
+            else:
+                await aclose()
+            close_proxy(service)
 
     def _close(self) -> None:
-        for _, service in self._services.items():
+        for service in self._services.values():
+            close = getattr(service, "close", None)
+            if close is not None:
+                close()
             close_proxy(service)
 
     async def register(
@@ -118,6 +229,11 @@ class LocalBackend(Backend):
         # (wandb initialization is now handled by the model's _get_wandb_run method)
         if model.trainable and "WANDB_API_KEY" in os.environ:
             _ = model._get_wandb_run()
+        if model.trainable:
+            trainable_model = cast(TrainableModel, model)
+            pricing = get_model_pricing(trainable_model.base_model)
+            if pricing is not None:
+                trainable_model.set_cost_calculator(build_cost_calculator(pricing))
 
     def _model_inference_name(self, model: Model, step: int | None = None) -> str:
         """Return the inference name for a model checkpoint.
@@ -131,13 +247,33 @@ class LocalBackend(Backend):
                   If None, returns name for latest checkpoint (step 0 initially).
         """
 
-        # For LocalBackend, vLLM always serves LoRA adapters with @step suffix
-        # Default to step 0 when not specified (the initial checkpoint created at registration)
-        actual_step = step if step is not None else self.__get_step(model)
-        return f"{model.name}@{actual_step}"
+        requested_step = step
+
+        if step is None and isinstance(model, TrainableModel):
+            from ..dev.validate import is_dedicated_mode
+
+            service = self._services.get(model.name)
+            if service is not None and is_dedicated_mode(
+                model._internal_config or dev.InternalModelConfig()
+            ):
+                loaded_step = getattr(service, "_latest_step", None)
+                if isinstance(loaded_step, int):
+                    step = loaded_step
+
+        if step is None:
+            # The checkpoint directory is written before dedicated-mode
+            # vLLM finishes reloading the new adapter.
+            step = self.__get_step(model)
+        name = f"{model.name}@{step}"
+        logger.debug(
+            f"[BACKEND] _model_inference_name: step_arg={requested_step} "
+            f"actual_step={step} -> {name}"
+        )
+        return name
 
     async def _get_service(self, model: TrainableModel) -> ModelService:
         from ..dev.get_model_config import get_model_config
+        from ..dev.validate import is_dedicated_mode, validate_dedicated_config
 
         if model.name not in self._services:
             config = get_model_config(
@@ -145,6 +281,9 @@ class LocalBackend(Backend):
                 output_dir=get_model_dir(model=model, art_path=self._path),
                 config=model._internal_config,
             )
+            validate_dedicated_config(config)
+            dedicated = is_dedicated_mode(config)
+
             is_tinker = config.get("tinker_args") is not None
             if is_tinker:
                 from ..tinker.service import TinkerService
@@ -157,13 +296,19 @@ class LocalBackend(Backend):
                 # When moving the service to a child process, import unsloth
                 # early to maximize optimizations
                 os.environ["IMPORT_UNSLOTH"] = "1"
+
+            if dedicated:
+                os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(
+                    str(g) for g in config["trainer_gpu_ids"]
+                )
+
             self._services[model.name] = service_class(
                 model_name=model.name,
                 base_model=model.base_model,
                 config=config,
                 output_dir=get_model_dir(model=model, art_path=self._path),
             )
-            if not self._in_process:
+            if not dedicated and not self._in_process:
                 # Kill all "model-service" processes to free up GPU memory
                 subprocess.run(["pkill", "-9", "model-service"])
                 self._services[model.name] = move_to_child_process(
@@ -204,7 +349,7 @@ class LocalBackend(Backend):
         )
         if not tokenized_results:
             return None
-        max_tokens = max(len(result.tokens) for result in tokenized_results)
+        max_tokens = max(len(result.token_ids) for result in tokenized_results)
         # Round up max_tokens to the nearest multiple of 2048
         sequence_length = math.ceil(max_tokens / 2048) * 2048
         # Cap sequence length at the model's max sequence length
@@ -254,40 +399,54 @@ class LocalBackend(Backend):
         steps_to_keep: list[int],
     ) -> None:
         """Delete checkpoint files, keeping only the specified steps."""
-        from ..tinker.service import TinkerService
 
         output_dir = get_model_dir(model=model, art_path=self._path)
         service = await self._get_service(model)
-        if isinstance(service, TinkerService):
-            await service.delete_checkpoints(steps_to_keep)
-        else:
-            delete_checkpoints(output_dir, steps_to_keep)
+        try:
+            from ..tinker.service import TinkerService
+
+            if isinstance(service, TinkerService):
+                await service.delete_checkpoints(steps_to_keep)
+                return
+        except ImportError:
+            pass
+        delete_checkpoints(output_dir, steps_to_keep)
 
     async def _prepare_backend_for_training(
         self,
         model: AnyTrainableModel,
         config: dev.OpenAIServerConfig | None = None,
     ) -> tuple[str, str]:
+        config_dict: dict = dict(config or {})
+        server_args = dict(config_dict.get("server_args", {}))
+
+        # Avoid binding collisions on busy hosts when no explicit port is provided.
+        if "port" not in server_args:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("", 0))
+                server_args["port"] = s.getsockname()[1]
+        config_dict["server_args"] = server_args
+        resolved_config = cast(dev.OpenAIServerConfig, config_dict)
+
         service = await self._get_service(model)
-        host, port = await service.start_openai_server(config=config)
+        host, port = await service.start_openai_server(config=resolved_config)
 
         base_url = f"http://{host}:{port}/v1"
-        api_key = (config or {}).get("server_args", {}).get(
-            "api_key", None
-        ) or "default"
+        api_key = server_args.get("api_key") or "default"
 
         def done_callback(_: asyncio.Task[None]) -> None:
             close_proxy(self._services.pop(model.name))
 
         asyncio.create_task(
-            self._monitor_openai_server(model.name, base_url, api_key)
+            self._monitor_openai_server(model, base_url, api_key)
         ).add_done_callback(done_callback)
 
         return base_url, api_key
 
     async def _monitor_openai_server(
-        self, model_name: str, base_url: str, api_key: str
+        self, model: AnyTrainableModel, base_url: str, api_key: str
     ) -> None:
+        model_name = model.name
         openai_client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -322,7 +481,7 @@ class LocalBackend(Backend):
                         try:
                             # Send a health check with a short timeout
                             await openai_client.completions.create(
-                                model=model_name,
+                                model=self._model_inference_name(model),
                                 prompt="Hi",
                                 max_tokens=1,
                                 timeout=float(
@@ -373,9 +532,14 @@ class LocalBackend(Backend):
         *,
         # Core training parameters
         learning_rate: float = 5e-6,
-        beta: float = 0.0,
-        # RL algorithm settings
-        ppo: bool = False,
+        loss_fn: Literal["cispo", "ppo"] = "cispo",
+        loss_fn_config: dict | None = None,
+        normalize_advantages: bool = True,
+        adam_params: object | None = None,
+        # KL-penalized advantage adjustment
+        kl_penalty_coef: float = 0.0,
+        kl_penalty_reference_step: int | None = None,
+        kl_ref_adapter_path: str | None = None,
         epsilon: float | None = None,
         epsilon_high: float | None = None,
         # Advantage computation
@@ -412,9 +576,24 @@ class LocalBackend(Backend):
             model: The trainable model to train.
             trajectory_groups: Batches of trajectories to train on.
             learning_rate: Learning rate for training. Defaults to 5e-6.
-            beta: KL penalty coefficient. Defaults to 0.0.
-            ppo: Whether to use PPO clipping. Defaults to False.
-            epsilon: Clip epsilon for importance sampling. Defaults based on ppo.
+            loss_fn: RL loss function. LocalBackend currently supports
+                "cispo" and "ppo".
+            loss_fn_config: Additional loss-function config. Not supported by
+                LocalBackend.
+            normalize_advantages: Whether to normalize advantages. LocalBackend
+                currently requires True.
+            adam_params: Custom optimizer params. Not supported by
+                LocalBackend.
+            kl_penalty_coef: Coefficient for KL-penalized advantage adjustment.
+                Tokens diverging more from the reference get reduced advantages.
+                Defaults to 0.0 (disabled).
+            kl_penalty_reference_step: Checkpoint step of the training model to
+                use as the KL reference. If None, uses the base model (LoRA
+                disabled) as reference.
+            kl_ref_adapter_path: Direct filesystem path to a LoRA adapter
+                checkpoint to use as the KL reference. Alternative to
+                kl_penalty_reference_step.
+            epsilon: Clip epsilon for importance sampling. Defaults based on loss_fn.
             epsilon_high: Asymmetric upper clip bound. Defaults to epsilon.
             advantage_balance: Balance between negative and positive advantages
                 in range [-1.0, 1.0]. Defaults to 0.0 (balanced).
@@ -457,52 +636,59 @@ class LocalBackend(Backend):
             # await model.log(metrics=result.metrics, step=result.step)
         """
         groups_list = list(trajectory_groups)
+        if loss_fn not in {"cispo", "ppo"}:
+            raise ValueError("LocalBackend only supports loss_fn='cispo' or 'ppo'.")
+        if loss_fn_config is not None:
+            raise ValueError("LocalBackend requires loss_fn_config=None.")
+        if not normalize_advantages:
+            raise ValueError("LocalBackend requires normalize_advantages=True.")
+        if adam_params is not None:
+            raise ValueError("LocalBackend requires adam_params=None.")
 
-        # Build config objects from explicit kwargs
-        config = TrainConfig(learning_rate=learning_rate, beta=beta)
-        dev_config: dev.TrainConfig = {
-            "advantage_balance": advantage_balance,
-            "allow_training_without_logprobs": allow_training_without_logprobs,
-            "importance_sampling_level": importance_sampling_level,
-            "mask_prob_ratio": mask_prob_ratio,
-            "plot_tensors": plot_tensors,
-            "ppo": ppo,
-            "precalculate_logprobs": precalculate_logprobs,
-            "scale_learning_rate_by_reward_std_dev": scale_learning_rate_by_reward_std_dev,
-            "scale_rewards": scale_rewards,
-            "logprob_calculation_chunk_size": logprob_calculation_chunk_size,
-            "num_trajectories_learning_rate_multiplier_power": num_trajectories_learning_rate_multiplier_power,
-        }
-        # Only include optional fields if they're set
-        if epsilon is not None:
-            dev_config["epsilon"] = epsilon
-        if epsilon_high is not None:
-            dev_config["epsilon_high"] = epsilon_high
-        if max_negative_advantage_importance_sampling_weight is not None:
-            dev_config["max_negative_advantage_importance_sampling_weight"] = (
-                max_negative_advantage_importance_sampling_weight
+        resolved_kl_ref_adapter_path = kl_ref_adapter_path
+        if (
+            resolved_kl_ref_adapter_path is None
+            and kl_penalty_reference_step is not None
+        ):
+            resolved_kl_ref_adapter_path = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path),
+                kl_penalty_reference_step,
             )
-        if kimi_k2_tau is not None:
-            dev_config["kimi_k2_tau"] = kimi_k2_tau
-        if truncated_importance_sampling is not None:
-            dev_config["truncated_importance_sampling"] = truncated_importance_sampling
+        config, dev_config = build_rl_train_configs(
+            learning_rate=learning_rate,
+            advantage_balance=advantage_balance,
+            scale_rewards=scale_rewards,
+            importance_sampling_level=importance_sampling_level,
+            mask_prob_ratio=mask_prob_ratio,
+            ppo=loss_fn == "ppo",
+            precalculate_logprobs=precalculate_logprobs,
+            epsilon=epsilon,
+            epsilon_high=epsilon_high,
+            max_negative_advantage_importance_sampling_weight=max_negative_advantage_importance_sampling_weight,
+            kimi_k2_tau=kimi_k2_tau,
+            kl_penalty_coef=kl_penalty_coef,
+            allow_training_without_logprobs=allow_training_without_logprobs,
+            plot_tensors=plot_tensors,
+            truncated_importance_sampling=truncated_importance_sampling,
+            scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
+            logprob_calculation_chunk_size=logprob_calculation_chunk_size,
+            num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
+            kl_ref_adapter_path=resolved_kl_ref_adapter_path,
+        )
 
         # Collect metrics from training
         training_metrics: list[dict[str, float]] = []
+        trainer_started = time.monotonic()
         async for metrics in self._train_model(
             model, groups_list, config, dev_config, verbose
         ):
             training_metrics.append(metrics)
 
-        # Aggregate metrics
-        avg_metrics: dict[str, float] = {}
-        if training_metrics:
-            avg_metrics = {
-                k: sum(d.get(k, 0) for d in training_metrics)
-                / sum(1 for d in training_metrics if k in d)
-                for k in {k for d in training_metrics for k in d}
-                if k != "num_gradient_steps"
-            }
+        avg_metrics = aggregate_rl_training_metrics(
+            training_metrics=training_metrics,
+            trajectory_groups=groups_list,
+            trainer_started=trainer_started,
+        )
 
         # Get step and checkpoint path
         step = await self._get_step(model)
@@ -513,6 +699,11 @@ class LocalBackend(Backend):
             )
             if not os.path.exists(checkpoint_path):
                 checkpoint_path = None
+
+        # Record provenance on the latest W&B artifact
+        wandb_run = model._get_wandb_run()
+        if wandb_run is not None:
+            record_provenance(wandb_run, "local-rl")
 
         return LocalTrainResult(
             step=step,
@@ -535,12 +726,10 @@ class LocalBackend(Backend):
         if verbose:
             print("Packing tensors...")
 
-        # Count submitted groups and trainable groups
-        num_groups_submitted = len(trajectory_groups)
-        num_groups_trainable = sum(
-            1
-            for group in trajectory_groups
-            if group and len(set(trajectory.reward for trajectory in group)) > 1
+        summary = summarize_trajectory_groups(trajectory_groups)
+        base_metrics = build_training_summary_metrics(
+            summary,
+            include_trainable_groups=True,
         )
 
         packed_tensors = self._get_packed_tensors(
@@ -563,6 +752,10 @@ class LocalBackend(Backend):
             # Still advance the step by renaming the checkpoint directory
             current_step = self.__get_step(model)
             next_step = current_step + 1
+            logger.info(
+                f"[BACKEND] _train_model SKIP: current_step={current_step} "
+                f"next_step={next_step} (all rewards equal)"
+            )
             current_checkpoint_dir = get_step_checkpoint_dir(
                 get_model_dir(model=model, art_path=self._path), current_step
             )
@@ -570,51 +763,78 @@ class LocalBackend(Backend):
                 get_model_dir(model=model, art_path=self._path), next_step
             )
 
-            # If the current checkpoint exists, rename it to the next step
+            # If the current checkpoint exists, copy it to the next step
             if os.path.exists(current_checkpoint_dir):
-                os.rename(current_checkpoint_dir, next_checkpoint_dir)
-                print(
-                    f"Advanced step from {current_step} to {next_step} (no training occurred)"
+                shutil.copytree(
+                    current_checkpoint_dir,
+                    next_checkpoint_dir,
+                    dirs_exist_ok=True,
+                )
+                logger.info(
+                    f"[BACKEND] _train_model SKIP: copied checkpoint "
+                    f"{current_step} -> {next_step}, calling register_lora_for_step..."
                 )
 
                 try:
-                    # Register the renamed checkpoint as a new LoRA adapter
+                    # Register the copied checkpoint as a new LoRA adapter
                     # so it's available for inference at the new step
-                    from ..unsloth.service import UnslothService
-
-                    if isinstance(service, UnslothService):
-                        await service.register_lora_for_step(
+                    if hasattr(service, "register_lora_for_step"):
+                        await service.register_lora_for_step(  # type: ignore[attr-defined]
                             next_step, next_checkpoint_dir
                         )
+                    logger.info(
+                        f"[BACKEND] _train_model SKIP: register_lora_for_step "
+                        f"completed for step {next_step}"
+                    )
                 except ModuleNotFoundError:
                     pass  # Unsloth is not installed
 
             # Yield metrics showing no groups were trainable
             # (the frontend will handle logging)
             yield {
-                "num_groups_submitted": num_groups_submitted,
-                "num_groups_trainable": 0,
-                "num_gradient_steps": 0,
+                **base_metrics,
+                "data/step_num_groups_trainable": 0.0,
+                "data/step_trainer_tokens": 0.0,
+                TRAIN_GRADIENT_STEPS_KEY: 0.0,
             }
             return
+        base_metrics["data/step_trainer_tokens"] = float(
+            packed_tensors["assistant_mask"].sum().item()
+        )
         disk_packed_tensors = packed_tensors_to_dir(
             packed_tensors, f"{get_model_dir(model=model, art_path=self._path)}/tensors"
         )
         # Note: scale_learning_rate_by_reward_std_dev is now handled by the frontend (Model.train())
-        results: list[dict[str, float]] = []
-        estimated_gradient_steps = disk_packed_tensors["num_sequences"]
-        pbar = tqdm.tqdm(total=estimated_gradient_steps, desc="train")
+        grad_accumulation_sequences = max(
+            1, int(config.grad_accumulation_sequences or 1)
+        )
+        fallback_gradient_steps = math.ceil(
+            disk_packed_tensors["num_sequences"] / grad_accumulation_sequences
+        )
+        pbar = tqdm.tqdm(total=fallback_gradient_steps, desc="train")
+        reported_gradient_steps: int | None = None
         async for result in service.train(
             disk_packed_tensors, config, dev_config, verbose
         ):
-            num_gradient_steps = int(
-                result.pop("num_gradient_steps", estimated_gradient_steps)
-            )
-            assert num_gradient_steps == estimated_gradient_steps, (
-                f"num_gradient_steps {num_gradient_steps} != estimated_gradient_steps {estimated_gradient_steps}"
-            )
-            results.append(result)
-            yield {**result, "num_gradient_steps": num_gradient_steps}
+            raw_num_gradient_steps = result.pop(TRAIN_GRADIENT_STEPS_KEY, None)
+            if raw_num_gradient_steps is not None:
+                num_gradient_steps = int(raw_num_gradient_steps)
+                if reported_gradient_steps is None:
+                    reported_gradient_steps = num_gradient_steps
+                    if pbar.total != num_gradient_steps:
+                        pbar.total = num_gradient_steps
+                        pbar.refresh()
+                else:
+                    assert num_gradient_steps == reported_gradient_steps, (
+                        f"num_gradient_steps {num_gradient_steps} != reported_gradient_steps {reported_gradient_steps}"
+                    )
+            else:
+                num_gradient_steps = reported_gradient_steps or fallback_gradient_steps
+            yield {
+                **base_metrics,
+                **result,
+                TRAIN_GRADIENT_STEPS_KEY: float(num_gradient_steps),
+            }
             pbar.update(1)
             pbar.set_postfix(result)
         pbar.close()
@@ -624,6 +844,114 @@ class LocalBackend(Backend):
 
     # Note: _get_reward_std_dev_learning_rate_multiplier and _log_metrics
     # have been moved to the Model class (frontend)
+
+    async def _train_sft(
+        self,
+        model: AnyTrainableModel,
+        trajectories: Iterable[Trajectory],
+        config: TrainSFTConfig,
+        dev_config: dev.TrainSFTConfig,
+        verbose: bool = False,
+    ) -> AsyncIterator[dict[str, float]]:
+        """Train the model using supervised fine-tuning.
+
+        Args:
+            model: The trainable model to fine-tune
+            trajectories: Iterable of Trajectory objects
+            config: SFT configuration with batch_size and learning rates.
+                    If learning_rate is a list, streaming mode is used automatically.
+            dev_config: Developer configuration
+            verbose: Whether to print detailed logs
+
+        Yields:
+            Dictionary containing training metrics for each batch
+        """
+        if verbose:
+            print("Starting _train_sft")
+
+        # Get tokenizer
+        if model.base_model not in self._tokenizers:
+            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
+                model.base_model
+            )
+        tokenizer = self._tokenizers[model.base_model]
+
+        from ..utils.sft import resolve_sft_batch_size
+
+        batch_size = resolve_sft_batch_size(
+            batch_size=config.batch_size,
+            default_batch_size=self._default_sft_batch_size(),
+        )
+        service_config = config.model_copy(update={"batch_size": batch_size})
+
+        # Auto-detect instruction/response parts from model
+        from ..utils.model_config import get_instruction_response_parts
+
+        instruction_part, response_part = get_instruction_response_parts(
+            model.base_model, tokenizer
+        )
+
+        if verbose:
+            print(f"Using instruction_part: {instruction_part!r}")
+            print(f"Using response_part: {response_part!r}")
+
+        import itertools
+        from typing import Iterator
+
+        from ..preprocessing.tokenize import SFTBatch
+
+        if isinstance(config.learning_rate, list):
+            learning_rates_iter: Iterator[float] = iter(config.learning_rate)
+        else:
+            learning_rates_iter = itertools.repeat(config.learning_rate)
+
+        # Build all batches in memory
+        trajectory_list = list(trajectories)
+        batches: list[SFTBatch] = []
+        for i in range(0, len(trajectory_list), batch_size):
+            batch_trajectories = trajectory_list[i : i + batch_size]
+            batches.append(
+                tokenize_sft_batch(
+                    trajectory_batch=batch_trajectories,
+                    learning_rate=next(learning_rates_iter),
+                    tokenizer=tokenizer,
+                    instruction_part=instruction_part,
+                    response_part=response_part,
+                )
+            )
+
+        # Get the service and train
+        service = await self._get_service(model)
+
+        pbar = tqdm.tqdm(total=len(batches), desc="sft train")
+        total_trainable_tokens = sum(batch.num_trainable_tokens for batch in batches)
+        total_trajectories = len(trajectory_list)
+        batch_count = 0
+
+        async for result in service.train_sft(batches, service_config, verbose):
+            pbar.update(1)
+            pbar.set_postfix({"loss": f"{result.get('loss/train', 0):.4f}"})
+            batch_count += 1
+            yield {
+                **result,
+                "data/step_num_trajectories": float(total_trajectories),
+                "data/step_trainer_tokens": float(total_trainable_tokens),
+                TRAIN_GRADIENT_STEPS_KEY: float(len(batches)),
+            }
+
+        pbar.close()
+
+        if batch_count > 0 and total_trainable_tokens == 0:
+            print(
+                "WARNING: No trainable tokens found! "
+                "Check instruction_part and response_part settings."
+            )
+
+        if verbose:
+            print("_train_sft complete")
+
+    def _default_sft_batch_size(self) -> int:
+        return 2
 
     # ------------------------------------------------------------------
     # Experimental support for S3

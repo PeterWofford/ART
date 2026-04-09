@@ -1,5 +1,31 @@
 from .engine import EngineArgs
 from .model import InitArgs, InternalModelConfig, PeftArgs, TrainerArgs
+from .validate import QWEN3_5_MOE_MODELS, is_dedicated_mode
+
+
+def default_target_modules(base_model: str) -> list[str]:
+    if base_model in QWEN3_5_MOE_MODELS:
+        return [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "in_proj_qkv",
+            "in_proj_z",
+            "out_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
+        ]
+    return [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
 
 
 def get_model_config(
@@ -12,13 +38,23 @@ def get_model_config(
     if config is None:
         config = InternalModelConfig()
 
-    enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
+    dedicated = is_dedicated_mode(config)
+    rollout_weights_mode = config.get("rollout_weights_mode", "lora")
+
+    if dedicated:
+        enable_sleep_mode = False
+    else:
+        enable_sleep_mode = config.get("engine_args", {}).get("enable_sleep_mode", True)
+
     init_args = InitArgs(
-        fast_inference=False,
         load_in_4bit=True,
         max_seq_length=32768,
         model_name=base_model,
     )
+    # fast_inference triggers in-process vLLM via Unsloth; dedicated mode runs vLLM as a subprocess
+    if not dedicated:
+        init_args["fast_inference"] = False
+
     engine_args = EngineArgs(
         allowed_local_media_path="/tmp",
         enable_sleep_mode=enable_sleep_mode,
@@ -33,15 +69,7 @@ def get_model_config(
         lora_alpha=16,
         r=8,
         random_state=3407,
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
+        target_modules=default_target_modules(base_model),
         use_gradient_checkpointing="unsloth",
     )
     peft_args.update(config.get("peft_args", {}))
@@ -50,6 +78,7 @@ def get_model_config(
         adam_beta2=0.99,
         disable_tqdm=True,
         gradient_accumulation_steps=1,
+        gradient_checkpointing=True,
         learning_rate=5e-6,
         logging_steps=1,
         lr_scheduler_type="constant",
@@ -63,10 +92,16 @@ def get_model_config(
         weight_decay=0.1,
     )
     trainer_args.update(config.get("trainer_args", {}))
-    return InternalModelConfig(
+    result = InternalModelConfig(
         init_args=init_args,
         engine_args=engine_args,
         peft_args=peft_args,
+        rollout_weights_mode=rollout_weights_mode,
         tinker_args=config.get("tinker_args"),
         trainer_args=trainer_args,
     )
+    if "trainer_gpu_ids" in config:
+        result["trainer_gpu_ids"] = config["trainer_gpu_ids"]
+    if "inference_gpu_ids" in config:
+        result["inference_gpu_ids"] = config["inference_gpu_ids"]
+    return result

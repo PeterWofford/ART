@@ -30,6 +30,7 @@ class Model(BaseModel):
     project: str
     name: str
     base_model: str
+    run_id: str | None
 
 
 class Checkpoint(BaseModel):
@@ -65,7 +66,16 @@ class ExperimentalTrainingConfig(TypedDict, total=False):
     scale_rewards: bool | None
 
 
+class SFTTrainingConfig(TypedDict, total=False):
+    batch_size: int | None
+    learning_rate: float | list[float] | None
+
+
 class TrainingJob(BaseModel):
+    id: str
+
+
+class SFTTrainingJob(BaseModel):
     id: str
 
 
@@ -116,7 +126,7 @@ class Models(AsyncAPIResource):
             body={
                 "model_id": model_id,
                 "trajectory_groups": [
-                    trajectory_group.model_dump()
+                    trajectory_group.model_dump(mode="json")
                     for trajectory_group in trajectory_groups
                 ],
                 "split": split,
@@ -220,6 +230,29 @@ class TrainingJobEvents(AsyncAPIResource):
         )
 
 
+class SFTTrainingJobs(AsyncAPIResource):
+    async def create(
+        self,
+        *,
+        model_id: str,
+        training_data_url: str,
+        config: SFTTrainingConfig | None = None,
+    ) -> SFTTrainingJob:
+        return await self._post(
+            "/preview/sft-training-jobs",
+            cast_to=SFTTrainingJob,
+            body={
+                "model_id": model_id,
+                "training_data_url": training_data_url,
+                "config": config,
+            },
+        )
+
+    @cached_property
+    def events(self) -> "TrainingJobEvents":
+        return TrainingJobEvents(cast(AsyncOpenAI, self._client))  # ty:ignore[redundant-cast]
+
+
 class Client(AsyncAPIClient):
     api_key: str
 
@@ -263,6 +296,10 @@ class Client(AsyncAPIClient):
     @cached_property
     def training_jobs(self) -> TrainingJobs:
         return TrainingJobs(cast(AsyncOpenAI, self))
+
+    @cached_property
+    def sft_training_jobs(self) -> SFTTrainingJobs:
+        return SFTTrainingJobs(cast(AsyncOpenAI, self))
 
     ############################
     # AsyncOpenAI overrides #

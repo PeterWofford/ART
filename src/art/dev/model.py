@@ -1,8 +1,11 @@
 from enum import Enum
+from typing import Literal
 
 from typing_extensions import Required, TypedDict
 
 from .engine import EngineArgs
+
+RolloutWeightsMode = Literal["lora", "merged"]
 
 
 # Vendored from transformers.training_args.OptimizerNames
@@ -115,6 +118,15 @@ class InternalModelConfig(TypedDict, total=False):
         peft: Arguments for creating an Unsloth PEFT model wrapper.
         tinker: Arguments for the Tinker training client.
         trainer: Arguments for the GRPO trainer.
+        trainer_gpu_ids: GPU IDs for training (e.g., [0]). When set with
+            inference_gpu_ids, enables dedicated mode where training and
+            inference run on separate GPUs.
+        inference_gpu_ids: GPU IDs for vLLM inference (e.g., [1]). When set
+            with trainer_gpu_ids, enables dedicated mode.
+        rollout_weights_mode: How inference weights are applied in vLLM.
+            - "lora": load LoRA adapters into vLLM directly
+            - "merged": keep training LoRA adapters, but push merged weights
+              into vLLM for inference
     """
 
     init_args: "InitArgs"
@@ -123,6 +135,9 @@ class InternalModelConfig(TypedDict, total=False):
     tinker_args: "TinkerArgs | None"
     tinker_native_args: "TinkerNativeArgs | None"
     trainer_args: "TrainerArgs"
+    trainer_gpu_ids: list[int]
+    inference_gpu_ids: list[int]
+    rollout_weights_mode: "RolloutWeightsMode"
 
 
 class TinkerArgs(TypedDict, total=False):
@@ -150,6 +165,7 @@ class InitArgs(TypedDict, total=False):
     dtype: str | None
     load_in_4bit: bool
     load_in_8bit: bool
+    load_in_16bit: bool
     full_finetuning: bool
     token: str | None
     device_map: str

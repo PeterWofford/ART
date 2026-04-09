@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import json
 import math
 from typing import Any, Awaitable, Iterable, Literal, NamedTuple, TypeVar, cast
 import os
@@ -31,6 +32,10 @@ from art.tinker.cookbook_v import renderers, tokenizer_utils
 from .. import dev
 from ..backend import Backend
 from ..costs import build_cost_calculator, compute_train_cost, get_model_pricing
+from ..metrics_taxonomy import (
+    build_training_summary_metrics,
+    summarize_trajectory_groups,
+)
 from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
@@ -47,6 +52,35 @@ from .data import (
 STATE_KEY_RUN_IDS = "tinker_run_ids"
 STATE_KEY_LATEST_STEP = "latest_step"
 T = TypeVar("T")
+
+_UPSTREAM_TRAIN_METRIC_KEYS = {
+    "reward": "reward",
+    "reward_std_dev": "reward_std_dev",
+    "exception_rate": "exception_rate",
+    "policy_loss": "loss/train",
+    "loss": "loss/train",
+    "entropy": "loss/entropy",
+    "kl_div": "loss/kl_div",
+    "kl_policy_ref": "loss/kl_policy_ref",
+    "grad_norm": "loss/grad_norm",
+    "learning_rate": "loss/learning_rate",
+    "num_groups_submitted": "data/step_num_groups_submitted",
+    "num_groups_trainable": "data/step_num_groups_trainable",
+    "num_trajectories": "data/step_num_trajectories",
+    "num_trainable_tokens": "data/step_trainer_tokens",
+    "train_tokens": "data/step_trainer_tokens",
+    "num_datums": "data/step_num_datums",
+}
+
+
+def _canonicalize_upstream_metric_key(metric: str) -> str:
+    if "/" in metric:
+        return metric
+    if metric == "tokens_per_second":
+        return ""
+    if metric.startswith("group_metric_"):
+        return f"group_{metric[len('group_metric_') :]}"
+    return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
 
 
 class DistillationWorkItem(NamedTuple):
@@ -222,6 +256,7 @@ class TinkerNativeBackend(Backend):
     ) -> TrainResult:
         state = self._model_state[model.name]
         groups_list = list(trajectory_groups)
+        summary = summarize_trajectory_groups(groups_list)
 
         datums = trajectory_groups_to_datums(
             groups_list,
@@ -231,8 +266,11 @@ class TinkerNativeBackend(Backend):
         )
 
         metrics: dict[str, float] = {
-            "num_groups_submitted": float(len(groups_list)),
-            "num_datums": float(len(datums)),
+            **build_training_summary_metrics(
+                summary,
+                include_trainable_groups=True,
+            ),
+            "data/step_num_datums": float(len(datums)),
         }
 
         if not datums:
@@ -241,10 +279,13 @@ class TinkerNativeBackend(Backend):
         train_tokens = 0
         for datum in datums:
             train_tokens += len(datum.model_input.to_ints())
-        metrics["train_tokens"] = float(train_tokens)
+        metrics["data/step_trainer_tokens"] = float(train_tokens)
         pricing = get_model_pricing(model.base_model)
         if pricing is not None:
-            metrics["costs_train"] = compute_train_cost(train_tokens, pricing)
+            metrics["costs/train/tinker_train"] = compute_train_cost(
+                train_tokens, pricing
+            )
+        trainer_started = time.monotonic()
 
         if adam_params is None:
             adam_params = tinker.AdamParams(
@@ -282,12 +323,16 @@ class TinkerNativeBackend(Backend):
             for key, value in forward_output.metrics.items():
                 if value is None:
                     continue
-                metrics[key] = float(value)
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
         if optim_output.metrics:
             for key, value in optim_output.metrics.items():
                 if value is None:
                     continue
-                metrics[key] = float(value)
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
 
         next_step = state.current_step + 1
         checkpoint_name = f"step_{next_step:06d}"
@@ -312,6 +357,7 @@ class TinkerNativeBackend(Backend):
 
         state.current_step = next_step
         self._persist_model_state(model, state)
+        metrics["time/step_trainer_s"] = time.monotonic() - trainer_started
 
         return TrainResult(step=state.current_step, metrics=metrics)
 
@@ -1086,7 +1132,7 @@ class TinkerNativeBackend(Backend):
         @app.post("/v1/chat/completions")
         async def chat_completions(body: CompletionCreateParams) -> ChatCompletion:
             model_name = body.get("model")
-            _, step = self._parse_model_name(model_name)
+            parsed_model_name, step = self._parse_model_name(model_name)
             sampler_client = await self._get_sampler_client(state, step)
 
             messages = self._normalize_messages(body["messages"])
@@ -1143,7 +1189,13 @@ class TinkerNativeBackend(Backend):
                             id=tool_call.get("id") or f"call_{idx}",
                             function=Function(
                                 name=tool_call["function"]["name"],
-                                arguments=tool_call["function"]["arguments"],
+                                arguments=(
+                                    tool_call["function"]["arguments"]
+                                    if isinstance(
+                                        tool_call["function"]["arguments"], str
+                                    )
+                                    else json.dumps(tool_call["function"]["arguments"])
+                                ),
                             ),
                         )
                         for idx, tool_call in enumerate(parsed_message["tool_calls"])
@@ -1179,7 +1231,7 @@ class TinkerNativeBackend(Backend):
                 id=str(uuid.uuid4()),
                 choices=choices,
                 created=int(time.time()),
-                model=self._format_response_model(model_name, step, state),
+                model=self._format_response_model(parsed_model_name, step),
                 object="chat.completion",
                 usage=CompletionUsage(
                     completion_tokens=completion_tokens,
@@ -1233,6 +1285,7 @@ class TinkerNativeBackend(Backend):
         renderer = renderers.get_renderer(
             name=config.renderer_name,
             tokenizer=tokenizer,
+            model_name=model.base_model,
         )
 
         saved_state = model.read_state() or {}
@@ -1418,27 +1471,32 @@ class TinkerNativeBackend(Backend):
                 normalized.append(dict(tool))
         return normalized
 
-    def _parse_model_name(
-        self, model_name: str | None
-    ) -> tuple[str | None, int | None]:
-        if model_name and "@" in model_name:
-            base_name, step_str = model_name.rsplit("@", 1)
-            try:
-                return base_name, int(step_str)
-            except ValueError as exc:
-                raise HTTPException(
-                    status_code=400, detail=f"Invalid model step: {model_name}"
-                ) from exc
-        return model_name, None
+    def _parse_model_name(self, model_name: str | None) -> tuple[str, int]:
+        if not model_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Model name is required and must include an '@step' suffix. Use model.get_inference_name().",
+            )
+        if "@" not in model_name:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{model_name}' is missing an '@step' suffix. "
+                    "Use model.get_inference_name()."
+                ),
+            )
 
-    def _format_response_model(
-        self, model_name: str | None, step: int | None, state: ModelState
-    ) -> str:
-        if model_name is None:
-            return f"{state.model_name}@{state.current_step}"
-        if step is None and "@" not in model_name:
-            return f"{model_name}@{state.current_step}"
-        return model_name
+        base_name, step_str = model_name.rsplit("@", 1)
+        try:
+            return base_name, int(step_str)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Invalid model step: {model_name}"
+            ) from exc
+
+    def _format_response_model(self, model_name: str, step: int) -> str:
+        # Echo back the explicit model@step used for this completion.
+        return f"{model_name}@{step}"
 
     async def _create_training_client_from_checkpoint(
         self,
@@ -1530,3 +1588,140 @@ class TinkerNativeBackend(Backend):
                 STATE_KEY_LATEST_STEP: state.current_step,
             }
         )
+
+    async def _experimental_fork_checkpoint(
+        self,
+        model: Model,
+        from_model: str,
+        from_project: str | None = None,
+        from_s3_bucket: str | None = None,
+        not_after_step: int | None = None,
+        verbose: bool = False,
+        prefix: str | None = None,
+    ) -> None:
+        """Fork a checkpoint from another TinkerNative model to initialize this model.
+
+        Loads the source model's training checkpoint into the destination model's
+        training client directly via tinker:// paths. No local download needed.
+
+        Args:
+            model: The destination model to fork to (must already be registered).
+            from_model: The name of the source model to fork from.
+            from_project: The project of the source model. Defaults to model.project.
+            from_s3_bucket: Not supported for TinkerNativeBackend.
+            not_after_step: If provided, uses the latest checkpoint <= this step.
+            verbose: Whether to print verbose output.
+            prefix: Not applicable for TinkerNativeBackend.
+        """
+        if from_s3_bucket is not None:
+            raise NotImplementedError(
+                "from_s3_bucket is not supported for TinkerNativeBackend. "
+                "Tinker checkpoints are stored on Tinker infrastructure, not S3."
+            )
+
+        trainable_model = cast(TrainableModel, model)
+
+        if trainable_model.name not in self._model_state:
+            raise RuntimeError(
+                f"Model '{trainable_model.name}' is not registered. "
+                "Call register() before forking."
+            )
+
+        from_project = from_project or model.project
+
+        # Read the source model's state.json to get its tinker_run_ids
+        source_state_dir = get_model_dir(
+            Model(name=from_model, project=from_project),
+            art_path=self._path,
+        )
+        source_state_path = f"{source_state_dir}/state.json"
+        import json
+
+        if not os.path.exists(source_state_path):
+            raise FileNotFoundError(
+                f"Source model state not found at {source_state_path}. "
+                f"Ensure the source model '{from_model}' has been trained "
+                f"with this backend."
+            )
+        with open(source_state_path, "r") as f:
+            source_state = json.load(f)
+
+        source_run_ids = list(source_state.get(STATE_KEY_RUN_IDS, []))
+        if not source_run_ids:
+            raise ValueError(
+                f"Source model '{from_model}' has no tinker run IDs in its state."
+            )
+
+        # List source model's checkpoints
+        dest_state = self._model_state[trainable_model.name]
+        training_paths, sampler_paths = await self._list_checkpoints(
+            dest_state.rest_client, source_run_ids
+        )
+
+        if not training_paths:
+            raise ValueError(
+                f"No training checkpoints found for source model '{from_model}'."
+            )
+
+        # Select the target step
+        available_steps = sorted(training_paths.keys())
+        if not_after_step is not None:
+            eligible_steps = [s for s in available_steps if s <= not_after_step]
+            if not eligible_steps:
+                raise ValueError(
+                    f"No checkpoint found at or before step {not_after_step}. "
+                    f"Available steps: {available_steps}"
+                )
+            target_step = max(eligible_steps)
+        else:
+            target_step = max(available_steps)
+
+        source_checkpoint_path = training_paths[target_step]
+        if verbose:
+            print(
+                f"Forking from '{from_model}' step {target_step} "
+                f"(checkpoint: {source_checkpoint_path})"
+            )
+
+        # Load the source checkpoint into a new training client
+        config = self._resolve_model_config(trainable_model)
+        new_training_client = await self._create_training_client_from_checkpoint(
+            service_client=dest_state.service_client,
+            checkpoint_state_path=source_checkpoint_path,
+            base_model=trainable_model.base_model,
+            training_client_args=config.training_client_args,
+            reset_optimizer=True,
+        )
+
+        # Save new sampler weights
+        checkpoint_name = f"step_{target_step:06d}"
+        sampler_response = await self._save_sampler_weights(
+            new_training_client, checkpoint_name
+        )
+
+        # Create a sampler client from the new weights
+        sampler_client = await self._tinker_train_call(
+            "create_sampling_client_async",
+            new_training_client.create_sampling_client_async(
+                model_path=sampler_response.path
+            ),
+        )
+
+        # Update the destination model's state
+        new_run_id = new_training_client.model_id
+        if new_run_id not in dest_state.tinker_run_ids:
+            dest_state.tinker_run_ids.append(new_run_id)
+
+        dest_state.training_client = new_training_client
+        dest_state.current_step = target_step
+        dest_state.sampler_clients[target_step] = sampler_client
+        dest_state.sampler_checkpoint_paths[target_step] = sampler_response.path
+        dest_state.training_checkpoint_paths[target_step] = source_checkpoint_path
+
+        self._persist_model_state(trainable_model, dest_state)
+
+        if verbose:
+            print(
+                f"Fork complete. Model '{trainable_model.name}' is now at "
+                f"step {target_step}."
+            )

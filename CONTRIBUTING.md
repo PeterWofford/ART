@@ -37,6 +37,20 @@ uv run prek run pytest
 
 These checks are automatically run in CI for all pull requests. If your PR fails these checks, re-run the corresponding `prek` hook locally and commit any fixes.
 
+### CI uv Cache
+
+The PR `prek` workflow uses a prebuilt full `uv` cache (stored as a GitHub release asset) to avoid rebuilding heavy dependencies on every run.
+
+The cache is keyed by a fingerprint computed from `pyproject.toml`, `uv.lock`, the base Docker image, and the Python version. When dependencies change, the fingerprint changes and CI automatically rebuilds the cache using Docker Buildx and uploads it for future runs. The first CI run after a dependency change will be slower while the cache is built.
+
+To manually rebuild the cache (e.g., if the automatic build fails), run:
+
+```bash
+bash scripts/ci/build_and_push_uv_cache.sh
+```
+
+This requires GitHub CLI authentication (`gh auth login`) and should be run in an environment compatible with CI (same base CUDA image/toolchain).
+
 ### Release Process
 
 To create a new release:
@@ -132,5 +146,23 @@ You should see immediate improvement in `val/reward` after one step.
 If you run into any issues, the training output is set to maximum verbosity. Copying the outputs such as the vLLM or torchtune logs, or copying/screenshotting the plotted packed tensors, may help me debug the issue.
 
 ### Cleaning Up
+
+When you're done, you can tear down the cluster with:
+
+```bash
+uv run sky down art
+```
+
+### Adding Docs
+
+We use Mintlify to serve our docs. Here are the steps for adding a new page:
+1. Clone the ART repo
+2. Open the /docs directory in your CLI and IDE
+3. Run npx mintlify dev to start serving a local version of the docs in your browser
+4. Create a new .mdx file in the relevant directory
+5. Add a title and sidebar title (see other pages for examples)
+6. In docs.json, add a link to the new page within one of the `navigation`.`groups`
+7. Ensure everything works by navigating to and viewing the page in your browser
+8. Submit a PR
 
 When you're done, shut down your GPU instance (if using a cloud VM) or stop the local training process.

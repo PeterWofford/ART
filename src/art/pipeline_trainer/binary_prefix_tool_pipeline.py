@@ -165,7 +165,7 @@ def print_history_summary(model: art.TrainableModel, tail: int = 5) -> None:
         step = row["step"]
         reward = row["train/reward"]
         std_dev = row["train/reward_std_dev"]
-        discarded = row["train/discarded_stale_samples"]
+        discarded = row["train/discarded_stale_groups"]
         off_policy = row["train/steps_off_policy"]
         print(
             f"  step={step} reward={reward} std={std_dev} "
@@ -229,12 +229,14 @@ async def main() -> None:
     openai_client = model.openai_client()
     cost_calculator = model.cost_calculator
 
-    async def do_rollout(scenario: Scenario, temp: float) -> art.Trajectory:
+    async def do_rollout(
+        scenario: Scenario, temp: float, cost_context: str
+    ) -> art.Trajectory:
         """Core rollout logic used by both training and eval."""
         messages: art.Messages = scenario["messages"]
         response = await openai_client.chat.completions.create(
             messages=messages,
-            model=model.name,
+            model=model.get_inference_name(),
             max_tokens=max_tokens,
             timeout=request_timeout,
             temperature=temp,
@@ -265,6 +267,7 @@ async def main() -> None:
         sample_costs = cost_calculator(
             prompt_tokens,
             completion_tokens,
+            cost_context,
         )
         if sample_costs:
             metrics.update(sample_costs)
@@ -281,7 +284,7 @@ async def main() -> None:
         scenario: Scenario,
         _config: PipelineConfig,
     ) -> art.Trajectory:
-        return await do_rollout(scenario, temperature)
+        return await do_rollout(scenario, temperature, "train")
 
     rollout_fn = make_group_rollout_fn(single_rollout, n=rollouts_per_scenario)
 
@@ -290,7 +293,7 @@ async def main() -> None:
     async def eval_fn(
         _model: art.TrainableModel, _step: int, _config: PipelineConfig
     ) -> list[art.Trajectory]:
-        tasks = [do_rollout(build_scenario(), eval_temperature)]
+        tasks = [do_rollout(build_scenario(), eval_temperature, "eval")]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         trajectories = [r for r in results if isinstance(r, art.Trajectory)]
         if trajectories:
@@ -312,7 +315,7 @@ async def main() -> None:
     async def scenario_iter():
         for i in range(scenario_count):
             scenario = build_scenario()
-            scenario["metadata"] = {"scenario_idx": i}
+            scenario["metadata"] = {"scenario_id": str(i)}
             yield scenario
 
     config = PipelineConfig(

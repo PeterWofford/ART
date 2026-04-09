@@ -16,6 +16,8 @@ from .status import StatusReporter
 from .types import ConfigT, EvalFn, RolloutFn, ScenarioT, SingleRolloutFn  # noqa: F401
 
 PIPELINE_STATE_KEY = "_pipeline_trainer"
+_ROLLOUT_WALL_TIME_KEY = "_art_rollout_wall_s"
+_ACTOR_IDLE_TIME_KEY = "_art_actor_idle_s"
 
 
 def _to_async_iterator(iterable: Iterable[T] | AsyncIterator[T]) -> AsyncIterator[T]:
@@ -152,6 +154,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             total_scenarios=total_scenarios,
             num_workers=num_rollout_workers,
         )
+        self._validate_backend_support()
 
     async def train(self, *, handle_signals: bool = True) -> None:
         """Run the training pipeline over the configured scenario iterator."""
@@ -275,6 +278,42 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             except asyncio.QueueFull:
                 loop.create_task(self._output_queue.put(None))
 
+    def _validate_backend_support(self) -> None:
+        from art.dev.validate import is_dedicated_mode
+        from art.local.backend import LocalBackend
+
+        if not isinstance(self.backend, LocalBackend):
+            return
+
+        model_config = self.model._internal_config or art.dev.InternalModelConfig()
+        if not is_dedicated_mode(model_config):
+            raise ValueError(
+                "PipelineTrainer only supports LocalBackend in dedicated mode. "
+                "Shared LocalBackend pauses inference during training and is not "
+                "a supported async PipelineTrainer path. Set both "
+                "trainer_gpu_ids and inference_gpu_ids on the TrainableModel "
+                "_internal_config to use LocalBackend with PipelineTrainer."
+            )
+        if self.loss_fn not in {"cispo", "ppo"}:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) only supports "
+                "loss_fn='cispo' or loss_fn='ppo'."
+            )
+        if self.loss_fn_config is not None:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires "
+                "loss_fn_config=None."
+            )
+        if not self.normalize_advantages:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires "
+                "normalize_advantages=True."
+            )
+        if self.adam_params is not None:
+            raise ValueError(
+                "PipelineTrainer + LocalBackend(dedicated) requires adam_params=None."
+            )
+
     async def _skip_scenarios(
         self, scenarios: AsyncIterator[ScenarioT], count: int
     ) -> int:
@@ -322,13 +361,21 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             self._status.note_rollout_started()
             errored = False
             try:
+                wait_started = time.monotonic()
                 await self._wait_for_policy()
+                actor_idle_s = time.monotonic() - wait_started
                 if self.state.done:
                     break
 
                 initial_version = self.state.policy_version
 
-                group = await self.rollout_fn(self.model, scenario, self.config)
+                token = self.model.activate_metrics_context("train")
+                rollout_started = time.monotonic()
+                try:
+                    group = await self.rollout_fn(self.model, scenario, self.config)
+                finally:
+                    token.var.reset(token)
+                rollout_wall_s = time.monotonic() - rollout_started
                 if not isinstance(group, TrajectoryGroup):
                     errored = True
                     continue
@@ -340,7 +387,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 )
                 if self.state.done:
                     break
-                await self._put_output_group(group)
+                queue_wait_s = await self._put_output_group(group)
+                group.metadata[_ROLLOUT_WALL_TIME_KEY] = rollout_wall_s
+                group.metadata[_ACTOR_IDLE_TIME_KEY] = actor_idle_s + queue_wait_s
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -379,12 +428,16 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             if stop_at_step is not None and current_step >= stop_at_step:
                 break
             step_start = time.monotonic()
+            collect_started = time.monotonic()
             batch, discarded, saw_sentinel = await self._collect_batch(current_step)
-            self.state.discarded_stale_samples += discarded
+            trainer_idle_s = time.monotonic() - collect_started
+            self.state.discarded_stale_groups += discarded
             if discarded:
                 self._status.note_stale(discarded)
             if not batch:
                 break
+
+            actor_wall_s, actor_idle_s = self._consume_batch_rollout_timings(batch)
 
             expected_step = current_step + 1
             should_eval_step = self._should_eval_step(expected_step)
@@ -395,10 +448,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self.state.policy_updated.notify_all()
 
             self._status.note_training_start(len(batch))
-            train_call_start: float | None = None
+            train_call_start = time.monotonic()
             if os.getenv("ART_TRAIN_STEP_LOG"):
                 print(f"[train] step {expected_step} starting (batch={len(batch)})")
-                train_call_start = time.perf_counter()
             try:
                 result = await self.backend.train(
                     self.model,
@@ -414,8 +466,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 self._status.note_training_end()
                 raise
             finally:
-                if train_call_start is not None:
-                    train_call_elapsed = time.perf_counter() - train_call_start
+                train_call_elapsed = time.monotonic() - train_call_start
+                if os.getenv("ART_TRAIN_STEP_LOG"):
                     print(
                         f"[train] step {expected_step} done in "
                         f"{train_call_elapsed:.1f}s"
@@ -433,12 +485,16 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
 
                 steps_off_policy = self._average_steps_off_policy(current_step, batch)
                 metrics = {
-                    "discarded_stale_samples": float(
-                        self.state.discarded_stale_samples
-                    ),
+                    "discarded_stale_groups": float(self.state.discarded_stale_groups),
                     "steps_off_policy": steps_off_policy,
-                    "num_groups": float(len(batch)),
+                    "time/step_wall_s": step_seconds,
+                    "throughput/step_trainer_idle_s": trainer_idle_s,
                 }
+                metrics.setdefault("time/step_trainer_s", train_call_elapsed)
+                if actor_wall_s > 0:
+                    metrics["time/step_actor_s"] = actor_wall_s
+                if actor_idle_s > 0:
+                    metrics["throughput/step_actor_idle_s"] = actor_idle_s
                 metrics.update(result.metrics)
 
                 await self.model.log(
@@ -447,7 +503,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     step=current_step,
                     metrics=metrics,
                 )
-                await self._log_discarded_groups(current_step)
+                await self._log_zero_variance_groups(current_step)
 
                 if self.eval_fn is not None and should_eval_step:
                     if self._eval_queue is not None:
@@ -496,7 +552,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 continue
             batch.append(item)
 
-        while not saw_sentinel:
+        while not saw_sentinel and len(batch) < self.max_batch_size:
             try:
                 item = self._output_queue.get_nowait()
             except asyncio.QueueEmpty:
@@ -561,14 +617,22 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         assert self.eval_fn is not None
         self._status.note_val_started(step)
         reward: float | None = None
+        eval_elapsed = 0.0
         try:
-            result = await self.eval_fn(self.model, step, self.config)
+            token = self.model.activate_metrics_context("eval")
+            eval_started = time.monotonic()
+            try:
+                result = await self.eval_fn(self.model, step, self.config)
+            finally:
+                token.var.reset(token)
+                eval_elapsed = time.monotonic() - eval_started
             splits: dict[str, list[art.Trajectory | art.TrajectoryGroup]]
             if isinstance(result, dict):
                 splits = result
             else:
                 splits = {"val": result}
 
+            logged_eval_timing = False
             for split_name, items in splits.items():
                 groups, trajectories = self._normalize_eval_items(items)
                 if split_name == "val":
@@ -577,7 +641,25 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                     else:
                         reward = None
                 if groups:
-                    await self.model.log(groups, split=split_name, step=step)
+                    metrics = (
+                        {"time/step_eval_s": eval_elapsed}
+                        if not logged_eval_timing
+                        else None
+                    )
+                    await self.model.log(
+                        groups,
+                        split=split_name,
+                        step=step,
+                        metrics=metrics,
+                    )
+                    logged_eval_timing = True
+            if not logged_eval_timing and eval_elapsed > 0:
+                await self.model.log(
+                    trajectories=None,
+                    split="val",
+                    step=step,
+                    metrics={"time/step_eval_s": eval_elapsed},
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -630,6 +712,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 continue
             if not self._is_scalar_metadata(value):
                 continue
+            if key == "scenario_id":
+                group.metadata["scenario_id"] = value
+                continue
             group.metadata[f"scenario_{key}"] = value
 
     def _is_group_stale(self, group: TrajectoryGroup, min_version: int) -> bool:
@@ -672,7 +757,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             "\n"
         )
 
-    async def _log_discarded_groups(self, step: int) -> None:
+    async def _log_zero_variance_groups(self, step: int) -> None:
         if not self._discard_queue:
             return
         discarded = list(self._discard_queue)
@@ -734,12 +819,31 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
     def _is_scalar_metadata(value: object) -> bool:
         return value is None or isinstance(value, (str, int, float, bool))
 
-    async def _put_output_group(self, group: TrajectoryGroup) -> None:
+    async def _put_output_group(self, group: TrajectoryGroup) -> float:
         assert self._output_queue is not None
+        queue_wait_started = time.monotonic()
         while not self.state.done:
             try:
                 await asyncio.wait_for(self._output_queue.put(group), timeout=1.0)
                 self._status.note_group_enqueued(group)
-                return
+                return time.monotonic() - queue_wait_started
             except asyncio.TimeoutError:
                 continue
+        return time.monotonic() - queue_wait_started
+
+    def _consume_batch_rollout_timings(
+        self, batch: list[TrajectoryGroup]
+    ) -> tuple[float, float]:
+        rollout_wall_s = 0.0
+        actor_idle_s = 0.0
+        for group in batch:
+            rollout_wall_s += self._pop_float_metadata(group, _ROLLOUT_WALL_TIME_KEY)
+            actor_idle_s += self._pop_float_metadata(group, _ACTOR_IDLE_TIME_KEY)
+        return rollout_wall_s, actor_idle_s
+
+    @staticmethod
+    def _pop_float_metadata(group: TrajectoryGroup, key: str) -> float:
+        value = group.metadata.pop(key, 0.0)
+        if isinstance(value, (int, float)):
+            return float(value)
+        return 0.0

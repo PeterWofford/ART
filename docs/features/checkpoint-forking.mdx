@@ -31,7 +31,7 @@ import art
 from art.local import LocalBackend
 
 async def train():
-    with LocalBackend() as backend:
+    async with LocalBackend() as backend:
         # Create a new model that will fork from an existing checkpoint
         model = art.TrainableModel(
             name="my-model-v2",
@@ -115,7 +115,7 @@ low_lr_model = art.TrainableModel(
 )
 
 async def experiment():
-    with LocalBackend() as backend:
+    async with LocalBackend() as backend:
         # Fork the model from the base model
         await backend._experimental_fork_checkpoint(
             low_lr_model,

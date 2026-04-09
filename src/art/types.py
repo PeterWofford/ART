@@ -16,7 +16,13 @@ Tools = list[ChatCompletionToolParam]
 
 class TrainConfig(pydantic.BaseModel):
     learning_rate: float = 5e-6
-    beta: float = 0.0
+    kl_penalty_coef: float = 0.0
+    grad_accumulation_sequences: int | None = pydantic.Field(default=None, ge=1)
+
+
+class TrainSFTConfig(pydantic.BaseModel):
+    learning_rate: float | list[float] = 5e-5  # Single value or per-batch list
+    batch_size: int | Literal["auto"] = "auto"
 
 
 Verbosity = Literal[0, 1, 2]
