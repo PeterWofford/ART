@@ -216,6 +216,8 @@ def build_runtime_config() -> dict[str, Any]:
         "max_tokens": MAX_TOKENS,
         "rollout_temperature": ROLLOUT_TEMPERATURE,
         "save_checkpoint": SAVE_CHECKPOINT,
+        "upload_checkpoints_to_wandb": _get_env_bool("UPLOAD_CHECKPOINTS_TO_WANDB", False),
+        "upload_checkpoints_every_steps": int(os.environ.get("UPLOAD_CHECKPOINTS_EVERY_STEPS", "0")) or None,
         "ruler_judge_model": RULER_JUDGE_MODEL,
         "min_reward_std": MIN_REWARD_STD,
         "aligned_tie_epsilon": ALIGNED_TIE_EPSILON,
@@ -437,6 +439,7 @@ async def generate_gpt41_response(
 
 async def run_eval(
     model: art.TrainableModel,
+    backend: LocalBackend,
     model_client: AsyncOpenAI,
     get_inference_model_name: "Callable[[], str]",
     gpt41_client: AsyncOpenAI,
@@ -455,6 +458,13 @@ async def run_eval(
     print(f"Eval at step {step}  "
           f"(holdout={len(holdout_rows)}, test={len(test_rows)})")
     print(f"{'─'*60}")
+
+    await backend.persist_checkpoint(
+        model=model,
+        step=step,
+        force=True,
+        wait=False,
+    )
 
     eval_builder = model.metrics_builder("eval")
     ruler_semaphore = asyncio.Semaphore(RULER_EVAL_CONCURRENCY)
@@ -615,278 +625,283 @@ async def train(model: art.TrainableModel) -> None:
     model.update_wandb_config(runtime_config)
 
     backend = LocalBackend()
-    gpt41_client = AsyncOpenAI(http_client=httpx.AsyncClient(timeout=90))
+    gpt41_http_client = httpx.AsyncClient(timeout=90)
+    gpt41_client = AsyncOpenAI(http_client=gpt41_http_client)
 
-    await model.register(
-        backend,
-        _openai_client_config={
-            "server_args": {
-                "tool_call_parser": "qwen3_coder",
-                "enable_auto_tool_choice": True,
-            }
-        },
-    )
-
-    if FORK_FROM_MODEL:
-        await backend._experimental_fork_checkpoint(
-            model=model,
-            from_model=FORK_FROM_MODEL,
-            from_project=FORK_FROM_PROJECT or PROJECT_NAME,
-            not_after_step=int(FORK_NOT_AFTER_STEP) if FORK_NOT_AFTER_STEP else None,
-            verbose=True,
-        )
-
-    model_client = model.openai_client()
-
-    # -- Test inference after LoRA seeding --------------------------------------
-    print("\nRunning test inference to verify LoRA loaded correctly...")
     try:
-        with open(TRAIN_PATH) as f:
-            for i, line in enumerate(f):
-                if i == 0:
-                    test_inp = json.loads(line)["input"]
-                if i == 1:
-                    test_inp["tools"] = json.loads(line)["input"]["tools"]
-                    break
-        test_resp = await model_client.chat.completions.create(
-            model=backend._model_inference_name(model),
-            messages=test_inp["messages"],
-            tools=test_inp["tools"] or None,
-            tool_choice="auto",
-            temperature=0,
-            max_tokens=MAX_TOKENS,
-            logprobs=True,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        await model.register(
+            backend,
+            _openai_client_config={
+                "server_args": {
+                    "tool_call_parser": "qwen3_coder",
+                    "enable_auto_tool_choice": True,
+                }
+            },
         )
-        choices = test_resp.choices
-        if choices:
-            token_logprobs = []
-            if choices[0].logprobs and choices[0].logprobs.content:
-                token_logprobs = [t.model_dump() for t in choices[0].logprobs.content]
-            if token_logprobs:
-                raw_bytes = b"".join(bytes(t["bytes"]) for t in token_logprobs if t.get("bytes"))
-                if raw_bytes:
-                    print("\nRaw decoded output (from bytes):")
-                    print(raw_bytes.decode("utf-8", errors="replace"))
-                else:
-                    print("\nRaw decoded output (from token strings):")
-                    print("".join(t.get("token", "") for t in token_logprobs))
-            else:
-                print("\nNo logprobs returned.")
-                print("Raw logprobs field:", choices[0].logprobs)
-        else:
-            print("  Test inference returned no choices")
-    except Exception as exc:
-        print(f"  Test inference failed (non-fatal): {exc}")
 
-    def get_inference_model_name() -> str:
-        """Return the current LoRA checkpoint name for vLLM inference."""
-        return backend._model_inference_name(model)
-
-    print(f"Local vLLM serving model as: {get_inference_model_name()!r}")
-
-    # -- Load and split training data -------------------------------------------
-    print(f"Loading training data from {TRAIN_PATH} ...")
-    all_train = load_jsonl(TRAIN_PATH)
-    print(f"  {len(all_train)} rows loaded")
-
-    rng = random.Random(SHUFFLE_SEED)
-    rng.shuffle(all_train)
-
-    holdout_rows = all_train[:N_HOLDOUT_ROWS]
-    train_rows = all_train[N_HOLDOUT_ROWS:]
-    if TRAIN_LIMIT is not None:
-        train_rows = train_rows[:TRAIN_LIMIT]
-    print(f"  {len(train_rows)} train / {len(holdout_rows)} holdout")
-
-    # -- Load and sample test data ----------------------------------------------
-    print(f"Loading test data from {TEST_PATH} ...")
-    all_test = load_jsonl(TEST_PATH)
-    split_counts = Counter(str(row.get("split", "<missing>")) for row in all_test if "split" in row)
-    if split_counts:
-        print(f"  split distribution: {dict(split_counts)}")
-        candidate_test_rows = [row for row in all_test if row.get("split") == "TEST"]
-        if not candidate_test_rows:
-            raise ValueError(
-                f"Expected at least one split == 'TEST' row in {TEST_PATH}, "
-                f"found {dict(split_counts)}"
+        if FORK_FROM_MODEL:
+            await backend._experimental_fork_checkpoint(
+                model=model,
+                from_model=FORK_FROM_MODEL,
+                from_project=FORK_FROM_PROJECT or PROJECT_NAME,
+                not_after_step=int(FORK_NOT_AFTER_STEP) if FORK_NOT_AFTER_STEP else None,
+                verbose=True,
             )
+
+        model_client = model.openai_client()
+
+        # -- Test inference after LoRA seeding ----------------------------------
+        print("\nRunning test inference to verify LoRA loaded correctly...")
+        try:
+            with open(TRAIN_PATH) as f:
+                for i, line in enumerate(f):
+                    if i == 0:
+                        test_inp = json.loads(line)["input"]
+                    if i == 1:
+                        test_inp["tools"] = json.loads(line)["input"]["tools"]
+                        break
+            test_resp = await model_client.chat.completions.create(
+                model=backend._model_inference_name(model),
+                messages=test_inp["messages"],
+                tools=test_inp["tools"] or None,
+                tool_choice="auto",
+                temperature=0,
+                max_tokens=MAX_TOKENS,
+                logprobs=True,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            choices = test_resp.choices
+            if choices:
+                token_logprobs = []
+                if choices[0].logprobs and choices[0].logprobs.content:
+                    token_logprobs = [t.model_dump() for t in choices[0].logprobs.content]
+                if token_logprobs:
+                    raw_bytes = b"".join(bytes(t["bytes"]) for t in token_logprobs if t.get("bytes"))
+                    if raw_bytes:
+                        print("\nRaw decoded output (from bytes):")
+                        print(raw_bytes.decode("utf-8", errors="replace"))
+                    else:
+                        print("\nRaw decoded output (from token strings):")
+                        print("".join(t.get("token", "") for t in token_logprobs))
+                else:
+                    print("\nNo logprobs returned.")
+                    print("Raw logprobs field:", choices[0].logprobs)
+            else:
+                print("  Test inference returned no choices")
+        except Exception as exc:
+            print(f"  Test inference failed (non-fatal): {exc}")
+
+        def get_inference_model_name() -> str:
+            """Return the current LoRA checkpoint name for vLLM inference."""
+            return backend._model_inference_name(model)
+
+        print(f"Local vLLM serving model as: {get_inference_model_name()!r}")
+
+        # -- Load and split training data ---------------------------------------
+        print(f"Loading training data from {TRAIN_PATH} ...")
+        all_train = load_jsonl(TRAIN_PATH)
+        print(f"  {len(all_train)} rows loaded")
+
+        rng = random.Random(SHUFFLE_SEED)
+        rng.shuffle(all_train)
+
+        holdout_rows = all_train[:N_HOLDOUT_ROWS]
+        train_rows = all_train[N_HOLDOUT_ROWS:]
+        if TRAIN_LIMIT is not None:
+            train_rows = train_rows[:TRAIN_LIMIT]
+        print(f"  {len(train_rows)} train / {len(holdout_rows)} holdout")
+
+        # -- Load and sample test data ------------------------------------------
+        print(f"Loading test data from {TEST_PATH} ...")
+        all_test = load_jsonl(TEST_PATH)
+        split_counts = Counter(str(row.get("split", "<missing>")) for row in all_test if "split" in row)
+        if split_counts:
+            print(f"  split distribution: {dict(split_counts)}")
+            candidate_test_rows = [row for row in all_test if row.get("split") == "TEST"]
+            if not candidate_test_rows:
+                raise ValueError(
+                    f"Expected at least one split == 'TEST' row in {TEST_PATH}, "
+                    f"found {dict(split_counts)}"
+                )
+            print(
+                f"  using split == 'TEST' rows only: "
+                f"{len(candidate_test_rows)} / {len(all_test)}"
+            )
+        else:
+            candidate_test_rows = all_test
+            print("  no split field found; using the full eval file")
+        rng_test = random.Random(SHUFFLE_SEED + 1)
+        rng_test.shuffle(candidate_test_rows)
+        test_rows = candidate_test_rows[:N_TEST_ROWS]
         print(
-            f"  using split == 'TEST' rows only: "
-            f"{len(candidate_test_rows)} / {len(all_test)}"
+            f"  {len(test_rows)} test rows sampled from "
+            f"{len(candidate_test_rows)} candidate rows "
+            f"({len(all_test)} total rows)"
         )
-    else:
-        candidate_test_rows = all_test
-        print("  no split field found; using the full eval file")
-    rng_test = random.Random(SHUFFLE_SEED + 1)
-    rng_test.shuffle(candidate_test_rows)
-    test_rows = candidate_test_rows[:N_TEST_ROWS]
-    print(
-        f"  {len(test_rows)} test rows sampled from "
-        f"{len(candidate_test_rows)} candidate rows "
-        f"({len(all_test)} total rows)"
-    )
 
-    # -- Training loop ----------------------------------------------------------
+        # -- Training loop ------------------------------------------------------
 
-    last_eval_step = -EVAL_EVERY
-    step = await model.get_step()
-    stop_training = False
+        last_eval_step = -EVAL_EVERY
+        step = await model.get_step()
+        stop_training = False
 
-    for epoch in range(NUM_EPOCHS):
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch + 1}/{NUM_EPOCHS}  ({len(train_rows)} rows)")
-        print(f"{'='*60}")
+        for epoch in range(NUM_EPOCHS):
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch + 1}/{NUM_EPOCHS}  ({len(train_rows)} rows)")
+            print(f"{'='*60}")
 
-        epoch_rows = train_rows.copy()
-        rng_epoch = random.Random(SHUFFLE_SEED + epoch)
-        rng_epoch.shuffle(epoch_rows)
+            epoch_rows = train_rows.copy()
+            rng_epoch = random.Random(SHUFFLE_SEED + epoch)
+            rng_epoch.shuffle(epoch_rows)
 
-        for batch_start in range(0, len(epoch_rows), BATCH_SIZE):
-            batch = epoch_rows[batch_start : batch_start + BATCH_SIZE]
-            step = await model.get_step()
-            if MAX_STEPS is not None and step >= MAX_STEPS:
-                print(f"Reached MAX_STEPS={MAX_STEPS}; stopping training loop.")
-                stop_training = True
+            for batch_start in range(0, len(epoch_rows), BATCH_SIZE):
+                batch = epoch_rows[batch_start : batch_start + BATCH_SIZE]
+                step = await model.get_step()
+                if MAX_STEPS is not None and step >= MAX_STEPS:
+                    print(f"Reached MAX_STEPS={MAX_STEPS}; stopping training loop.")
+                    stop_training = True
+                    break
+
+                print(
+                    f"\n--- Step {step} | "
+                    f"rows {batch_start}--{batch_start + len(batch) - 1} "
+                    f"(epoch {epoch + 1}) ---"
+                )
+
+                # -- Periodic eval ----------------------------------------------
+                if (step - last_eval_step) >= EVAL_EVERY:
+                    await run_eval(
+                        model, backend, model_client, get_inference_model_name, gpt41_client,
+                        holdout_rows, test_rows, step,
+                    )
+                    last_eval_step = step
+
+                # -- Build + score trajectory groups ----------------------------
+                scenario_ids = [
+                    row_scenario_id(r, f"train_{batch_start + i}")
+                    for i, r in enumerate(batch)
+                ]
+
+                train_builder = model.metrics_builder("train")
+
+                async def build_group(
+                    row: dict[str, Any],
+                    scenario_id: str,
+                ) -> art.TrajectoryGroup | None:
+                    messages: list[dict] = row["input"]["messages"]
+                    tools: list[dict] = row["input"].get("tools") or []
+                    context, _ = split_context_and_golden(messages)
+
+                    choices = await generate_response(
+                        model_client, get_inference_model_name(), context, tools, n=GRPO_GROUP_SIZE
+                    )
+                    if not choices:
+                        return None
+
+                    group = art.TrajectoryGroup([
+                        art.Trajectory(
+                            messages_and_choices=context + [choice],
+                            tools=tools,
+                            reward=0.0,
+                        )
+                        for choice in choices
+                    ])
+                    group.metadata["scenario_id"] = scenario_id
+                    return group
+
+                async def score_group(
+                    group: art.TrajectoryGroup,
+                ) -> art.TrajectoryGroup | None:
+                    non_tool_trajs:list[art.Trajectory] = []
+                    for t in group.trajectories:
+                        if not t.messages_and_choices[-1].message.tool_calls:
+                            non_tool_trajs.append(t)
+
+                    for t in non_tool_trajs:
+                        group.trajectories.remove(t)
+
+                    scored = await ruler_score_group(
+                        group,
+                        RULER_JUDGE_MODEL,
+                        rubric=RULER_RUBRIC,
+                        swallow_exceptions=True,
+                        debug=False,
+                    )
+
+                    if scored is None:
+                        return None
+                    
+                    for t in non_tool_trajs:
+                        t.reward = -0.1
+                        scored.trajectories.append(t)
+
+                    if group_reward_std(scored) < MIN_REWARD_STD:
+                        return None
+                    return scored
+
+                with train_builder.activate_context():
+                    with train_builder.measure("time/step_actor_s"):
+                        raw_groups = await asyncio.gather(*[
+                            build_group(r, sid)
+                            for r, sid in zip(batch, scenario_ids)
+                        ])
+                        raw_groups = [g for g in raw_groups if g is not None]
+
+                        scored_groups = await asyncio.gather(*[
+                            score_group(g) for g in raw_groups
+                        ])
+                        scored_groups = [g for g in scored_groups if g is not None]
+
+                train_builder.add_data(
+                    step_num_scenarios=len(batch),
+                    scenario_ids=scenario_ids,
+                )
+
+                print(
+                    f"  Valid groups after RULER filter: "
+                    f"{len(scored_groups)}/{len(batch)}"
+                )
+                if not scored_groups:
+                    print("  No valid groups, skipping step.")
+                    continue
+
+                log_trajectory_samples(scored_groups, step)
+
+                # -- Train ------------------------------------------------------
+                result = await backend.train(
+                    model=model,
+                    trajectory_groups=scored_groups,
+                    learning_rate=LEARNING_RATE,
+                    # kl_penalty_coef=KL_COEFF,
+                    # kl_penalty_reference_step=0,
+                    save_checkpoint=SAVE_CHECKPOINT,
+                )
+                await model.log(
+                    scored_groups,
+                    metrics=result.metrics,
+                    step=result.step,
+                    split="train",
+                )
+
+                metrics_str = "  ".join(
+                    f"{k}={v:.4f}"
+                    for k, v in result.metrics.items()
+                    if isinstance(v, float)
+                )
+                print(f"  Step {result.step} metrics: {metrics_str}")
+            if stop_training:
                 break
 
-            print(
-                f"\n--- Step {step} | "
-                f"rows {batch_start}--{batch_start + len(batch) - 1} "
-                f"(epoch {epoch + 1}) ---"
-            )
-
-            # -- Periodic eval --------------------------------------------------
-            if (step - last_eval_step) >= EVAL_EVERY:
-                await run_eval(
-                    model, model_client, get_inference_model_name, gpt41_client,
-                    holdout_rows, test_rows, step,
-                )
-                last_eval_step = step
-
-            # -- Build + score trajectory groups --------------------------------
-            scenario_ids = [
-                row_scenario_id(r, f"train_{batch_start + i}")
-                for i, r in enumerate(batch)
-            ]
-
-            train_builder = model.metrics_builder("train")
-
-            async def build_group(
-                row: dict[str, Any],
-                scenario_id: str,
-            ) -> art.TrajectoryGroup | None:
-                messages: list[dict] = row["input"]["messages"]
-                tools: list[dict] = row["input"].get("tools") or []
-                context, _ = split_context_and_golden(messages)
-
-                choices = await generate_response(
-                    model_client, get_inference_model_name(), context, tools, n=GRPO_GROUP_SIZE
-                )
-                if not choices:
-                    return None
-
-                group = art.TrajectoryGroup([
-                    art.Trajectory(
-                        messages_and_choices=context + [choice],
-                        tools=tools,
-                        reward=0.0,
-                    )
-                    for choice in choices
-                ])
-                group.metadata["scenario_id"] = scenario_id
-                return group
-
-            async def score_group(
-                group: art.TrajectoryGroup,
-            ) -> art.TrajectoryGroup | None:
-                non_tool_trajs:list[art.Trajectory] = []
-                for t in group.trajectories:
-                    if not t.messages_and_choices[-1].message.tool_calls:
-                        non_tool_trajs.append(t)
-
-                for t in non_tool_trajs:
-                    group.trajectories.remove(t)
-
-                scored = await ruler_score_group(
-                    group,
-                    RULER_JUDGE_MODEL,
-                    rubric=RULER_RUBRIC,
-                    swallow_exceptions=True,
-                    debug=False,
-                )
-
-                if scored is None:
-                    return None
-                
-                for t in non_tool_trajs:
-                    t.reward = -0.1
-                    scored.trajectories.append(t)
-
-                if group_reward_std(scored) < MIN_REWARD_STD:
-                    return None
-                return scored
-
-            with train_builder.activate_context():
-                with train_builder.measure("time/step_actor_s"):
-                    raw_groups = await asyncio.gather(*[
-                        build_group(r, sid)
-                        for r, sid in zip(batch, scenario_ids)
-                    ])
-                    raw_groups = [g for g in raw_groups if g is not None]
-
-                    scored_groups = await asyncio.gather(*[
-                        score_group(g) for g in raw_groups
-                    ])
-                    scored_groups = [g for g in scored_groups if g is not None]
-
-            train_builder.add_data(
-                step_num_scenarios=len(batch),
-                scenario_ids=scenario_ids,
-            )
-
-            print(
-                f"  Valid groups after RULER filter: "
-                f"{len(scored_groups)}/{len(batch)}"
-            )
-            if not scored_groups:
-                print("  No valid groups, skipping step.")
-                continue
-
-            log_trajectory_samples(scored_groups, step)
-
-            # -- Train ----------------------------------------------------------
-            result = await backend.train(
-                model=model,
-                trajectory_groups=scored_groups,
-                learning_rate=LEARNING_RATE,
-                # kl_penalty_coef=KL_COEFF,
-                # kl_penalty_reference_step=0,
-                save_checkpoint=SAVE_CHECKPOINT,
-            )
-            await model.log(
-                scored_groups,
-                metrics=result.metrics,
-                step=result.step,
-                split="train",
-            )
-
-            metrics_str = "  ".join(
-                f"{k}={v:.4f}"
-                for k, v in result.metrics.items()
-                if isinstance(v, float)
-            )
-            print(f"  Step {result.step} metrics: {metrics_str}")
-        if stop_training:
-            break
-
-    # Final eval
-    step = await model.get_step()
-    await run_eval(
-        model, model_client, get_inference_model_name, gpt41_client,
-        holdout_rows, test_rows, step,
-    )
-    print("\nTraining complete.")
+        # Final eval
+        step = await model.get_step()
+        await run_eval(
+            model, backend, model_client, get_inference_model_name, gpt41_client,
+            holdout_rows, test_rows, step,
+        )
+        print("\nTraining complete.")
+    finally:
+        await gpt41_http_client.aclose()
+        await backend.close()
 
 
 def _get_env_bool(name: str, default: bool) -> bool:

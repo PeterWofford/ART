@@ -98,6 +98,20 @@ parser.add_argument(
     action=argparse.BooleanOptionalAction,
     default=True,
 )
+parser.add_argument(
+    "--upload-checkpoints-to-wandb",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+)
+parser.add_argument(
+    "--upload-checkpoints-every-steps",
+    type=int,
+    default=None,
+    help=(
+        "Persist checkpoints to W&B artifacts every N training steps. "
+        "If unset but uploads are enabled, defaults to eval cadence."
+    ),
+)
 parser.add_argument("--trainer-gpu-ids", type=int, nargs="+", default=[0])
 parser.add_argument("--inference-gpu-ids", type=int, nargs="+", default=[1])
 args = parser.parse_args()
@@ -161,6 +175,11 @@ if args.fork_from_project:
     runtime_env["FORK_FROM_PROJECT"] = args.fork_from_project
 if args.fork_not_after_step is not None:
     runtime_env["FORK_NOT_AFTER_STEP"] = str(args.fork_not_after_step)
+if args.upload_checkpoints_to_wandb or args.upload_checkpoints_every_steps is not None:
+    runtime_env["UPLOAD_CHECKPOINTS_TO_WANDB"] = "true"
+    runtime_env["UPLOAD_CHECKPOINTS_EVERY_STEPS"] = str(
+        args.upload_checkpoints_every_steps or args.eval_every
+    )
 
 
 def render_env_block(env: dict[str, str]) -> str:
@@ -240,6 +259,8 @@ effective_config = {
     "eval_temperature": args.eval_temperature,
     "min_reward_std": args.min_reward_std,
     "save_checkpoint": args.save_checkpoint,
+    "upload_checkpoints_to_wandb": args.upload_checkpoints_to_wandb or args.upload_checkpoints_every_steps is not None,
+    "upload_checkpoints_every_steps": args.upload_checkpoints_every_steps or (args.eval_every if args.upload_checkpoints_to_wandb else None),
     "pipeline_pilot": args.pipeline_pilot,
     "fork_from_model": args.fork_from_model,
     "fork_from_project": args.fork_from_project,

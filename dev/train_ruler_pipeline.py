@@ -317,6 +317,8 @@ def build_runtime_config() -> dict[str, Any]:
         "rollout_temperature": PILOT_CONFIG.rollout_temperature,
         "eval_temperature": PILOT_CONFIG.eval_temperature,
         "save_checkpoint": SAVE_CHECKPOINT,
+        "upload_checkpoints_to_wandb": _get_env_bool("UPLOAD_CHECKPOINTS_TO_WANDB", False),
+        "upload_checkpoints_every_steps": int(os.environ.get("UPLOAD_CHECKPOINTS_EVERY_STEPS", "0")) or None,
         "ruler_judge_model": RULER_JUDGE_MODEL,
         "min_reward_std": MIN_REWARD_STD,
         "gpt41_model": GPT41_MODEL,
@@ -331,6 +333,7 @@ def build_runtime_config() -> dict[str, Any]:
 
 async def run_eval(
     model: art.TrainableModel,
+    backend: LocalBackend,
     model_client: AsyncOpenAI,
     gpt41_client: AsyncOpenAI,
     *,
@@ -342,6 +345,13 @@ async def run_eval(
     print(f"\n{'─'*60}")
     print(f"Pilot eval at step {step}  (holdout={len(holdout_rows)}, test={len(test_rows)})")
     print(f"{'─'*60}")
+
+    await backend.persist_checkpoint(
+        model=model,
+        step=step,
+        force=True,
+        wait=False,
+    )
 
     ruler_semaphore = asyncio.Semaphore(RULER_EVAL_CONCURRENCY)
     model_semaphore = asyncio.Semaphore(100)
@@ -599,6 +609,7 @@ async def train(model: art.TrainableModel) -> None:
     ) -> list[art.Trajectory]:
         await run_eval(
             eval_model,
+            backend,
             model_client,
             gpt41_client,
             holdout_rows=holdout_rows,

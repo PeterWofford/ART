@@ -40,6 +40,10 @@ from art.utils.s3 import (
     pull_model_from_s3,
     push_model_to_s3,
 )
+from art.utils.wandb_checkpoints import (
+    checkpoint_upload_enabled,
+    maybe_upload_checkpoint_to_wandb,
+)
 from mp_actors import close_proxy, move_to_child_process
 
 from .. import dev
@@ -105,6 +109,7 @@ class LocalBackend(Backend):
         self._services: dict[str, ModelService] = {}
         self._tokenizers: dict[str, PreTrainedTokenizerBase] = {}
         self._image_processors: dict[str, BaseImageProcessor | None] = {}
+        self._checkpoint_upload_tasks: set[asyncio.Task[bool]] = set()
 
     def supports_automatic_train_step_metrics(self) -> bool:
         return True
@@ -183,6 +188,7 @@ class LocalBackend(Backend):
         """
         If running vLLM in a separate process, this will kill that process and close the communication threads.
         """
+        await self._flush_checkpoint_uploads()
         for service in self._services.values():
             aclose = getattr(service, "aclose", None)
             if aclose is None:
@@ -194,11 +200,114 @@ class LocalBackend(Backend):
             close_proxy(service)
 
     def _close(self) -> None:
+        if self._checkpoint_upload_tasks:
+            logger.warning(
+                "Closing LocalBackend synchronously with %s outstanding checkpoint upload task(s); uploads may be interrupted.",
+                len(self._checkpoint_upload_tasks),
+            )
         for service in self._services.values():
             close = getattr(service, "close", None)
             if close is not None:
                 close()
             close_proxy(service)
+
+    def _track_checkpoint_upload_task(self, task: asyncio.Task[bool]) -> None:
+        self._checkpoint_upload_tasks.add(task)
+
+        def _on_done(done_task: asyncio.Task[bool]) -> None:
+            self._checkpoint_upload_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                logger.error(
+                    "Background checkpoint upload task failed.",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+
+        task.add_done_callback(_on_done)
+
+    async def _flush_checkpoint_uploads(self) -> None:
+        if not self._checkpoint_upload_tasks:
+            return
+        timeout_seconds = float(
+            os.environ.get("UPLOAD_CHECKPOINTS_CLOSE_TIMEOUT_SECONDS", "30")
+        )
+        pending = list(self._checkpoint_upload_tasks)
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*pending, return_exceptions=True),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Timed out waiting %.1fs for %s checkpoint upload task(s) during backend shutdown.",
+                timeout_seconds,
+                len(self._checkpoint_upload_tasks),
+            )
+
+    async def persist_checkpoint(
+        self,
+        *,
+        model: TrainableModel,
+        step: int,
+        checkpoint_path: str | None = None,
+        force: bool = False,
+        wait: bool = False,
+        verbose: bool = False,
+    ) -> bool:
+        if not checkpoint_upload_enabled():
+            return False
+        if checkpoint_path is None:
+            checkpoint_path = get_step_checkpoint_dir(
+                get_model_dir(model=model, art_path=self._path), step
+            )
+        if not os.path.exists(checkpoint_path):
+            return False
+
+        timeout_seconds = float(
+            os.environ.get("UPLOAD_CHECKPOINTS_TIMEOUT_SECONDS", "300")
+        )
+
+        async def _upload() -> bool:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(
+                        maybe_upload_checkpoint_to_wandb,
+                        model=model,
+                        checkpoint_path=checkpoint_path,
+                        step=step,
+                        force=force,
+                        verbose=verbose,
+                    ),
+                    timeout=timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Timed out after %.1fs persisting checkpoint step %s for model %s to W&B; continuing without blocking training.",
+                    timeout_seconds,
+                    step,
+                    model.name,
+                )
+                return False
+
+        if wait:
+            try:
+                return await _upload()
+            except Exception:
+                logger.exception(
+                    "Failed to persist checkpoint step %s for model %s to W&B; continuing.",
+                    step,
+                    model.name,
+                )
+                return False
+
+        task = asyncio.create_task(
+            _upload(),
+            name=f"checkpoint-upload-{model.name}-{step}",
+        )
+        self._track_checkpoint_upload_task(task)
+        return True
 
     async def register(
         self,
@@ -716,6 +825,16 @@ class LocalBackend(Backend):
             )
             if not os.path.exists(checkpoint_path):
                 checkpoint_path = None
+
+        if checkpoint_path is not None:
+            await self.persist_checkpoint(
+                model=model,
+                step=step,
+                checkpoint_path=checkpoint_path,
+                force=False,
+                wait=False,
+                verbose=verbose,
+            )
 
         # Record provenance on the latest W&B artifact
         wandb_run = model._get_wandb_run()
