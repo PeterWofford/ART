@@ -3,12 +3,14 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import socket
 import subprocess
 import time
 from types import TracebackType
 from typing import AsyncIterator, Iterable, Literal, cast
+from urllib.parse import urlparse
 import warnings
 
 logger = logging.getLogger(__name__)
@@ -76,6 +78,48 @@ from .checkpoints import (
     delete_checkpoints,
 )
 from .service import ModelService
+
+
+def _extract_step_from_wandb_aliases(aliases: Iterable[str]) -> int | None:
+    for alias in aliases:
+        if alias.startswith("step"):
+            try:
+                return int(alias[4:])
+            except ValueError:
+                continue
+    return None
+
+
+def _parse_wandb_artifact_reference(ref: str) -> tuple[str, str, str, str]:
+    """Parse a W&B artifact reference into entity/project/name/version."""
+    ref = ref.strip()
+    if ref.startswith("https://") or ref.startswith("http://"):
+        parsed = urlparse(ref)
+        parts = [part for part in parsed.path.strip("/").split("/") if part]
+        if len(parts) >= 6 and parts[2] == "artifacts":
+            entity, project, _, _, name, version = parts[:6]
+            return entity, project, name, version
+        raise ValueError(f"Unsupported W&B artifact URL: {ref}")
+
+    if ref.startswith("wandb-artifact:///"):
+        ref = ref[len("wandb-artifact:///") :]
+
+    if ":" not in ref:
+        raise ValueError(
+            "W&B artifact reference must include an explicit version or alias, "
+            f"got: {ref}"
+        )
+
+    path_part, version = ref.rsplit(":", 1)
+    parts = [part for part in path_part.split("/") if part]
+    if len(parts) != 3:
+        raise ValueError(
+            "W&B artifact reference must be in the form "
+            "<entity>/<project>/<name>:<version>"
+        )
+
+    entity, project, name = parts
+    return entity, project, name, version
 
 
 class LocalBackend(Backend):
@@ -1320,9 +1364,10 @@ class LocalBackend(Backend):
     async def _experimental_fork_checkpoint(
         self,
         model: Model,
-        from_model: str,
+        from_model: str | None = None,
         from_project: str | None = None,
         from_s3_bucket: str | None = None,
+        from_wandb_artifact: str | None = None,
         not_after_step: int | None = None,
         verbose: bool = False,
         prefix: str | None = None,
@@ -1335,13 +1380,74 @@ class LocalBackend(Backend):
             from_project: The project of the model to fork from. Defaults to model.project.
             from_s3_bucket: Optional S3 bucket to pull the checkpoint from. If provided,
                 will pull from S3 first. Otherwise, will fork from local disk.
+            from_wandb_artifact: Optional W&B artifact reference or URL to pull the
+                source checkpoint from before copying it into the destination model dir.
             not_after_step: Optional step number. If provided, will copy the last saved
                 checkpoint that is <= this step. Otherwise, copies the latest checkpoint.
             verbose: Whether to print verbose output.
             prefix: Optional S3 prefix for the bucket.
         """
+        if from_model is None and from_wandb_artifact is None:
+            raise ValueError(
+                "Either from_model or from_wandb_artifact must be provided."
+            )
+
+        if from_wandb_artifact is not None:
+            import wandb
+
+            entity, artifact_project, artifact_model, artifact_version = (
+                _parse_wandb_artifact_reference(from_wandb_artifact)
+            )
+            from_model = artifact_model
+            from_project = artifact_project
+
+            api_key = os.environ.get("WANDB_API_KEY")
+            api = wandb.Api(api_key=api_key)
+            artifact = api.artifact(
+                f"{entity}/{artifact_project}/{artifact_model}:{artifact_version}",
+                type="lora",
+            )
+
+            selected_step = _extract_step_from_wandb_aliases(artifact.aliases)
+            if selected_step is None:
+                match = re.fullmatch(r"step(\d+)", artifact_version)
+                if match is not None:
+                    selected_step = int(match.group(1))
+
+            if selected_step is None:
+                raise ValueError(
+                    "Could not determine checkpoint step from W&B artifact aliases "
+                    f"for {from_wandb_artifact}. Expected an alias like 'step360'."
+                )
+            if not_after_step is not None and selected_step > not_after_step:
+                raise ValueError(
+                    f"W&B artifact step {selected_step} is after requested not_after_step="
+                    f"{not_after_step}"
+                )
+
+            source_model_dir = get_output_dir_from_model_properties(
+                project=artifact_project,
+                name=artifact_model,
+                art_path=self._path,
+            )
+            source_checkpoint_dir = get_step_checkpoint_dir(
+                source_model_dir, selected_step
+            )
+
+            if verbose:
+                print(
+                    "Downloading source checkpoint from W&B artifact "
+                    f"{from_wandb_artifact} -> {source_checkpoint_dir}"
+                )
+
+            if os.path.exists(source_checkpoint_dir):
+                shutil.rmtree(source_checkpoint_dir)
+            os.makedirs(source_checkpoint_dir, exist_ok=True)
+            artifact.download(root=source_checkpoint_dir)
+
         # Default from_project to model.project if not provided
         from_project = from_project or model.project
+        assert from_model is not None
 
         # Get source and destination directories
         source_model_dir = get_output_dir_from_model_properties(

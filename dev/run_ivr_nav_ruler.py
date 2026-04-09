@@ -62,6 +62,7 @@ parser.add_argument("--aux-file", type=str, default=DEFAULT_AUX_FILE)
 parser.add_argument("--skip-validation", action="store_true")
 parser.add_argument("--dry-run", action="store_true")
 parser.add_argument("--pipeline-pilot", action="store_true")
+parser.add_argument("--fork-from-artifact", type=str, default=None)
 parser.add_argument("--fork-from-model", type=str, default=None)
 parser.add_argument("--fork-from-project", type=str, default=None)
 parser.add_argument("--fork-not-after-step", type=int, default=None)
@@ -115,6 +116,9 @@ parser.add_argument(
 parser.add_argument("--trainer-gpu-ids", type=int, nargs="+", default=[0])
 parser.add_argument("--inference-gpu-ids", type=int, nargs="+", default=[1])
 args = parser.parse_args()
+
+if args.fork_from_artifact and args.fork_from_model:
+    parser.error("Use either --fork-from-artifact or --fork-from-model, not both.")
 
 cluster_name = args.cluster_name
 cluster_prefix = os.environ.get("CLUSTER_PREFIX")
@@ -171,6 +175,8 @@ if args.max_steps is not None:
     runtime_env["MAX_STEPS"] = str(args.max_steps)
 if args.fork_from_model:
     runtime_env["FORK_FROM_MODEL"] = args.fork_from_model
+if args.fork_from_artifact:
+    runtime_env["FORK_FROM_ARTIFACT"] = args.fork_from_artifact
 if args.fork_from_project:
     runtime_env["FORK_FROM_PROJECT"] = args.fork_from_project
 if args.fork_not_after_step is not None:
@@ -262,6 +268,7 @@ effective_config = {
     "upload_checkpoints_to_wandb": args.upload_checkpoints_to_wandb or args.upload_checkpoints_every_steps is not None,
     "upload_checkpoints_every_steps": args.upload_checkpoints_every_steps or (args.eval_every if args.upload_checkpoints_to_wandb else None),
     "pipeline_pilot": args.pipeline_pilot,
+    "fork_from_artifact": args.fork_from_artifact,
     "fork_from_model": args.fork_from_model,
     "fork_from_project": args.fork_from_project,
     "fork_not_after_step": args.fork_not_after_step,

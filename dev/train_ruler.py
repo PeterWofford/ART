@@ -40,6 +40,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import statistics
 import time
 from collections import Counter
@@ -134,6 +135,7 @@ RULER_EVAL_CONCURRENCY = 50        # max simultaneous RULER calls during eval
 # Drop training groups where all RULER scores are nearly equal (no learning signal)
 MIN_REWARD_STD = float(os.environ.get("MIN_REWARD_STD", "0.1"))
 FORK_FROM_MODEL = os.environ.get("FORK_FROM_MODEL")
+FORK_FROM_ARTIFACT = os.environ.get("FORK_FROM_ARTIFACT")
 FORK_FROM_PROJECT = os.environ.get("FORK_FROM_PROJECT")
 FORK_NOT_AFTER_STEP = os.environ.get("FORK_NOT_AFTER_STEP")
 
@@ -150,8 +152,8 @@ reflect microscopic differences in efficiency, formatting, and logic.
 SCORING BANDS:
 - 0.91 to 0.99: Correct action that follows the system prompt instructions exactly.
   (Higher decimals for optimal efficiency).
-- 0.61 to 0.89: Reasonable action but suboptimal (e.g., chose to wait when a
-  better, faster tool exists).
+- 0.61 to 0.89: Reasonable action but suboptimal (e.g., a safe wait when a
+  clearer, faster action likely exists, or a correct action taken slightly late).
 - 0.31 to 0.59: Wrong action that does not advance the goal but is not catastrophic.
 - 0.01 to 0.29: Clearly wrong action (premature hangup, wrong digit, wait on
   active prompt). (Lower decimals for fatal errors).
@@ -165,11 +167,13 @@ CRITICAL RULES (priority order):
    (digit not yet spoken). COMMON MISTAKE: "press 4. for your balance, loan terms..."
    does NOT mean press 4 for balance.
 3. hangup_and_extract({}) with empty args is normal. Do not penalize it.
-4. wait() is ONLY correct when the IVR is mid-monologue AND required fields are still
-   missing. If the IVR asked a question, presented a menu, or all fields are gathered,
-   wait = low score. IVRs deliver summaries as short sequential messages; even if the
-   last message is a complete sentence, if no question was asked, it may still be
-   mid-monologue.
+4. wait() is ONLY high-scoring when the IVR is clearly mid-monologue AND required
+   fields are still missing, or acting now would obviously be guessing. If a concrete
+   better action exists now, wait should usually score no higher than 0.55. If the
+   IVR asked a direct question, presented a menu, offered a concrete route, or all
+   required fields are already gathered, wait should usually score in 0.01 to 0.20.
+   Short ambiguous fragments can still justify wait, but unless the stream is clearly
+   incomplete and unsafe to act on, that wait should usually stay below 0.90.
 5. "No payment due" satisfies "next payment date and amount" ONLY, not "last payment."
    "Past due amount" is NOT "last payment." Be precise about field matching.
 6. "No recent payments on file" DOES satisfy "last payment" (answer is "none"), so the
@@ -221,6 +225,7 @@ def build_runtime_config() -> dict[str, Any]:
         "ruler_judge_model": RULER_JUDGE_MODEL,
         "min_reward_std": MIN_REWARD_STD,
         "aligned_tie_epsilon": ALIGNED_TIE_EPSILON,
+        "fork_from_artifact": FORK_FROM_ARTIFACT,
         "fork_from_model": FORK_FROM_MODEL,
         "fork_from_project": FORK_FROM_PROJECT,
         "fork_not_after_step": FORK_NOT_AFTER_STEP,
@@ -284,6 +289,323 @@ def tool_calls_match(choice: Choice, golden_msg: dict) -> bool:
     return model_tc == golden_tc
 
 
+
+
+def flatten_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return " ".join(flatten_message_content(part) for part in content)
+    if isinstance(content, dict):
+        if "text" in content:
+            return flatten_message_content(content["text"])
+        if "content" in content:
+            return flatten_message_content(content["content"])
+        return " ".join(
+            flatten_message_content(value)
+            for value in content.values()
+            if isinstance(value, (str, list, dict))
+        )
+    return ""
+
+
+def normalize_text(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def extract_user_texts(messages: list[dict]) -> list[str]:
+    texts: list[str] = []
+    for msg in messages:
+        if msg.get("role") != "user":
+            continue
+        text = normalize_text(flatten_message_content(msg.get("content", "")))
+        if text:
+            texts.append(text)
+    return texts
+
+
+def count_pattern_hits(text: str, patterns: list[str]) -> int:
+    return sum(1 for pattern in patterns if pattern in text)
+
+
+def classify_eval_row(messages: list[dict], tools: list[dict]) -> dict[str, Any]:
+    user_texts = extract_user_texts(messages)
+    last_user_text = user_texts[-1] if user_texts else ""
+    full_user_text = " ".join(user_texts)
+    tool_names = {tool.get("function", {}).get("name", "") for tool in tools}
+
+    keypad_entry = any(phrase in last_user_text for phrase in [
+        "using your keypad",
+        "using the keypad",
+        "enter your account number",
+        "enter your social security number",
+        "enter your ssn",
+        "enter your date of birth",
+        "key in your",
+        "please enter your",
+    ])
+    explicit_menu = (
+        bool(re.search(r"\bpress\s+\d+\b", last_user_text))
+        or "you can say" in last_user_text
+        or bool(re.search(r"\b(?:say|press)\s+[a-z0-9]", last_user_text))
+    )
+    direct_question = (
+        "?" in last_user_text
+        or any(phrase in last_user_text for phrase in [
+            "what you're calling about",
+            "please tell me what you're calling about",
+            "in a few words",
+            "how can i help",
+            "what can i help you with",
+            "what are you calling about",
+        ])
+    )
+    yes_no_prompt = any(phrase in last_user_text for phrase in [
+        "is that correct",
+        "yes or no",
+        "would you like",
+        "did i get that right",
+        "if yes",
+        "if no",
+    ])
+    likely_stuck_loop = count_pattern_hits(full_user_text, [
+        "i'm sorry",
+        "sorry, i",
+        "didn't get that",
+        "not sure i got that",
+        "let's try again",
+        "one more time",
+        "invalid",
+    ]) >= 2
+
+    balance_seen = any(phrase in full_user_text for phrase in [
+        "current balance",
+        "balance is $",
+        "your balance is",
+        "principal balance",
+        "payoff amount",
+        "available credit",
+    ])
+    last_payment_seen = any(phrase in full_user_text for phrase in [
+        "your last payment of",
+        "last payment of $",
+        "was received and credited",
+        "was received on",
+        "no recent payments on file",
+    ])
+    next_payment_seen = any(phrase in full_user_text for phrase in [
+        "next payment",
+        "payment amount and due date",
+        "no payment due",
+        "there's no payment due",
+        "past due amount",
+    ])
+    extractable_now = balance_seen and (last_payment_seen or next_payment_seen)
+    actionable_now = keypad_entry or explicit_menu or direct_question or yes_no_prompt
+
+    return {
+        "last_user_text": last_user_text,
+        "actionable_now": actionable_now,
+        "extractable_now": extractable_now,
+        "keypad_entry": keypad_entry,
+        "yes_no_prompt": yes_no_prompt,
+        "likely_stuck_loop": likely_stuck_loop,
+        "explicit_menu": explicit_menu,
+        "direct_question": direct_question,
+        "tool_names": sorted(name for name in tool_names if name),
+    }
+
+
+def percentile(values: list[float], p: float) -> float:
+    if not values:
+        return float("nan")
+    sorted_values = sorted(values)
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    pos = (len(sorted_values) - 1) * p
+    lower = int(pos)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = pos - lower
+    return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+
+
+def safe_rate(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return numerator / denominator
+
+
+def is_say_action(action: str | None) -> bool:
+    return bool(action and action.startswith("say_"))
+
+
+def summarize_holdout_failure_modes(holdout_results: list[dict[str, Any]]) -> dict[str, float]:
+    if not holdout_results:
+        return {}
+
+    metrics: dict[str, float] = {}
+    score_deltas = [float(r["score_delta"]) for r in holdout_results]
+    metrics["compare/score_delta_mean"] = statistics.mean(score_deltas)
+    metrics["compare/score_delta_median"] = statistics.median(score_deltas)
+    metrics["compare/score_delta_p10"] = percentile(score_deltas, 0.10)
+    metrics["compare/score_delta_p90"] = percentile(score_deltas, 0.90)
+
+    supports = {
+        "actionable_rows": sum(1 for r in holdout_results if r["actionable_now"]),
+        "extractable_rows": sum(1 for r in holdout_results if r["extractable_now"]),
+        "keypad_rows": sum(1 for r in holdout_results if r["keypad_entry"]),
+        "yes_no_rows": sum(1 for r in holdout_results if r["yes_no_prompt"]),
+        "stuck_loop_rows": sum(1 for r in holdout_results if r["likely_stuck_loop"]),
+    }
+    for name, count in supports.items():
+        metrics[f"support/{name}"] = float(count)
+
+    action_names = [
+        "wait",
+        "hangup_and_extract",
+        "enter_digit",
+        "say_no",
+        "navigation_failed",
+    ]
+    for actor in ("model", "gpt41"):
+        for action_name in action_names:
+            metrics[f"action_rate/{actor}/{action_name}"] = safe_rate(
+                sum(1 for r in holdout_results if r[f"{actor}_action"] == action_name),
+                len(holdout_results),
+            )
+
+        metrics[f"failure/{actor}/wait_on_actionable_rate"] = safe_rate(
+            sum(1 for r in holdout_results if r["actionable_now"] and r[f"{actor}_action"] == "wait"),
+            supports["actionable_rows"],
+        )
+        metrics[f"failure/{actor}/wait_after_completion_rate"] = safe_rate(
+            sum(1 for r in holdout_results if r["extractable_now"] and r[f"{actor}_action"] == "wait"),
+            supports["extractable_rows"],
+        )
+        metrics[f"failure/{actor}/missed_extract_rate"] = safe_rate(
+            sum(1 for r in holdout_results if r["extractable_now"] and r[f"{actor}_action"] != "hangup_and_extract"),
+            supports["extractable_rows"],
+        )
+        metrics[f"failure/{actor}/premature_extract_rate"] = safe_rate(
+            sum(1 for r in holdout_results if (not r["extractable_now"]) and r[f"{actor}_action"] == "hangup_and_extract"),
+            len(holdout_results) - supports["extractable_rows"],
+        )
+        metrics[f"failure/{actor}/speak_on_keypad_rate"] = safe_rate(
+            sum(1 for r in holdout_results if r["keypad_entry"] and is_say_action(r[f"{actor}_action"])),
+            supports["keypad_rows"],
+        )
+        metrics[f"failure/{actor}/say_no_misuse_rate"] = safe_rate(
+            sum(1 for r in holdout_results if (not r["yes_no_prompt"]) and r[f"{actor}_action"] == "say_no"),
+            len(holdout_results) - supports["yes_no_rows"],
+        )
+        metrics[f"failure/{actor}/navigation_failed_too_early_rate"] = safe_rate(
+            sum(1 for r in holdout_results if (not r["likely_stuck_loop"]) and r[f"{actor}_action"] == "navigation_failed"),
+            len(holdout_results) - supports["stuck_loop_rows"],
+        )
+        metrics[f"failure/{actor}/wait_loss_rate"] = safe_rate(
+            sum(
+                1
+                for r in holdout_results
+                if r[f"{actor}_action"] == "wait"
+                and r[f"{actor}_score"] + ALIGNED_TIE_EPSILON
+                < r["model_score" if actor == "gpt41" else "gpt41_score"]
+            ),
+            sum(1 for r in holdout_results if r[f"{actor}_action"] == "wait"),
+        )
+
+    metrics["failure/compare/model_wait_vs_gpt41_action_rate"] = safe_rate(
+        sum(1 for r in holdout_results if r["model_action"] == "wait" and r["gpt41_action"] not in {None, "wait"}),
+        len(holdout_results),
+    )
+    metrics["failure/compare/gpt41_wait_vs_model_action_rate"] = safe_rate(
+        sum(1 for r in holdout_results if r["gpt41_action"] == "wait" and r["model_action"] not in {None, "wait"}),
+        len(holdout_results),
+    )
+    return metrics
+
+
+def summarize_test_failure_modes(test_results: list[dict[str, Any]]) -> dict[str, float]:
+    if not test_results:
+        return {}
+
+    metrics: dict[str, float] = {}
+    supports = {
+        "actionable_rows": sum(1 for r in test_results if r["actionable_now"]),
+        "extractable_rows": sum(1 for r in test_results if r["extractable_now"]),
+        "keypad_rows": sum(1 for r in test_results if r["keypad_entry"]),
+        "yes_no_rows": sum(1 for r in test_results if r["yes_no_prompt"]),
+    }
+    for name, count in supports.items():
+        metrics[f"test/support/{name}"] = float(count)
+
+    model_action_count = sum(1 for r in test_results if r["model_action"] is not None)
+    metrics["test/failure/wrong_tool_rate"] = safe_rate(
+        sum(
+            1
+            for r in test_results
+            if r["model_action"] is not None
+            and r["golden_action"] is not None
+            and r["model_action"] != r["golden_action"]
+        ),
+        len(test_results),
+    )
+    metrics["test/failure/wrong_args_rate"] = safe_rate(
+        sum(
+            1
+            for r in test_results
+            if r["model_action"] is not None
+            and r["golden_action"] is not None
+            and r["model_action"] == r["golden_action"]
+            and not r["match"]
+        ),
+        len(test_results),
+    )
+    metrics["test/failure/wait_on_actionable_rate"] = safe_rate(
+        sum(1 for r in test_results if r["actionable_now"] and r["model_action"] == "wait"),
+        supports["actionable_rows"],
+    )
+    metrics["test/failure/speak_on_keypad_rate"] = safe_rate(
+        sum(1 for r in test_results if r["keypad_entry"] and is_say_action(r["model_action"])),
+        supports["keypad_rows"],
+    )
+    metrics["test/failure/say_no_misuse_rate"] = safe_rate(
+        sum(1 for r in test_results if (not r["yes_no_prompt"]) and r["model_action"] == "say_no"),
+        len(test_results) - supports["yes_no_rows"],
+    )
+    metrics["test/failure/missed_extract_rate"] = safe_rate(
+        sum(
+            1
+            for r in test_results
+            if r["extractable_now"]
+            and r["golden_action"] == "hangup_and_extract"
+            and r["model_action"] != "hangup_and_extract"
+        ),
+        sum(1 for r in test_results if r["extractable_now"] and r["golden_action"] == "hangup_and_extract"),
+    )
+    metrics["test/failure/enter_digit_arg_mismatch_rate"] = safe_rate(
+        sum(
+            1
+            for r in test_results
+            if r["model_action"] == "enter_digit"
+            and r["golden_action"] == "enter_digit"
+            and not r["match"]
+        ),
+        sum(1 for r in test_results if r["golden_action"] == "enter_digit"),
+    )
+    metrics["test/action_rate/model/wait"] = safe_rate(
+        sum(1 for r in test_results if r["model_action"] == "wait"),
+        len(test_results),
+    )
+    metrics["test/action_rate/model/hangup_and_extract"] = safe_rate(
+        sum(1 for r in test_results if r["model_action"] == "hangup_and_extract"),
+        len(test_results),
+    )
+    metrics["test/action_rate/model/enter_digit"] = safe_rate(
+        sum(1 for r in test_results if r["model_action"] == "enter_digit"),
+        len(test_results),
+    )
+    metrics["test/support/model_action_rows"] = float(model_action_count)
+    return metrics
 
 
 def insert_tool_responses(messages: list[dict]) -> list[dict]:
@@ -473,6 +795,7 @@ async def run_eval(
     async def eval_holdout_row(row: dict[str, Any]) -> dict[str, Any] | None:
         messages: list[dict] = row["input"]["messages"]
         tools: list[dict] = row["input"].get("tools") or []
+        row_features = classify_eval_row(messages, tools)
 
         async with model_semaphore:
             model_choices = await generate_response(model_client, get_inference_model_name(), messages, tools)
@@ -513,12 +836,17 @@ async def run_eval(
         model_score = scored.trajectories[0].reward
         gpt41_score = scored.trajectories[1].reward
         score_delta = model_score - gpt41_score
+        model_tc = choice_to_tool_name_and_args(model_choice)
+        gpt41_tc = choice_to_tool_name_and_args(gpt41_choice)
         return {
             "model_score": model_score,
             "gpt41_score": gpt41_score,
             "score_delta": score_delta,
             "win": score_delta > ALIGNED_TIE_EPSILON,
             "tie": abs(score_delta) <= ALIGNED_TIE_EPSILON,
+            "model_action": model_tc[0] if model_tc else None,
+            "gpt41_action": gpt41_tc[0] if gpt41_tc else None,
+            **row_features,
         }
 
     async def eval_test_row(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -528,6 +856,7 @@ async def run_eval(
         context, golden_msg = split_context_and_golden(messages)
         if golden_msg is None:
             return None
+        row_features = classify_eval_row(context, tools)
 
         async with model_semaphore:
             model_choices = await generate_response(model_client, get_inference_model_name(), context, tools)
@@ -548,6 +877,7 @@ async def run_eval(
             "tie": tie,
             "model_action": model_tc[0] if model_tc else None,
             "golden_action": golden_tc[0] if golden_tc else None,
+            **row_features,
         }
 
     with eval_builder.activate_context():
@@ -569,21 +899,45 @@ async def run_eval(
         h_win_rate  = wins / h_n
         h_tie_rate  = ties / h_n
         h_win_tie_rate = (wins + ties) / h_n
+        holdout_failure_metrics = summarize_holdout_failure_modes(holdout_results)
     else:
         h_win_rate, h_tie_rate, h_win_tie_rate, h_n = float("nan"), float("nan"), float("nan"), 0
+        holdout_failure_metrics = {}
 
     if test_results:
         t_match_rate = sum(r["match"] for r in test_results) / len(test_results)
         t_tie_rate   = sum(r["tie"]   for r in test_results) / len(test_results)
         t_n = len(test_results)
+        test_failure_metrics = summarize_test_failure_modes(test_results)
     else:
         t_match_rate, t_tie_rate, t_n = float("nan"), float("nan"), 0
+        test_failure_metrics = {}
 
     print(f"  Holdout RULER win rate      : {h_win_rate:.1%}  (n={h_n})")
     print(f"  Holdout RULER tie rate      : {h_tie_rate:.1%}  (n={h_n})")
     print(f"  Holdout RULER win+tie rate  : {h_win_tie_rate:.1%}  (n={h_n})")
+    if holdout_failure_metrics:
+        print(
+            "  Failure modes              : "
+            f"model wait/actionable={holdout_failure_metrics.get('failure/model/wait_on_actionable_rate', 0.0):.1%}  "
+            f"model missed extract={holdout_failure_metrics.get('failure/model/missed_extract_rate', 0.0):.1%}  "
+            f"model speak/keypad={holdout_failure_metrics.get('failure/model/speak_on_keypad_rate', 0.0):.1%}"
+        )
+        print(
+            "                               "
+            f"gpt41 wait/actionable={holdout_failure_metrics.get('failure/gpt41/wait_on_actionable_rate', 0.0):.1%}  "
+            f"gpt41 missed extract={holdout_failure_metrics.get('failure/gpt41/missed_extract_rate', 0.0):.1%}  "
+            f"delta mean={holdout_failure_metrics.get('compare/score_delta_mean', float('nan')):.3f}"
+        )
     print(f"  Test    match rate          : {t_match_rate:.1%}  (n={t_n})")
     print(f"  Test    tie rate            : {t_tie_rate:.1%}  (n={t_n})")
+    if test_failure_metrics:
+        print(
+            "  Test failures              : "
+            f"wrong tool={test_failure_metrics.get('test/failure/wrong_tool_rate', 0.0):.1%}  "
+            f"wrong args={test_failure_metrics.get('test/failure/wrong_args_rate', 0.0):.1%}  "
+            f"wait/actionable={test_failure_metrics.get('test/failure/wait_on_actionable_rate', 0.0):.1%}"
+        )
 
     await model.log(
         [],
@@ -591,6 +945,7 @@ async def run_eval(
             "ruler_win_rate": h_win_rate,
             "ruler_tie_rate": h_tie_rate,
             "ruler_win_tie_rate": h_win_tie_rate,
+            **holdout_failure_metrics,
         },
         step=step,
         split="val",
@@ -600,6 +955,7 @@ async def run_eval(
         metrics={
             "test/golden_match_rate": t_match_rate,
             "test/tie_rate": t_tie_rate,
+            **test_failure_metrics,
         },
         step=step,
         split="test",
@@ -612,6 +968,8 @@ async def run_eval(
             "step": step,
             "holdout": {"win_rate": h_win_rate, "tie_rate": h_tie_rate, "win_tie_rate": h_win_tie_rate, "n": h_n},
             "test": {"match_rate": t_match_rate, "n": t_n},
+            "holdout_diagnostics": holdout_failure_metrics,
+            "test_diagnostics": test_failure_metrics,
         }, f)
     print(f"  Logged -> {log_path}")
 
@@ -639,11 +997,12 @@ async def train(model: art.TrainableModel) -> None:
             },
         )
 
-        if FORK_FROM_MODEL:
+        if FORK_FROM_MODEL or FORK_FROM_ARTIFACT:
             await backend._experimental_fork_checkpoint(
                 model=model,
                 from_model=FORK_FROM_MODEL,
                 from_project=FORK_FROM_PROJECT or PROJECT_NAME,
+                from_wandb_artifact=FORK_FROM_ARTIFACT,
                 not_after_step=int(FORK_NOT_AFTER_STEP) if FORK_NOT_AFTER_STEP else None,
                 verbose=True,
             )
