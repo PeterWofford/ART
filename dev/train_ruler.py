@@ -133,26 +133,56 @@ RULER_EVAL_CONCURRENCY = 50        # max simultaneous RULER calls during eval
 
 # Drop training groups where all RULER scores are nearly equal (no learning signal)
 MIN_REWARD_STD = float(os.environ.get("MIN_REWARD_STD", "0.1"))
+FORK_FROM_MODEL = os.environ.get("FORK_FROM_MODEL")
+FORK_FROM_PROJECT = os.environ.get("FORK_FROM_PROJECT")
+FORK_NOT_AFTER_STEP = os.environ.get("FORK_NOT_AFTER_STEP")
 
 EVAL_LOG_DIR = Path(f"eval_logs/{MODEL_NAME}")
 
 RULER_RUBRIC = """\
 An AI agent is navigating a bank IVR phone system step-by-step.
-At each step, the agent should call exactly the right tool given what the IVR just said.
+Evaluate each trajectory and assign a continuous float score between 0.00 and 1.00.
 
-Score each trajectory based on how correctly the agent picks the tool for this step:
-- HIGH score: correct tool with correct arguments (right digit, right hangup timing, etc.)
-- MEDIUM score: nearly right but with a minor issue
-- LOW score: wrong tool, or clearly wrong arguments
-- VERY LOW score: malformed tool call or no tool call at all
+CRITICAL INSTRUCTION: You MUST use two decimal places (e.g., 0.83, 0.42, 0.96).
+DO NOT use clean round numbers like 0.80 or 1.00. Use the hundredths place to
+reflect microscopic differences in efficiency, formatting, and logic.
 
-Key correctness criteria:
-- wait() only when IVR sentence is clearly mid-phrase or incomplete
-- enter_digit(n) only when IVR explicitly offered numbered options, with the right digit for the goal
-- hangup_and_extract only AFTER target info is fully stated
-- hangup_without_extraction only when info truly cannot be obtained via IVR
-- navigation_failed only when forwarded to a rep or account is unreachable
+SCORING BANDS:
+- 0.91 to 0.99: Correct action that follows the system prompt instructions exactly.
+  (Higher decimals for optimal efficiency).
+- 0.61 to 0.89: Reasonable action but suboptimal (e.g., chose to wait when a
+  better, faster tool exists).
+- 0.31 to 0.59: Wrong action that does not advance the goal but is not catastrophic.
+- 0.01 to 0.29: Clearly wrong action (premature hangup, wrong digit, wait on
+  active prompt). (Lower decimals for fatal errors).
+
+CRITICAL RULES (priority order):
+1. The agent's system prompt is authoritative: it specifies which fields to gather
+   and often gives specific navigation instructions. Following them = high score.
+2. IVR messages stream in real-time and may split across turns. A digit at the START
+   of a message completes the PREVIOUS option, not the next one. Example:
+   "press 4. for your balance..." means 4 = previous option, balance = next option
+   (digit not yet spoken). COMMON MISTAKE: "press 4. for your balance, loan terms..."
+   does NOT mean press 4 for balance.
+3. hangup_and_extract({}) with empty args is normal. Do not penalize it.
+4. wait() is ONLY correct when the IVR is mid-monologue AND required fields are still
+   missing. If the IVR asked a question, presented a menu, or all fields are gathered,
+   wait = low score. IVRs deliver summaries as short sequential messages; even if the
+   last message is a complete sentence, if no question was asked, it may still be
+   mid-monologue.
+5. "No payment due" satisfies "next payment date and amount" ONLY, not "last payment."
+   "Past due amount" is NOT "last payment." Be precise about field matching.
+6. "No recent payments on file" DOES satisfy "last payment" (answer is "none"), so the
+   agent should hangup_and_extract, not navigation_failed.
+7. navigation_failed is acceptable for stuck loops (3+ repeated attempts), but NOT for
+   ambiguous IVR fragments that might be mid-speech.
+8. Judge ONLY the current action, not previous mistakes in the trajectory.
+9. Voice menus ("you can say ...") may accept digit input, so do not penalize positional
+   digit selection if the target option is correct.
+10. Only reference instructions that ACTUALLY EXIST in the agent's system prompt.
+    Do NOT hallucinate or infer instructions not explicitly written there.
 """
+ALIGNED_TIE_EPSILON = float(os.environ.get("ALIGNED_TIE_EPSILON", "0.03"))
 
 
 # -- Helpers --------------------------------------------------------------------
@@ -188,6 +218,10 @@ def build_runtime_config() -> dict[str, Any]:
         "save_checkpoint": SAVE_CHECKPOINT,
         "ruler_judge_model": RULER_JUDGE_MODEL,
         "min_reward_std": MIN_REWARD_STD,
+        "aligned_tie_epsilon": ALIGNED_TIE_EPSILON,
+        "fork_from_model": FORK_FROM_MODEL,
+        "fork_from_project": FORK_FROM_PROJECT,
+        "fork_not_after_step": FORK_NOT_AFTER_STEP,
         "gpt41_model": GPT41_MODEL,
         "train_path": str(TRAIN_PATH),
         "test_path": str(TEST_PATH),
@@ -459,6 +493,7 @@ async def run_eval(
             scored = await ruler_score_group(
                 group,
                 RULER_JUDGE_MODEL,
+                rubric=RULER_RUBRIC,
                 swallow_exceptions=True,
                 debug=False,
             )
@@ -467,11 +502,13 @@ async def run_eval(
 
         model_score = scored.trajectories[0].reward
         gpt41_score = scored.trajectories[1].reward
+        score_delta = model_score - gpt41_score
         return {
             "model_score": model_score,
             "gpt41_score": gpt41_score,
-            "win": model_score > gpt41_score,
-            "tie": model_score == gpt41_score,
+            "score_delta": score_delta,
+            "win": score_delta > ALIGNED_TIE_EPSILON,
+            "tie": abs(score_delta) <= ALIGNED_TIE_EPSILON,
         }
 
     async def eval_test_row(row: dict[str, Any]) -> dict[str, Any] | None:
@@ -589,6 +626,15 @@ async def train(model: art.TrainableModel) -> None:
             }
         },
     )
+
+    if FORK_FROM_MODEL:
+        await backend._experimental_fork_checkpoint(
+            model=model,
+            from_model=FORK_FROM_MODEL,
+            from_project=FORK_FROM_PROJECT or PROJECT_NAME,
+            not_after_step=int(FORK_NOT_AFTER_STEP) if FORK_NOT_AFTER_STEP else None,
+            verbose=True,
+        )
 
     model_client = model.openai_client()
 
@@ -765,6 +811,7 @@ async def train(model: art.TrainableModel) -> None:
                 scored = await ruler_score_group(
                     group,
                     RULER_JUDGE_MODEL,
+                    rubric=RULER_RUBRIC,
                     swallow_exceptions=True,
                     debug=False,
                 )

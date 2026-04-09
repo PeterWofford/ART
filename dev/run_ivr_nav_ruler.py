@@ -62,6 +62,9 @@ parser.add_argument("--aux-file", type=str, default=DEFAULT_AUX_FILE)
 parser.add_argument("--skip-validation", action="store_true")
 parser.add_argument("--dry-run", action="store_true")
 parser.add_argument("--pipeline-pilot", action="store_true")
+parser.add_argument("--fork-from-model", type=str, default=None)
+parser.add_argument("--fork-from-project", type=str, default=None)
+parser.add_argument("--fork-not-after-step", type=int, default=None)
 parser.add_argument(
     "--tail-logs",
     action=argparse.BooleanOptionalAction,
@@ -152,6 +155,12 @@ if args.train_limit is not None:
     runtime_env["TRAIN_LIMIT"] = str(args.train_limit)
 if args.max_steps is not None:
     runtime_env["MAX_STEPS"] = str(args.max_steps)
+if args.fork_from_model:
+    runtime_env["FORK_FROM_MODEL"] = args.fork_from_model
+if args.fork_from_project:
+    runtime_env["FORK_FROM_PROJECT"] = args.fork_from_project
+if args.fork_not_after_step is not None:
+    runtime_env["FORK_NOT_AFTER_STEP"] = str(args.fork_not_after_step)
 
 
 def render_env_block(env: dict[str, str]) -> str:
@@ -232,6 +241,9 @@ effective_config = {
     "min_reward_std": args.min_reward_std,
     "save_checkpoint": args.save_checkpoint,
     "pipeline_pilot": args.pipeline_pilot,
+    "fork_from_model": args.fork_from_model,
+    "fork_from_project": args.fork_from_project,
+    "fork_not_after_step": args.fork_not_after_step,
     "skip_validation": args.skip_validation,
     "dry_run": args.dry_run,
     "tail_logs": args.tail_logs,
