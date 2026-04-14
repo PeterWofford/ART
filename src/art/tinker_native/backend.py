@@ -94,6 +94,18 @@ class DistillationWorkItem(NamedTuple):
     teacher_prompt: Any
     prompt_messages: list[dict[str, Any]]
     teacher_system_prompt: str
+    reward: float = 0.0
+
+
+class PiDistillWorkItem(NamedTuple):
+    """Work item for π-Distill: one per history in a teacher-sampled trajectory."""
+    group_idx: int
+    traj_reward: float
+    teacher_prompt_tokens: list[int]
+    student_prompt_tokens: list[int]
+    completion_tokens: list[int]
+    teacher_logprobs: list[float]  # π_T_old logprobs (IS denominator for both datums)
+    student_prompt: Any  # renderer prompt object, used for compute_logprobs
 
 
 @dataclass
@@ -370,6 +382,7 @@ class TinkerNativeBackend(Backend):
         learning_rate: float = 1e-5,
         loss_fn: str = "importance_sampling",
         normalize_advantages: bool = False,
+        grpo_weight: float = 0.0,
         save_checkpoint: bool = False,
         loss_fn_config: dict | None = None,
         adam_params: tinker.AdamParams | None = None,
@@ -418,6 +431,7 @@ class TinkerNativeBackend(Backend):
             state,
             prompts_list,
             normalize_advantages,
+            grpo_weight=grpo_weight,
         )
 
         metrics: dict[str, float] = {
@@ -434,7 +448,7 @@ class TinkerNativeBackend(Backend):
         metrics["train_tokens"] = float(train_tokens)
         pricing = get_model_pricing(model.base_model)
         if pricing is not None:
-            metrics["costs_train"] = compute_train_cost(train_tokens, pricing)
+            metrics["costs/train/tinker_train"] = compute_train_cost(train_tokens, pricing)
 
         if adam_params is None:
             adam_params = tinker.AdamParams(
@@ -474,12 +488,16 @@ class TinkerNativeBackend(Backend):
             for key, value in forward_output.metrics.items():
                 if value is None:
                     continue
-                metrics[key] = float(value)
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
         if optim_output.metrics:
             for key, value in optim_output.metrics.items():
                 if value is None:
                     continue
-                metrics[key] = float(value)
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
 
         next_step = state.current_step + 1
         checkpoint_name = f"step_{next_step:06d}"
@@ -507,12 +525,395 @@ class TinkerNativeBackend(Backend):
 
         return TrainResult(step=state.current_step, metrics=metrics)
 
+    async def train_with_pi_distill(  # type: ignore[override]
+        self,
+        model: TrainableModel,
+        trajectory_groups: Iterable[TrajectoryGroup],
+        *,
+        teacher_system_prompts: str | list[str] = "",
+        student_system_prompts: str | list[str] = "",
+        pi_as_last_message: bool = False,
+        alpha: float = 0.5,
+        beta: float = 0.25,
+        learning_rate: float = 1e-5,
+        loss_fn: str = "importance_sampling",
+        normalize_advantages: bool = True,
+        save_checkpoint: bool = False,
+        loss_fn_config: dict | None = None,
+        adam_params: tinker.AdamParams | None = None,
+    ) -> TrainResult:
+        """Train using π-Distill (Penaloza et al., arXiv:2602.04942).
+
+        Jointly trains teacher (with privileged information in system prompt) and student
+        (without PI) on the same teacher-sampled completions. The teacher's reward includes
+        a KL penalty keeping it near the student; the student learns via off-policy GRPO
+        with the teacher's old logprobs as the IS denominator.
+
+        For each trajectory (sampled with PI-augmented teacher policy):
+          1. Extract completion tokens and teacher old logprobs from the Choice
+          2. Compute student logprobs for the same completion (current π_S, stop-grad)
+          3. KL(π_T || π_S) ≈ mean(teacher_logp[t] - student_logp[t]) over sampled tokens
+          4. modified_reward = R_env - β * KL(π_T || π_S)
+          5. Teacher datum: teacher prompt, IS denom = π_T_old, advantage = α * normalized
+          6. Student datum: student prompt, IS denom = π_T_old, advantage = (1-α) * normalized
+
+        Args:
+            model: The trainable model
+            trajectory_groups: Groups sampled using the PI-augmented teacher policy
+            teacher_system_prompts: PI-augmented system prompt. Used when pi_as_last_message=False.
+                Single string or list of strings (one per group).
+            student_system_prompts: Student system prompt without PI. Used when pi_as_last_message=False.
+                Single string or list of strings (one per group).
+            pi_as_last_message: If True, the PI is already appended as the last system message in
+                the trajectory. Teacher prompt tokens are taken directly from the trajectory;
+                student prompt tokens are derived by stripping that last system message.
+                teacher_system_prompts/student_system_prompts are ignored in this mode.
+            alpha: Teacher/student mix. 0=student only, 0.5=joint, 1=teacher only.
+            beta: KL penalty coefficient (0.25 recommended).
+            learning_rate: Learning rate for optimization
+            loss_fn: Loss function (default: "importance_sampling")
+            normalize_advantages: Whether to normalize advantages within each group
+            save_checkpoint: Whether to save full checkpoint
+            loss_fn_config: Additional loss function configuration
+            adam_params: Adam optimizer parameters
+        """
+        state = self._model_state[model.name]
+        groups_list = list(trajectory_groups)
+        summary = summarize_trajectory_groups(groups_list)
+
+        if isinstance(teacher_system_prompts, str):
+            teacher_prompts_list = [teacher_system_prompts] * len(groups_list)
+        else:
+            teacher_prompts_list = list(teacher_system_prompts)
+            if len(teacher_prompts_list) != len(groups_list):
+                raise ValueError(
+                    f"Number of teacher_system_prompts ({len(teacher_prompts_list)}) must match "
+                    f"number of trajectory_groups ({len(groups_list)})"
+                )
+
+        if isinstance(student_system_prompts, str):
+            student_prompts_list = [student_system_prompts] * len(groups_list)
+        else:
+            student_prompts_list = list(student_system_prompts)
+            if len(student_prompts_list) != len(groups_list):
+                raise ValueError(
+                    f"Number of student_system_prompts ({len(student_prompts_list)}) must match "
+                    f"number of trajectory_groups ({len(groups_list)})"
+                )
+
+        datums = await self._build_pi_distill_datums(
+            groups_list,
+            state,
+            teacher_prompts_list,
+            student_prompts_list,
+            alpha=alpha,
+            beta=beta,
+            normalize_advantages=normalize_advantages,
+            pi_as_last_message=pi_as_last_message,
+        )
+
+        metrics: dict[str, float] = {
+            **build_training_summary_metrics(
+                summary,
+                include_trainable_groups=True,
+            ),
+            "data/step_num_datums": float(len(datums)),
+        }
+
+        if not datums:
+            return TrainResult(step=state.current_step, metrics=metrics)
+
+        train_tokens = 0
+        for datum in datums:
+            train_tokens += len(datum.model_input.to_ints())
+        metrics["data/step_trainer_tokens"] = float(train_tokens)
+        pricing = get_model_pricing(model.base_model)
+        if pricing is not None:
+            metrics["costs/train/tinker_train"] = compute_train_cost(train_tokens, pricing)
+        trainer_started = time.monotonic()
+
+        if adam_params is None:
+            adam_params = tinker.AdamParams(
+                learning_rate=learning_rate,
+                beta1=0.9,
+                beta2=0.95,
+                eps=1e-8,
+            )
+
+        def remove_mask(datum: tinker.Datum) -> tinker.Datum:
+            if "mask" not in datum.loss_fn_inputs:
+                return datum
+            loss_fn_inputs = {
+                key: value
+                for key, value in datum.loss_fn_inputs.items()
+                if key != "mask"
+            }
+            return tinker.Datum(
+                model_input=datum.model_input, loss_fn_inputs=loss_fn_inputs
+            )
+
+        forward_output = await self._tinker_train_call(
+            "forward_backward",
+            state.training_client.forward_backward(
+                [remove_mask(datum) for datum in datums],
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+            ),
+        )
+        optim_output = await self._tinker_train_call(
+            "optim_step", state.training_client.optim_step(adam_params)
+        )
+
+        if forward_output.metrics:
+            for key, value in forward_output.metrics.items():
+                if value is None:
+                    continue
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
+        if optim_output.metrics:
+            for key, value in optim_output.metrics.items():
+                if value is None:
+                    continue
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
+
+        next_step = state.current_step + 1
+        checkpoint_name = f"step_{next_step:06d}"
+
+        if save_checkpoint:
+            state_response, sampler_response = await self._save_checkpoint(
+                state.training_client, checkpoint_name
+            )
+            state.training_checkpoint_paths[next_step] = state_response.path
+        else:
+            sampler_response = await self._save_sampler_weights(
+                state.training_client, checkpoint_name
+            )
+        sampler_client = await self._tinker_train_call(
+            "create_sampling_client_async",
+            state.training_client.create_sampling_client_async(
+                model_path=sampler_response.path
+            ),
+        )
+        state.sampler_clients[next_step] = sampler_client
+        state.sampler_checkpoint_paths[next_step] = sampler_response.path
+
+        state.current_step = next_step
+        self._persist_model_state(model, state)
+        metrics["time/step_trainer_s"] = time.monotonic() - trainer_started
+
+        return TrainResult(step=state.current_step, metrics=metrics)
+
+    async def _build_pi_distill_datums(
+        self,
+        trajectory_groups: list[TrajectoryGroup],
+        state: ModelState,
+        teacher_system_prompts: list[str],
+        student_system_prompts: list[str],
+        alpha: float,
+        beta: float,
+        normalize_advantages: bool,
+        pi_as_last_message: bool = False,
+    ) -> list[tinker.Datum]:
+        """Build teacher and student datums for π-Distill.
+
+        For each group:
+          1. Collect work items: teacher/student prompt tokens, completions, teacher logprobs
+          2. Batch-compute student logprobs under current π_S (stop-grad reference)
+          3. Compute modified rewards = R_env - β * KL(π_T || π_S)
+          4. Normalize advantages within each group
+          5. Build alpha-scaled teacher datum and (1-alpha)-scaled student datum per trajectory
+        """
+        from collections import defaultdict
+
+        from .data import (
+            build_datum,
+            compute_advantages,
+            extract_logprobs_from_choice,
+            find_last_choice,
+            iter_trajectory_histories,
+        )
+
+        sampler_client = state.sampler_clients[state.current_step]
+
+        # First pass: collect work items
+        work_items: list[PiDistillWorkItem] = []
+
+        for group_idx, (group, teacher_sys, student_sys) in enumerate(
+            zip(trajectory_groups, teacher_system_prompts, student_system_prompts)
+        ):
+            if not group.trajectories:
+                continue
+
+            for trajectory in group.trajectories:
+                for history in iter_trajectory_histories(trajectory):
+                    choice_info = find_last_choice(history.messages_and_choices)
+                    if choice_info is None:
+                        continue
+                    choice_idx, choice = choice_info
+
+                    completion_tokens, teacher_logprobs = extract_logprobs_from_choice(
+                        choice, state.tokenizer
+                    )
+                    if not completion_tokens or len(completion_tokens) != len(teacher_logprobs):
+                        continue
+
+                    prompt_messages = cast(
+                        list[dict[str, Any]],
+                        get_messages(history.messages_and_choices[:choice_idx]),
+                    )
+
+                    if pi_as_last_message:
+                        # Teacher = trajectory messages as-is (PI is the last system message)
+                        teacher_messages = list(prompt_messages)
+                        # Student = strip the last system message (the PI)
+                        student_messages = list(prompt_messages)
+                        for i in range(len(student_messages) - 1, -1, -1):
+                            if student_messages[i].get("role") == "system":
+                                student_messages.pop(i)
+                                break
+                    else:
+                        teacher_messages = self._modify_system_prompt(prompt_messages, teacher_sys)
+                        student_messages = self._modify_system_prompt(prompt_messages, student_sys)
+
+                    teacher_renderer_msgs = convert_openai_messages_to_renderer_format(
+                        messages=teacher_messages,
+                        tools=cast(list[dict[str, Any]] | None, history.tools),
+                        renderer=state.renderer,
+                    )
+                    teacher_prompt_obj = state.renderer.build_generation_prompt(teacher_renderer_msgs)
+
+                    student_renderer_msgs = convert_openai_messages_to_renderer_format(
+                        messages=student_messages,
+                        tools=cast(list[dict[str, Any]] | None, history.tools),
+                        renderer=state.renderer,
+                    )
+                    student_prompt_obj = state.renderer.build_generation_prompt(student_renderer_msgs)
+
+                    work_items.append(PiDistillWorkItem(
+                        group_idx=group_idx,
+                        traj_reward=trajectory.reward,
+                        teacher_prompt_tokens=list(teacher_prompt_obj.to_ints()),
+                        student_prompt_tokens=list(student_prompt_obj.to_ints()),
+                        completion_tokens=completion_tokens,
+                        teacher_logprobs=teacher_logprobs,
+                        student_prompt=student_prompt_obj,
+                    ))
+
+        if not work_items:
+            return []
+
+        # Second pass: batch-compute student logprobs under current π_S (stop-grad)
+        student_logprob_results = await self._compute_student_logprobs_batch(
+            sampler_client,
+            [(item.student_prompt, item.completion_tokens) for item in work_items],
+        )
+
+        # Third pass: compute modified rewards and track valid items per group
+        group_item_indices: dict[int, list[int]] = defaultdict(list)
+        modified_rewards: list[float] = [float("nan")] * len(work_items)
+
+        for i, (item, student_logprobs) in enumerate(
+            zip(work_items, student_logprob_results)
+        ):
+            if student_logprobs is None:
+                continue
+            # KL(π_T || π_S) ≈ mean(teacher_logp[t] - student_logp[t]) over sampled tokens
+            kl_seq = sum(
+                t - s for t, s in zip(item.teacher_logprobs, student_logprobs)
+            ) / max(1, len(item.completion_tokens))
+            modified_rewards[i] = item.traj_reward - beta * kl_seq
+            group_item_indices[item.group_idx].append(i)
+
+        # Fourth pass: normalize advantages within each group
+        item_advantages: list[float] = [0.0] * len(work_items)
+        for group_idx, indices in group_item_indices.items():
+            group_rewards = [modified_rewards[i] for i in indices]
+            group_advantages = compute_advantages(group_rewards, normalize_advantages)
+            if all(a == 0.0 for a in group_advantages):
+                continue
+            for idx, adv in zip(indices, group_advantages):
+                item_advantages[idx] = adv
+
+        # Fifth pass: build teacher and student datums
+        datums: list[tinker.Datum] = []
+
+        for i, item in enumerate(work_items):
+            adv = item_advantages[i]
+            if adv == 0.0:
+                continue
+
+            # Teacher datum: IS = π_T_current / π_T_old, advantage scaled by alpha
+            if alpha > 0.0:
+                teacher_datum = build_datum(
+                    prompt_tokens=item.teacher_prompt_tokens,
+                    completion_tokens=item.completion_tokens,
+                    logprobs=item.teacher_logprobs,
+                    advantage=alpha * adv,
+                )
+                if teacher_datum is not None:
+                    datums.append(teacher_datum)
+
+            # Student datum: IS = π_S_current / π_T_old, advantage scaled by (1-alpha)
+            if alpha < 1.0:
+                student_datum = build_datum(
+                    prompt_tokens=item.student_prompt_tokens,
+                    completion_tokens=item.completion_tokens,
+                    logprobs=item.teacher_logprobs,  # IS denominator is always π_T_old
+                    advantage=(1.0 - alpha) * adv,
+                )
+                if student_datum is not None:
+                    datums.append(student_datum)
+
+        return datums
+
+    async def _compute_student_logprobs_batch(
+        self,
+        sampler_client: tinker.SamplingClient,
+        items: list[tuple[Any, list[int]]],  # [(student_prompt, completion_tokens), ...]
+    ) -> list[list[float] | None]:
+        """Batch-compute completion logprobs under student prompts.
+
+        Kicks off all futures before awaiting so all requests run in parallel.
+        """
+        # Kick off all futures before awaiting any
+        futures = []
+        prompt_lens = []
+        for student_prompt, completion_tokens in items:
+            prompt_tokens = list(student_prompt.to_ints())
+            prompt_lens.append(len(prompt_tokens))
+            all_tokens = prompt_tokens + completion_tokens
+            model_input = tinker.ModelInput.from_ints(tokens=all_tokens)
+            futures.append(sampler_client.compute_logprobs(model_input))
+
+        async def get_result(
+            future: Any, prompt_len: int, completion_len: int
+        ) -> list[float] | None:
+            try:
+                all_logprobs = await asyncio.to_thread(future.result)
+                completion_logprobs = all_logprobs[prompt_len : prompt_len + completion_len]
+                if any(lp is None for lp in completion_logprobs):
+                    return None
+                return cast(list[float], list(completion_logprobs))
+            except Exception as e:
+                print(f"Error computing student logprobs: {e}")
+                return None
+
+        results = await asyncio.gather(*[
+            get_result(futures[i], prompt_lens[i], len(items[i][1]))
+            for i in range(len(items))
+        ])
+        return list(results)
+
     async def _trajectory_groups_to_datums_with_teacher_logprobs(
         self,
         trajectory_groups: list[TrajectoryGroup],
         state: ModelState,
         teacher_system_prompts: list[str],
         normalize_advantages: bool,
+        grpo_weight: float = 0.0,
     ) -> list[tinker.Datum]:
         """Convert trajectory groups to datums using distribution-level KL distillation.
 
@@ -524,6 +925,7 @@ class TinkerNativeBackend(Backend):
         associate teacher prompts with trajectories.
         """
         from .data import (
+            compute_advantages,
             convert_openai_messages_to_renderer_format,
             extract_logprobs_from_choice,
             find_last_choice,
@@ -571,8 +973,8 @@ class TinkerNativeBackend(Backend):
                     )
                     prompt_tokens = list(student_prompt.to_ints())
 
-                    # Build teacher prompt with modified system prompt
-                    teacher_messages = self._modify_system_prompt(
+                    # Build teacher prompt: keep original system, insert PI before last turn
+                    teacher_messages = self._insert_pi_before_last(
                         prompt_messages, teacher_system_prompt
                     )
                     teacher_renderer_messages = convert_openai_messages_to_renderer_format(
@@ -594,6 +996,7 @@ class TinkerNativeBackend(Backend):
                         teacher_prompt=teacher_prompt,
                         prompt_messages=prompt_messages,
                         teacher_system_prompt=teacher_system_prompt,
+                        reward=trajectory.reward,
                     ))
 
         # Second pass: compute all top-k distributions in batch
@@ -701,12 +1104,38 @@ class TinkerNativeBackend(Backend):
             print(f"Top-k KL(student||teacher) - mean: {kl_array.mean():.4f}, std: {kl_array.std():.4f}, min: {kl_array.min():.4f}, max: {kl_array.max():.4f}")
             print("=" * 80)
 
+        # GRPO datums: z-scored reward advantage on student's actual completions
+        if grpo_weight > 0.0:
+            from collections import defaultdict
+            from .data import build_datum
+            group_items_map: dict[int, list[DistillationWorkItem]] = defaultdict(list)
+            for item in work_items:
+                group_items_map[item.group_idx].append(item)
+
+            grpo_count = 0
+            for g_items in group_items_map.values():
+                rewards = [it.reward for it in g_items]
+                advantages = compute_advantages(rewards, normalize_advantages=True)
+                for it, adv in zip(g_items, advantages):
+                    if adv == 0.0:
+                        continue
+                    grpo_datum = build_datum(
+                        prompt_tokens=it.prompt_tokens,
+                        completion_tokens=it.completion_tokens,
+                        logprobs=it.student_logprobs,
+                        advantage=adv * grpo_weight,
+                    )
+                    if grpo_datum is not None:
+                        datums.append(grpo_datum)
+                        grpo_count += 1
+            print(f"Added {grpo_count} GRPO datums (grpo_weight={grpo_weight})")
+
         return datums
 
     def _modify_system_prompt(
         self, messages: list[dict[str, Any]], new_system_prompt: str
     ) -> list[dict[str, Any]]:
-        """Ensure the system prompt is inserted right before the last message."""
+        """Replace all system messages with new_system_prompt inserted before the last message."""
         # Remove any existing system messages
         modified = [m for m in messages if m.get("role") != "system"]
 
@@ -717,6 +1146,15 @@ class TinkerNativeBackend(Backend):
         modified.insert(insert_at, system_msg)
 
         return modified
+
+    def _insert_pi_before_last(
+        self, messages: list[dict[str, Any]], pi_content: str
+    ) -> list[dict[str, Any]]:
+        """Insert a PI system message right before the last message, preserving existing system messages."""
+        result = list(messages)
+        insert_at = max(len(result) - 1, 0)
+        result.insert(insert_at, {"role": "system", "content": pi_content})
+        return result
 
 
     async def _compute_topk_distributions_batch(
@@ -916,6 +1354,7 @@ class TinkerNativeBackend(Backend):
         student_tail_mass: list[float],
         teacher_tail_mass: list[float],
         trajectory_id: int = 0,
+        reward_scale: float = 1.0,
     ) -> list[tinker.Datum]:
         """Build k datums for top-k SDPO with probability-weighted advantages.
 
@@ -937,7 +1376,7 @@ class TinkerNativeBackend(Backend):
         if not prompt_tokens or not completion_tokens:
             return []
 
-        k = min(5, len(student_topk[0]) if student_topk else 20)  # Limit k to avoid too many datums
+        k = min(1, len(student_topk[0]) if student_topk else 20)  # Limit k to avoid too many datums
 
         # Build input tokens
         ob_len = max(len(prompt_tokens) - 1, 0)
@@ -1000,10 +1439,10 @@ class TinkerNativeBackend(Backend):
                             teacher_logp = math.log(max(1e-10, teacher_tail_mass[completion_pos] / max(1, k)))
 
                         # PROBABILITY-WEIGHTED advantage for top-k KL approximation
-                        # advantage = p_student * (log p_teacher - log p_student)
+                        # advantage = p_student * (log p_teacher - log p_student) * reward_scale
                         # This ensures the sum over k datums approximates KL divergence
-                        # The probability weighting naturally limits the magnitude, so no clamping needed
-                        advantage = student_prob * (teacher_logp - student_logp)
+                        # reward_scale weights trajectories by normalized reward when use_rewards=True
+                        advantage = student_prob * (teacher_logp - student_logp) * reward_scale
 
                         target_tokens_list.append(int(student_tok_id))
                         student_logprobs_list.append(float(student_logp))
