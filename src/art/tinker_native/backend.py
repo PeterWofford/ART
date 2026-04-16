@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 import json
+import math
+from typing import Any, Awaitable, Iterable, Literal, NamedTuple, TypeVar, cast
 import os
 import re
 import time
-from typing import Any, Awaitable, Iterable, Literal, TypeVar, cast
 import uuid
 
 from fastapi import FastAPI, HTTPException
@@ -38,7 +39,7 @@ from ..metrics_taxonomy import (
 from ..model import Model, TrainableModel
 from ..tinker.backend import get_renderer_name
 from ..tinker.server import get_free_port
-from ..trajectories import TrajectoryGroup
+from ..trajectories import TrajectoryGroup, get_messages
 from ..types import TrainResult
 from ..utils.output_dirs import get_model_dir
 from ..utils.trajectory_migration import auto_migrate_on_register
@@ -80,6 +81,31 @@ def _canonicalize_upstream_metric_key(metric: str) -> str:
     if metric.startswith("group_metric_"):
         return f"group_{metric[len('group_metric_') :]}"
     return _UPSTREAM_TRAIN_METRIC_KEYS.get(metric, metric)
+
+
+class DistillationWorkItem(NamedTuple):
+    """Work item for computing teacher logprobs in prompt distillation."""
+    group_idx: int
+    traj_idx: int
+    prompt_tokens: list[int]
+    completion_tokens: list[int]
+    student_logprobs: list[float]
+    student_prompt: Any
+    teacher_prompt: Any
+    prompt_messages: list[dict[str, Any]]
+    teacher_system_prompt: str
+    reward: float = 0.0
+
+
+class PiDistillWorkItem(NamedTuple):
+    """Work item for π-Distill: one per history in a teacher-sampled trajectory."""
+    group_idx: int
+    traj_reward: float
+    teacher_prompt_tokens: list[int]
+    student_prompt_tokens: list[int]
+    completion_tokens: list[int]
+    teacher_logprobs: list[float]  # π_T_old logprobs (IS denominator for both datums)
+    student_prompt: Any  # renderer prompt object, used for compute_logprobs
 
 
 @dataclass
@@ -346,6 +372,1171 @@ class TinkerNativeBackend(Backend):
         metrics["time/step_trainer_s"] = time.monotonic() - trainer_started
 
         return TrainResult(step=state.current_step, metrics=metrics)
+
+    async def train_with_prompt_distillation(  # type: ignore[override]
+        self,
+        model: TrainableModel,
+        trajectory_groups: Iterable[TrajectoryGroup],
+        *,
+        teacher_system_prompts: str | list[str],
+        learning_rate: float = 1e-5,
+        loss_fn: str = "importance_sampling",
+        normalize_advantages: bool = False,
+        grpo_weight: float = 0.0,
+        save_checkpoint: bool = False,
+        loss_fn_config: dict | None = None,
+        adam_params: tinker.AdamParams | None = None,
+    ) -> TrainResult:
+        """Train using on-policy distillation from the same model with modified system prompts.
+
+        This implements distribution-level KL distillation where the teacher is the same model
+        but with a modified system prompt. At each token position, per-token advantages are
+        computed as log(p_student[token] / p_teacher[token]) and used with importance sampling loss.
+
+        The teacher distributions are computed with stopgrad, so only the student model is updated.
+
+        Note: Group size doesn't matter here since the loss is computed per-token based on
+        distribution-level KL divergence. Groups of size 1 are typical.
+
+        Args:
+            model: The trainable model
+            trajectory_groups: Trajectory groups sampled from the student
+            teacher_system_prompts: Modified system prompt(s) to use for teacher distributions.
+                - Single string: Same prompt used for all groups
+                - List of strings: One prompt per group (must match number of groups)
+            learning_rate: Learning rate for optimization
+            loss_fn: Loss function to use (default: "importance_sampling")
+            normalize_advantages: Ignored for distillation loss (kept for API compatibility)
+            save_checkpoint: Whether to save full checkpoint
+            loss_fn_config: Additional loss function configuration
+            adam_params: Adam optimizer parameters
+        """
+        state = self._model_state[model.name]
+        groups_list = list(trajectory_groups)
+
+        # Convert single prompt to list
+        if isinstance(teacher_system_prompts, str):
+            prompts_list = [teacher_system_prompts] * len(groups_list)
+        else:
+            prompts_list = teacher_system_prompts
+            if len(prompts_list) != len(groups_list):
+                raise ValueError(
+                    f"Number of teacher_system_prompts ({len(prompts_list)}) must match "
+                    f"number of trajectory_groups ({len(groups_list)})"
+                )
+
+        # Compute teacher logprobs with modified system prompts and build datums
+        datums = await self._trajectory_groups_to_datums_with_teacher_logprobs(
+            groups_list,
+            state,
+            prompts_list,
+            normalize_advantages,
+            grpo_weight=grpo_weight,
+        )
+
+        metrics: dict[str, float] = {
+            "num_groups_submitted": float(len(groups_list)),
+            "num_datums": float(len(datums)),
+        }
+
+        if not datums:
+            return TrainResult(step=state.current_step, metrics=metrics)
+
+        train_tokens = 0
+        for datum in datums:
+            train_tokens += len(datum.model_input.to_ints())
+        metrics["train_tokens"] = float(train_tokens)
+        pricing = get_model_pricing(model.base_model)
+        if pricing is not None:
+            metrics["costs/train/tinker_train"] = compute_train_cost(train_tokens, pricing)
+
+        if adam_params is None:
+            adam_params = tinker.AdamParams(
+                learning_rate=learning_rate,
+                beta1=0.9,
+                beta2=0.95,
+                eps=1e-8,
+            )
+
+        # Use standard forward_backward with importance_sampling loss
+        def remove_mask(datum: tinker.Datum) -> tinker.Datum:
+            if "mask" not in datum.loss_fn_inputs:
+                return datum
+            loss_fn_inputs = {
+                key: value
+                for key, value in datum.loss_fn_inputs.items()
+                if key != "mask"
+            }
+            return tinker.Datum(
+                model_input=datum.model_input, loss_fn_inputs=loss_fn_inputs
+            )
+
+        forward_output = await self._tinker_train_call(
+            "forward_backward",
+            state.training_client.forward_backward(
+                [remove_mask(datum) for datum in datums],
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+            ),
+        )
+
+        optim_output = await self._tinker_train_call(
+            "optim_step", state.training_client.optim_step(adam_params)
+        )
+
+        if forward_output.metrics:
+            for key, value in forward_output.metrics.items():
+                if value is None:
+                    continue
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
+        if optim_output.metrics:
+            for key, value in optim_output.metrics.items():
+                if value is None:
+                    continue
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
+
+        next_step = state.current_step + 1
+        checkpoint_name = f"step_{next_step:06d}"
+
+        if save_checkpoint:
+            state_response, sampler_response = await self._save_checkpoint(
+                state.training_client, checkpoint_name
+            )
+            state.training_checkpoint_paths[next_step] = state_response.path
+        else:
+            sampler_response = await self._save_sampler_weights(
+                state.training_client, checkpoint_name
+            )
+        sampler_client = await self._tinker_train_call(
+            "create_sampling_client_async",
+            state.training_client.create_sampling_client_async(
+                model_path=sampler_response.path
+            ),
+        )
+        state.sampler_clients[next_step] = sampler_client
+        state.sampler_checkpoint_paths[next_step] = sampler_response.path
+
+        state.current_step = next_step
+        self._persist_model_state(model, state)
+
+        return TrainResult(step=state.current_step, metrics=metrics)
+
+    async def train_with_pi_distill(  # type: ignore[override]
+        self,
+        model: TrainableModel,
+        trajectory_groups: Iterable[TrajectoryGroup],
+        *,
+        teacher_system_prompts: str | list[str] = "",
+        student_system_prompts: str | list[str] = "",
+        pi_as_last_message: bool = False,
+        alpha: float = 0.5,
+        beta: float = 0.25,
+        learning_rate: float = 1e-5,
+        loss_fn: str = "importance_sampling",
+        normalize_advantages: bool = True,
+        save_checkpoint: bool = False,
+        loss_fn_config: dict | None = None,
+        adam_params: tinker.AdamParams | None = None,
+    ) -> TrainResult:
+        """Train using π-Distill (Penaloza et al., arXiv:2602.04942).
+
+        Jointly trains teacher (with privileged information in system prompt) and student
+        (without PI) on the same teacher-sampled completions. The teacher's reward includes
+        a KL penalty keeping it near the student; the student learns via off-policy GRPO
+        with the teacher's old logprobs as the IS denominator.
+
+        For each trajectory (sampled with PI-augmented teacher policy):
+          1. Extract completion tokens and teacher old logprobs from the Choice
+          2. Compute student logprobs for the same completion (current π_S, stop-grad)
+          3. KL(π_T || π_S) ≈ mean(teacher_logp[t] - student_logp[t]) over sampled tokens
+          4. modified_reward = R_env - β * KL(π_T || π_S)
+          5. Teacher datum: teacher prompt, IS denom = π_T_old, advantage = α * normalized
+          6. Student datum: student prompt, IS denom = π_T_old, advantage = (1-α) * normalized
+
+        Args:
+            model: The trainable model
+            trajectory_groups: Groups sampled using the PI-augmented teacher policy
+            teacher_system_prompts: PI-augmented system prompt. Used when pi_as_last_message=False.
+                Single string or list of strings (one per group).
+            student_system_prompts: Student system prompt without PI. Used when pi_as_last_message=False.
+                Single string or list of strings (one per group).
+            pi_as_last_message: If True, the PI is already appended as the last system message in
+                the trajectory. Teacher prompt tokens are taken directly from the trajectory;
+                student prompt tokens are derived by stripping that last system message.
+                teacher_system_prompts/student_system_prompts are ignored in this mode.
+            alpha: Teacher/student mix. 0=student only, 0.5=joint, 1=teacher only.
+            beta: KL penalty coefficient (0.25 recommended).
+            learning_rate: Learning rate for optimization
+            loss_fn: Loss function (default: "importance_sampling")
+            normalize_advantages: Whether to normalize advantages within each group
+            save_checkpoint: Whether to save full checkpoint
+            loss_fn_config: Additional loss function configuration
+            adam_params: Adam optimizer parameters
+        """
+        state = self._model_state[model.name]
+        groups_list = list(trajectory_groups)
+        summary = summarize_trajectory_groups(groups_list)
+
+        if isinstance(teacher_system_prompts, str):
+            teacher_prompts_list = [teacher_system_prompts] * len(groups_list)
+        else:
+            teacher_prompts_list = list(teacher_system_prompts)
+            if len(teacher_prompts_list) != len(groups_list):
+                raise ValueError(
+                    f"Number of teacher_system_prompts ({len(teacher_prompts_list)}) must match "
+                    f"number of trajectory_groups ({len(groups_list)})"
+                )
+
+        if isinstance(student_system_prompts, str):
+            student_prompts_list = [student_system_prompts] * len(groups_list)
+        else:
+            student_prompts_list = list(student_system_prompts)
+            if len(student_prompts_list) != len(groups_list):
+                raise ValueError(
+                    f"Number of student_system_prompts ({len(student_prompts_list)}) must match "
+                    f"number of trajectory_groups ({len(groups_list)})"
+                )
+
+        datums = await self._build_pi_distill_datums(
+            groups_list,
+            state,
+            teacher_prompts_list,
+            student_prompts_list,
+            alpha=alpha,
+            beta=beta,
+            normalize_advantages=normalize_advantages,
+            pi_as_last_message=pi_as_last_message,
+        )
+
+        metrics: dict[str, float] = {
+            **build_training_summary_metrics(
+                summary,
+                include_trainable_groups=True,
+            ),
+            "data/step_num_datums": float(len(datums)),
+        }
+
+        if not datums:
+            return TrainResult(step=state.current_step, metrics=metrics)
+
+        train_tokens = 0
+        for datum in datums:
+            train_tokens += len(datum.model_input.to_ints())
+        metrics["data/step_trainer_tokens"] = float(train_tokens)
+        pricing = get_model_pricing(model.base_model)
+        if pricing is not None:
+            metrics["costs/train/tinker_train"] = compute_train_cost(train_tokens, pricing)
+        trainer_started = time.monotonic()
+
+        if adam_params is None:
+            adam_params = tinker.AdamParams(
+                learning_rate=learning_rate,
+                beta1=0.9,
+                beta2=0.95,
+                eps=1e-8,
+            )
+
+        def remove_mask(datum: tinker.Datum) -> tinker.Datum:
+            if "mask" not in datum.loss_fn_inputs:
+                return datum
+            loss_fn_inputs = {
+                key: value
+                for key, value in datum.loss_fn_inputs.items()
+                if key != "mask"
+            }
+            return tinker.Datum(
+                model_input=datum.model_input, loss_fn_inputs=loss_fn_inputs
+            )
+
+        forward_output = await self._tinker_train_call(
+            "forward_backward",
+            state.training_client.forward_backward(
+                [remove_mask(datum) for datum in datums],
+                loss_fn=loss_fn,
+                loss_fn_config=loss_fn_config,
+            ),
+        )
+        optim_output = await self._tinker_train_call(
+            "optim_step", state.training_client.optim_step(adam_params)
+        )
+
+        if forward_output.metrics:
+            for key, value in forward_output.metrics.items():
+                if value is None:
+                    continue
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
+        if optim_output.metrics:
+            for key, value in optim_output.metrics.items():
+                if value is None:
+                    continue
+                canonical_key = _canonicalize_upstream_metric_key(key)
+                if canonical_key:
+                    metrics[canonical_key] = float(value)
+
+        next_step = state.current_step + 1
+        checkpoint_name = f"step_{next_step:06d}"
+
+        if save_checkpoint:
+            state_response, sampler_response = await self._save_checkpoint(
+                state.training_client, checkpoint_name
+            )
+            state.training_checkpoint_paths[next_step] = state_response.path
+        else:
+            sampler_response = await self._save_sampler_weights(
+                state.training_client, checkpoint_name
+            )
+        sampler_client = await self._tinker_train_call(
+            "create_sampling_client_async",
+            state.training_client.create_sampling_client_async(
+                model_path=sampler_response.path
+            ),
+        )
+        state.sampler_clients[next_step] = sampler_client
+        state.sampler_checkpoint_paths[next_step] = sampler_response.path
+
+        state.current_step = next_step
+        self._persist_model_state(model, state)
+        metrics["time/step_trainer_s"] = time.monotonic() - trainer_started
+
+        return TrainResult(step=state.current_step, metrics=metrics)
+
+    async def _build_pi_distill_datums(
+        self,
+        trajectory_groups: list[TrajectoryGroup],
+        state: ModelState,
+        teacher_system_prompts: list[str],
+        student_system_prompts: list[str],
+        alpha: float,
+        beta: float,
+        normalize_advantages: bool,
+        pi_as_last_message: bool = False,
+    ) -> list[tinker.Datum]:
+        """Build teacher and student datums for π-Distill.
+
+        For each group:
+          1. Collect work items: teacher/student prompt tokens, completions, teacher logprobs
+          2. Batch-compute student logprobs under current π_S (stop-grad reference)
+          3. Compute modified rewards = R_env - β * KL(π_T || π_S)
+          4. Normalize advantages within each group
+          5. Build alpha-scaled teacher datum and (1-alpha)-scaled student datum per trajectory
+        """
+        from collections import defaultdict
+
+        from .data import (
+            build_datum,
+            compute_advantages,
+            extract_logprobs_from_choice,
+            find_last_choice,
+            iter_trajectory_histories,
+        )
+
+        sampler_client = state.sampler_clients[state.current_step]
+
+        # First pass: collect work items
+        work_items: list[PiDistillWorkItem] = []
+
+        for group_idx, (group, teacher_sys, student_sys) in enumerate(
+            zip(trajectory_groups, teacher_system_prompts, student_system_prompts)
+        ):
+            if not group.trajectories:
+                continue
+
+            for trajectory in group.trajectories:
+                for history in iter_trajectory_histories(trajectory):
+                    choice_info = find_last_choice(history.messages_and_choices)
+                    if choice_info is None:
+                        continue
+                    choice_idx, choice = choice_info
+
+                    completion_tokens, teacher_logprobs = extract_logprobs_from_choice(
+                        choice, state.tokenizer
+                    )
+                    if not completion_tokens or len(completion_tokens) != len(teacher_logprobs):
+                        continue
+
+                    prompt_messages = cast(
+                        list[dict[str, Any]],
+                        get_messages(history.messages_and_choices[:choice_idx]),
+                    )
+
+                    if pi_as_last_message:
+                        # Teacher = trajectory messages as-is (PI is the last system message)
+                        teacher_messages = list(prompt_messages)
+                        # Student = strip the last system message (the PI)
+                        student_messages = list(prompt_messages)
+                        for i in range(len(student_messages) - 1, -1, -1):
+                            if student_messages[i].get("role") == "system":
+                                student_messages.pop(i)
+                                break
+                    else:
+                        teacher_messages = self._modify_system_prompt(prompt_messages, teacher_sys)
+                        student_messages = self._modify_system_prompt(prompt_messages, student_sys)
+
+                    teacher_renderer_msgs = convert_openai_messages_to_renderer_format(
+                        messages=teacher_messages,
+                        tools=cast(list[dict[str, Any]] | None, history.tools),
+                        renderer=state.renderer,
+                    )
+                    teacher_prompt_obj = state.renderer.build_generation_prompt(teacher_renderer_msgs)
+
+                    student_renderer_msgs = convert_openai_messages_to_renderer_format(
+                        messages=student_messages,
+                        tools=cast(list[dict[str, Any]] | None, history.tools),
+                        renderer=state.renderer,
+                    )
+                    student_prompt_obj = state.renderer.build_generation_prompt(student_renderer_msgs)
+
+                    work_items.append(PiDistillWorkItem(
+                        group_idx=group_idx,
+                        traj_reward=trajectory.reward,
+                        teacher_prompt_tokens=list(teacher_prompt_obj.to_ints()),
+                        student_prompt_tokens=list(student_prompt_obj.to_ints()),
+                        completion_tokens=completion_tokens,
+                        teacher_logprobs=teacher_logprobs,
+                        student_prompt=student_prompt_obj,
+                    ))
+
+        if not work_items:
+            return []
+
+        # Second pass: batch-compute student logprobs under current π_S (stop-grad)
+        student_logprob_results = await self._compute_student_logprobs_batch(
+            sampler_client,
+            [(item.student_prompt, item.completion_tokens) for item in work_items],
+        )
+
+        # Third pass: compute modified rewards and track valid items per group
+        group_item_indices: dict[int, list[int]] = defaultdict(list)
+        modified_rewards: list[float] = [float("nan")] * len(work_items)
+
+        for i, (item, student_logprobs) in enumerate(
+            zip(work_items, student_logprob_results)
+        ):
+            if student_logprobs is None:
+                continue
+            # KL(π_T || π_S) ≈ mean(teacher_logp[t] - student_logp[t]) over sampled tokens
+            kl_seq = sum(
+                t - s for t, s in zip(item.teacher_logprobs, student_logprobs)
+            ) / max(1, len(item.completion_tokens))
+            modified_rewards[i] = item.traj_reward - beta * kl_seq
+            group_item_indices[item.group_idx].append(i)
+
+        # Fourth pass: normalize advantages within each group
+        item_advantages: list[float] = [0.0] * len(work_items)
+        for group_idx, indices in group_item_indices.items():
+            group_rewards = [modified_rewards[i] for i in indices]
+            group_advantages = compute_advantages(group_rewards, normalize_advantages)
+            if all(a == 0.0 for a in group_advantages):
+                continue
+            for idx, adv in zip(indices, group_advantages):
+                item_advantages[idx] = adv
+
+        # Fifth pass: build teacher and student datums
+        datums: list[tinker.Datum] = []
+
+        for i, item in enumerate(work_items):
+            adv = item_advantages[i]
+            if adv == 0.0:
+                continue
+
+            # Teacher datum: IS = π_T_current / π_T_old, advantage scaled by alpha
+            if alpha > 0.0:
+                teacher_datum = build_datum(
+                    prompt_tokens=item.teacher_prompt_tokens,
+                    completion_tokens=item.completion_tokens,
+                    logprobs=item.teacher_logprobs,
+                    advantage=alpha * adv,
+                )
+                if teacher_datum is not None:
+                    datums.append(teacher_datum)
+
+            # Student datum: IS = π_S_current / π_T_old, advantage scaled by (1-alpha)
+            if alpha < 1.0:
+                student_datum = build_datum(
+                    prompt_tokens=item.student_prompt_tokens,
+                    completion_tokens=item.completion_tokens,
+                    logprobs=item.teacher_logprobs,  # IS denominator is always π_T_old
+                    advantage=(1.0 - alpha) * adv,
+                )
+                if student_datum is not None:
+                    datums.append(student_datum)
+
+        return datums
+
+    async def _compute_student_logprobs_batch(
+        self,
+        sampler_client: tinker.SamplingClient,
+        items: list[tuple[Any, list[int]]],  # [(student_prompt, completion_tokens), ...]
+    ) -> list[list[float] | None]:
+        """Batch-compute completion logprobs under student prompts.
+
+        Kicks off all futures before awaiting so all requests run in parallel.
+        """
+        # Kick off all futures before awaiting any
+        futures = []
+        prompt_lens = []
+        for student_prompt, completion_tokens in items:
+            prompt_tokens = list(student_prompt.to_ints())
+            prompt_lens.append(len(prompt_tokens))
+            all_tokens = prompt_tokens + completion_tokens
+            model_input = tinker.ModelInput.from_ints(tokens=all_tokens)
+            futures.append(sampler_client.compute_logprobs(model_input))
+
+        async def get_result(
+            future: Any, prompt_len: int, completion_len: int
+        ) -> list[float] | None:
+            try:
+                all_logprobs = await asyncio.to_thread(future.result)
+                completion_logprobs = all_logprobs[prompt_len : prompt_len + completion_len]
+                if any(lp is None for lp in completion_logprobs):
+                    return None
+                return cast(list[float], list(completion_logprobs))
+            except Exception as e:
+                print(f"Error computing student logprobs: {e}")
+                return None
+
+        results = await asyncio.gather(*[
+            get_result(futures[i], prompt_lens[i], len(items[i][1]))
+            for i in range(len(items))
+        ])
+        return list(results)
+
+    async def _trajectory_groups_to_datums_with_teacher_logprobs(
+        self,
+        trajectory_groups: list[TrajectoryGroup],
+        state: ModelState,
+        teacher_system_prompts: list[str],
+        normalize_advantages: bool,
+        grpo_weight: float = 0.0,
+    ) -> list[tinker.Datum]:
+        """Convert trajectory groups to datums using distribution-level KL distillation.
+
+        This computes teacher top-k distributions using the same model but with modified
+        system prompts (one per group), then packages the full distributions for a
+        distillation loss that computes KL(student || teacher) at each position.
+
+        Note: Each trajectory is processed independently. Groups are only used to
+        associate teacher prompts with trajectories.
+        """
+        from .data import (
+            compute_advantages,
+            convert_openai_messages_to_renderer_format,
+            extract_logprobs_from_choice,
+            find_last_choice,
+            iter_trajectory_histories,
+        )
+        import torch
+
+        # Get the current sampler client (teacher)
+        teacher_client = state.sampler_clients[state.current_step]
+
+        # First pass: collect all work items
+        work_items: list[DistillationWorkItem] = []
+
+        for group_idx, (group, teacher_system_prompt) in enumerate(zip(trajectory_groups, teacher_system_prompts)):
+            if not group.trajectories:
+                continue
+
+            # Process each trajectory in the group with this group's teacher prompt
+            for traj_idx, trajectory in enumerate(group.trajectories):
+                for history in iter_trajectory_histories(trajectory):
+                    choice_info = find_last_choice(history.messages_and_choices)
+                    if choice_info is None:
+                        continue
+                    choice_index, choice = choice_info
+
+                    # Extract student logprobs and tokens from the choice
+                    completion_tokens, student_logprobs = extract_logprobs_from_choice(
+                        choice, state.tokenizer
+                    )
+                    if not completion_tokens or len(completion_tokens) != len(student_logprobs):
+                        continue
+
+                    # Build student prompt (original)
+                    prompt_messages = cast(
+                        list[dict[str, Any]],
+                        get_messages(history.messages_and_choices[:choice_index]),
+                    )
+                    student_renderer_messages = convert_openai_messages_to_renderer_format(
+                        messages=prompt_messages,
+                        tools=cast(list[dict[str, Any]] | None, history.tools),
+                        renderer=state.renderer,
+                    )
+                    student_prompt = state.renderer.build_generation_prompt(
+                        student_renderer_messages
+                    )
+                    prompt_tokens = list(student_prompt.to_ints())
+
+                    # Build teacher prompt: keep original system, insert PI before last turn
+                    teacher_messages = self._insert_pi_before_last(
+                        prompt_messages, teacher_system_prompt
+                    )
+                    teacher_renderer_messages = convert_openai_messages_to_renderer_format(
+                        messages=teacher_messages,
+                        tools=cast(list[dict[str, Any]] | None, history.tools),
+                        renderer=state.renderer,
+                    )
+                    teacher_prompt = state.renderer.build_generation_prompt(
+                        teacher_renderer_messages
+                    )
+
+                    work_items.append(DistillationWorkItem(
+                        group_idx=group_idx,
+                        traj_idx=traj_idx,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        student_logprobs=student_logprobs,
+                        student_prompt=student_prompt,
+                        teacher_prompt=teacher_prompt,
+                        prompt_messages=prompt_messages,
+                        teacher_system_prompt=teacher_system_prompt,
+                        reward=trajectory.reward,
+                    ))
+
+        # Second pass: compute all top-k distributions in batch
+        if not work_items:
+            return []
+
+        print(f"Computing top-k distributions for {len(work_items)} trajectories in batch...")
+        distribution_results = await self._compute_topk_distributions_batch(
+            teacher_client,
+            [(item.student_prompt, item.teacher_prompt, item.completion_tokens) for item in work_items],
+        )
+
+        # Third pass: build datums with full distributions for distillation loss
+        datums: list[tinker.Datum] = []
+        all_kl_values: list[float] = []
+        trajectory_count = 0
+
+        for item, dist_result in zip(work_items, distribution_results):
+            if dist_result is None:
+                continue
+
+            student_topk, teacher_topk, student_tail_mass, teacher_tail_mass = dist_result
+
+            # Compute KL for logging only
+            kl_per_token = []
+            for s_topk, t_topk, s_tail, t_tail in zip(student_topk, teacher_topk, student_tail_mass, teacher_tail_mass):
+                kl = self._compute_topk_kl_single_with_tail(s_topk, t_topk, s_tail, t_tail)
+                kl_per_token.append(kl)
+            all_kl_values.extend(kl_per_token)
+
+            # Log first trajectory for debugging
+            if item.group_idx == 0 and item.traj_idx == 0 and len(datums) == 0:
+                print("\n[Prompt Distillation Logging]")
+                print("=" * 80)
+
+                # Decode and show completion text
+                completion_text = state.tokenizer.decode(item.completion_tokens)
+                print(f"Completion text: {repr(completion_text)}")
+                print(f"Completion tokens ({len(item.completion_tokens)}): {item.completion_tokens[:10]}...")
+
+                # Show student prompt (original)
+                student_msg_content = item.prompt_messages[0].get("content", "")
+                student_system = next(
+                    (m.get("content", "") for m in item.prompt_messages if m.get("role") == "system"),
+                    "(no system prompt)"
+                )
+                print(f"\nStudent system: {student_system}")
+                print(f"Student user msg: {student_msg_content}...")
+
+                # Show teacher prompt (modified)
+                print(f"\nTeacher system: {item.teacher_system_prompt}")
+
+                # Debug: Show prompt structure
+                print(f"\n[Trajectory Context Debug]")
+                print(f"Number of messages in prompt: {len(item.prompt_messages)}")
+                for idx, msg in enumerate(item.prompt_messages):
+                    role = msg.get('role', '?')
+                    content_preview = str(msg.get('content', ''))[:100]
+                    print(f"  Message {idx} ({role}): {content_preview}...")
+                print(f"Completion tokens length: {len(item.completion_tokens)}")
+                print(f"Completion text: {repr(state.tokenizer.decode(item.completion_tokens)[:200])}...")
+
+                # Show sample distributions and KL
+                print("\nSample distributions:")
+                for i in range(len(student_topk)):
+                    actual_id = item.completion_tokens[i]
+                    actual_txt = state.tokenizer.decode([actual_id])
+
+                    s_top3 = ", ".join(
+                        f"{state.tokenizer.decode([tid])!r}(id={tid}):lp={lp:.4f},p={math.exp(lp):.4f}"
+                        for tid, lp in student_topk[i][:3]
+                    )
+                    t_top3 = ", ".join(
+                        f"{state.tokenizer.decode([tid])!r}(id={tid}):lp={lp:.4f},p={math.exp(lp):.4f}"
+                        for tid, lp in teacher_topk[i][:3]
+                    )
+
+                    print(
+                        f"pos={i} actual={actual_txt!r}(id={actual_id}) | "
+                        f"S[{s_top3}] tail={student_tail_mass[i]:.4f} | "
+                        f"T[{t_top3}] tail={teacher_tail_mass[i]:.4f} | "
+                        f"KL={kl_per_token[i]:.4f}"
+                    )
+
+            # Build k datums (one per rank) for mean-seeking KL distillation
+            traj_datums = self._build_datums_with_distributions(
+                prompt_tokens=item.prompt_tokens,
+                completion_tokens=item.completion_tokens,
+                student_topk=student_topk,
+                teacher_topk=teacher_topk,
+                student_tail_mass=student_tail_mass,
+                teacher_tail_mass=teacher_tail_mass,
+                trajectory_id=trajectory_count,
+            )
+            datums.extend(traj_datums)
+            trajectory_count += 1
+
+        # Summary statistics
+        if all_kl_values:
+            import numpy as np
+            kl_array = np.array(all_kl_values)
+
+            print(f"\n[Distillation Statistics]")
+            print(f"Total tokens: {len(all_kl_values)}")
+            print(f"Top-k KL(student||teacher) - mean: {kl_array.mean():.4f}, std: {kl_array.std():.4f}, min: {kl_array.min():.4f}, max: {kl_array.max():.4f}")
+            print("=" * 80)
+
+        # GRPO datums: z-scored reward advantage on student's actual completions
+        if grpo_weight > 0.0:
+            from collections import defaultdict
+            from .data import build_datum
+            group_items_map: dict[int, list[DistillationWorkItem]] = defaultdict(list)
+            for item in work_items:
+                group_items_map[item.group_idx].append(item)
+
+            grpo_count = 0
+            for g_items in group_items_map.values():
+                rewards = [it.reward for it in g_items]
+                advantages = compute_advantages(rewards, normalize_advantages=True)
+                for it, adv in zip(g_items, advantages):
+                    if adv == 0.0:
+                        continue
+                    grpo_datum = build_datum(
+                        prompt_tokens=it.prompt_tokens,
+                        completion_tokens=it.completion_tokens,
+                        logprobs=it.student_logprobs,
+                        advantage=adv * grpo_weight,
+                    )
+                    if grpo_datum is not None:
+                        datums.append(grpo_datum)
+                        grpo_count += 1
+            print(f"Added {grpo_count} GRPO datums (grpo_weight={grpo_weight})")
+
+        return datums
+
+    def _modify_system_prompt(
+        self, messages: list[dict[str, Any]], new_system_prompt: str
+    ) -> list[dict[str, Any]]:
+        """Replace all system messages with new_system_prompt inserted before the last message."""
+        # Remove any existing system messages
+        modified = [m for m in messages if m.get("role") != "system"]
+
+        system_msg = {"role": "system", "content": new_system_prompt}
+
+        # Insert right before the last message (or at start if there's no "last")
+        insert_at = max(len(modified) - 1, 0)
+        modified.insert(insert_at, system_msg)
+
+        return modified
+
+    def _insert_pi_before_last(
+        self, messages: list[dict[str, Any]], pi_content: str
+    ) -> list[dict[str, Any]]:
+        """Insert a PI system message right before the last message, preserving existing system messages."""
+        result = list(messages)
+        insert_at = max(len(result) - 1, 0)
+        result.insert(insert_at, {"role": "system", "content": pi_content})
+        return result
+
+
+    async def _compute_topk_distributions_batch(
+        self,
+        sampler_client: tinker.SamplingClient,
+        items: list[tuple[Any, Any, list[int]]],  # [(student_prompt, teacher_prompt, completion_tokens), ...]
+        k: int = 20,
+    ) -> list[tuple[list[list[tuple[int, float]]], list[list[tuple[int, float]]], list[float], list[float]] | None]:
+        """Compute top-k distributions for student and teacher for multiple items in parallel.
+
+        Returns:
+            List of (student_topk, teacher_topk, student_tail_mass, teacher_tail_mass) or None
+            where student_topk/teacher_topk are lists (per position) of lists of (token_id, logprob) tuples,
+            and student_tail_mass/teacher_tail_mass are lists (per position) of tail probabilities.
+        """
+        import asyncio
+        import math
+
+        # Kick off all sample calls (returns futures immediately)
+        futures_student = []
+        futures_teacher = []
+
+        # Store prompt lengths for proper indexing
+        student_prompt_lens = []
+        teacher_prompt_lens = []
+
+        for student_prompt, teacher_prompt, completion_tokens in items:
+            student_prompt_len = len(student_prompt.to_ints())
+            teacher_prompt_len = len(teacher_prompt.to_ints())
+
+            student_prompt_lens.append(student_prompt_len)
+            teacher_prompt_lens.append(teacher_prompt_len)
+
+            student_tokens = list(student_prompt.to_ints()) + completion_tokens
+            teacher_tokens = list(teacher_prompt.to_ints()) + completion_tokens
+
+            # Note: max_tokens=1 (minimum allowed), we'll ignore the generated token
+            params = tinker.SamplingParams(max_tokens=1, temperature=0.0)
+
+            futures_student.append(
+                sampler_client.sample(
+                    prompt=tinker.ModelInput.from_ints(student_tokens),
+                    num_samples=1,
+                    sampling_params=params,
+                    include_prompt_logprobs=True,
+                    topk_prompt_logprobs=k,
+                )
+            )
+            futures_teacher.append(
+                sampler_client.sample(
+                    prompt=tinker.ModelInput.from_ints(teacher_tokens),
+                    num_samples=1,
+                    sampling_params=params,
+                    include_prompt_logprobs=True,
+                    topk_prompt_logprobs=k,
+                )
+            )
+
+        # Await all results in parallel
+        async def get_distributions_result(student_future, teacher_future, student_prompt_len, teacher_prompt_len, completion_len, completion_tokens, tokenizer):
+            try:
+                student_resp = await asyncio.to_thread(student_future.result)
+                teacher_resp = await asyncio.to_thread(teacher_future.result)
+
+                # Extract the correct positions
+                student_start = student_prompt_len
+                student_end = student_start + completion_len
+                teacher_start = teacher_prompt_len
+                teacher_end = teacher_start + completion_len
+
+                student_topk = student_resp.topk_prompt_logprobs[student_start:student_end]
+                teacher_topk = teacher_resp.topk_prompt_logprobs[teacher_start:teacher_end]
+
+                # Compute tail masses for each position
+                import math
+                student_tail_mass = []
+                teacher_tail_mass = []
+
+                for s_topk in student_topk:
+                    # Sum probabilities in top-k
+                    topk_prob_sum = sum(math.exp(lp) for _, lp in s_topk)
+                    # Tail mass is the remaining probability
+                    student_tail_mass.append(max(1e-10, 1.0 - topk_prob_sum))
+
+                for t_topk in teacher_topk:
+                    topk_prob_sum = sum(math.exp(lp) for _, lp in t_topk)
+                    teacher_tail_mass.append(max(1e-10, 1.0 - topk_prob_sum))
+
+                return (student_topk, teacher_topk, student_tail_mass, teacher_tail_mass)
+            except Exception as e:
+                print(f"Error computing top-k distributions: {e}")
+                import traceback
+                traceback.print_exc()
+                return None
+
+        # Get tokenizer from sampler_client
+        tokenizer = sampler_client.get_tokenizer()
+
+        results = await asyncio.gather(*[
+            get_distributions_result(
+                futures_student[i],
+                futures_teacher[i],
+                student_prompt_lens[i],
+                teacher_prompt_lens[i],
+                len(items[i][2]),
+                items[i][2],  # completion_tokens
+                tokenizer
+            )
+            for i in range(len(items))
+        ])
+
+        return results
+
+    def _compute_topk_kl_single_with_tail(
+        self,
+        student_topk: list[tuple[int, float]],
+        teacher_topk: list[tuple[int, float]],
+        student_tail_mass: float,
+        teacher_tail_mass: float,
+    ) -> float:
+        """Compute KL divergence using top-k approximation with explicit tail masses.
+
+        KL(P||Q) ≈ Σ p_i log(p_i/q_i) + p_tail log(p_tail/q_tail)
+
+        For tokens in student top-k but not in teacher top-k, we distribute the
+        teacher tail mass proportionally among them.
+        """
+        import math
+
+        # Convert to dicts for easy lookup
+        student_dict = {tok: logp for tok, logp in student_topk}
+        teacher_dict = {tok: logp for tok, logp in teacher_topk}
+
+        # Convert logprobs to probs
+        student_probs = {tok: math.exp(lp) for tok, lp in student_dict.items()}
+        teacher_probs = {tok: math.exp(lp) for tok, lp in teacher_dict.items()}
+
+        # Compute KL for top-k tokens
+        kl = 0.0
+        for tok, p_s in student_probs.items():
+            if p_s < 1e-10:
+                continue
+            # If token not in teacher top-k, assign it a share of the tail
+            p_t = teacher_probs.get(tok, teacher_tail_mass / max(1, len(student_probs)))
+            kl += p_s * math.log(p_s / max(1e-10, p_t))
+
+        # Add tail contribution
+        if student_tail_mass > 1e-10:
+            kl += student_tail_mass * math.log(student_tail_mass / max(1e-10, teacher_tail_mass))
+
+        return kl
+
+    async def _compute_logprobs_for_completion(
+        self,
+        sampler_client: tinker.SamplingClient,
+        prompt: Any,
+        completion_tokens: list[int],
+    ) -> list[float] | None:
+        """Compute logprobs for specific completion tokens given a prompt.
+
+        This uses the sampler's compute_logprobs method to compute logprobs
+        for the completion tokens conditioned on the prompt.
+        """
+        # Concatenate prompt and completion tokens
+        prompt_tokens = list(prompt.to_ints())
+        all_tokens = prompt_tokens + completion_tokens
+
+        # Create ModelInput with all tokens
+        model_input = tinker.ModelInput.from_ints(tokens=all_tokens)
+
+        # Compute logprobs for all tokens
+        # all_logprobs[i] is the logprob of token[i] given tokens[0:i]
+        future = sampler_client.compute_logprobs(model_input)
+        all_logprobs = future.result()
+
+        # Extract logprobs for completion tokens only
+        # Completion tokens start at index len(prompt_tokens)
+        # e.g., if prompt = [p1, p2, p3] and completion = [c1, c2]
+        # all_tokens = [p1, p2, p3, c1, c2]
+        # all_logprobs[3] = logprob of c1 given [p1, p2, p3]
+        # all_logprobs[4] = logprob of c2 given [p1, p2, p3, c1]
+        completion_start_idx = len(prompt_tokens)
+        completion_logprobs = all_logprobs[completion_start_idx:completion_start_idx + len(completion_tokens)]
+
+        # Check for None values (failed to compute)
+        if any(lp is None for lp in completion_logprobs):
+            return None
+
+        return cast(list[float], completion_logprobs)
+
+    def _build_datums_with_distributions(
+        self,
+        prompt_tokens: list[int],
+        completion_tokens: list[int],
+        student_topk: list[list[tuple[int, float]]],
+        teacher_topk: list[list[tuple[int, float]]],
+        student_tail_mass: list[float],
+        teacher_tail_mass: list[float],
+        trajectory_id: int = 0,
+        reward_scale: float = 1.0,
+    ) -> list[tinker.Datum]:
+        """Build k datums for top-k SDPO with probability-weighted advantages.
+
+        Creates k datums where datum[r] contains:
+        - target_tokens: [seq_len] - rank-r token from STUDENT's top-k at each position
+        - advantages: [seq_len] - p_student[r] * (log p_teacher[r] - log p_student[r])
+        - logprobs: [seq_len] - student's logprob (for importance sampling)
+
+        The probability weighting ensures that when losses are summed across all k datums,
+        we approximate: -KL(student || teacher) = -Σ p_student * log(p_student / p_teacher)
+                                                 = Σ p_student * (log p_teacher - log p_student)
+
+        Iterates through student's top-k (mean-seeking KL) and finds corresponding teacher probs.
+        Uses standard importance_sampling loss with per-token advantages.
+        """
+        import torch
+        import math
+
+        if not prompt_tokens or not completion_tokens:
+            return []
+
+        k = min(1, len(student_topk[0]) if student_topk else 20)  # Limit k to avoid too many datums
+
+        # Build input tokens
+        ob_len = max(len(prompt_tokens) - 1, 0)
+        all_tokens = prompt_tokens + completion_tokens
+        input_tokens = all_tokens[:-1]
+        completion_len = len(completion_tokens)
+        seq_len = len(input_tokens)
+
+        if seq_len != ob_len + completion_len:
+            return []
+
+        # Create k datums, one for each rank in student's top-k
+        datums = []
+        for rank in range(k):
+            target_tokens_list = []
+            student_logprobs_list = []
+            advantages_list = []
+            mask_list = []
+            has_nonzero_prob = False
+
+            for pos_idx in range(seq_len):
+                if pos_idx < ob_len:
+                    # Prompt position: dummy values
+                    target_tokens_list.append(0)
+                    student_logprobs_list.append(0.0)
+                    advantages_list.append(0.0)
+                    mask_list.append(0.0)
+                else:
+                    # Completion position: rank-r token from STUDENT's top-k
+                    completion_pos = pos_idx - ob_len
+                    student_topk_at_pos = student_topk[completion_pos]
+                    teacher_topk_at_pos = teacher_topk[completion_pos]
+
+                    if rank < len(student_topk_at_pos):
+                        # Student's rank-r token
+                        student_tok_id, student_logp = student_topk_at_pos[rank]
+                        student_prob = math.exp(student_logp)
+
+                        # Check if this rank has near-zero probability (numerical issues)
+                        if student_prob < 1e-10:
+                            # This rank and higher have negligible probability, skip
+                            target_tokens_list.append(0)
+                            student_logprobs_list.append(0.0)
+                            advantages_list.append(0.0)
+                            mask_list.append(0.0)
+                            continue
+
+                        has_nonzero_prob = True
+
+                        # Find this token's logprob in teacher's top-k
+                        teacher_logp = None
+                        for t_tok_id, t_logp in teacher_topk_at_pos:
+                            if t_tok_id == student_tok_id:
+                                teacher_logp = t_logp
+                                break
+
+                        if teacher_logp is None:
+                            # Token not in teacher's top-k, estimate from tail
+                            # Distribute tail mass uniformly among missing tokens
+                            teacher_logp = math.log(max(1e-10, teacher_tail_mass[completion_pos] / max(1, k)))
+
+                        # PROBABILITY-WEIGHTED advantage for top-k KL approximation
+                        # advantage = p_student * (log p_teacher - log p_student) * reward_scale
+                        # This ensures the sum over k datums approximates KL divergence
+                        # reward_scale weights trajectories by normalized reward when use_rewards=True
+                        advantage = student_prob * (teacher_logp - student_logp) * reward_scale
+
+                        target_tokens_list.append(int(student_tok_id))
+                        student_logprobs_list.append(float(student_logp))
+                        advantages_list.append(advantage)
+                        mask_list.append(1.0)
+                    else:
+                        # Less than k tokens at this position
+                        target_tokens_list.append(0)
+                        student_logprobs_list.append(0.0)
+                        advantages_list.append(0.0)
+                        mask_list.append(0.0)
+
+            # Skip this datum if it has no non-zero probabilities (all ranks exhausted)
+            if not has_nonzero_prob:
+                break
+
+            # Debug logging for first datum
+            if rank == 0 and trajectory_id == 0:
+                print(f"\n[SDPO Datum Creation Debug]")
+                print(f"seq_len: {seq_len}, k: {k}, ob_len: {ob_len}, completion_len: {completion_len}")
+                # Only show positions that exist
+                n_show = min(3, completion_len)
+                if n_show > 0:
+                    print(f"Sample advantages (first {n_show} completion positions): {advantages_list[ob_len:ob_len+n_show]}")
+                    print(f"Sample student probs (first {n_show} completion positions): {[math.exp(student_logprobs_list[i]) for i in range(ob_len, ob_len+n_show)]}")
+
+            datum = tinker.Datum(
+                model_input=tinker.ModelInput.from_ints(tokens=input_tokens),
+                loss_fn_inputs={
+                    "target_tokens": tinker.TensorData.from_torch(
+                        torch.tensor(target_tokens_list, dtype=torch.int64)
+                    ),
+                    "logprobs": tinker.TensorData.from_torch(
+                        torch.tensor(student_logprobs_list, dtype=torch.float32)
+                    ),
+                    "advantages": tinker.TensorData.from_torch(
+                        torch.tensor(advantages_list, dtype=torch.float32)
+                    ),
+                    "mask": tinker.TensorData.from_torch(
+                        torch.tensor(mask_list, dtype=torch.float32)
+                    ),
+                },
+            )
+
+            datums.append(datum)
+
+        return datums
+
+    def _build_datum_with_advantages(
+        self,
+        prompt_tokens: list[int],
+        completion_tokens: list[int],
+        student_logprobs: list[float],
+        advantages: list[float],
+    ) -> tinker.Datum | None:
+        """Build a tinker Datum with custom per-token advantages."""
+        import torch
+
+        if not prompt_tokens or not completion_tokens:
+            return None
+
+        ob_len = max(len(prompt_tokens) - 1, 0)
+        all_tokens = prompt_tokens + completion_tokens
+        input_tokens = all_tokens[:-1]
+        target_tokens = all_tokens[1:]
+
+        padded_logprobs = [0.0] * ob_len + list(student_logprobs)
+        padded_advantages = [0.0] * ob_len + list(advantages)
+        action_mask = [0.0] * ob_len + [1.0] * len(completion_tokens)
+
+        if not (
+            len(input_tokens)
+            == len(target_tokens)
+            == len(padded_logprobs)
+            == len(padded_advantages)
+            == len(action_mask)
+        ):
+            return None
+
+        return tinker.Datum(
+            model_input=tinker.ModelInput.from_ints(tokens=input_tokens),
+            loss_fn_inputs={
+                "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens)),
+                "logprobs": tinker.TensorData.from_torch(
+                    torch.tensor(padded_logprobs, dtype=torch.float32)
+                ),
+                "advantages": tinker.TensorData.from_torch(
+                    torch.tensor(padded_advantages, dtype=torch.float32)
+                ),
+                "mask": tinker.TensorData.from_torch(
+                    torch.tensor(action_mask, dtype=torch.float32)
+                ),
+            },
+        )
 
     async def _get_step(self, model: TrainableModel) -> int:
         if model.name in self._model_state:
