@@ -6,6 +6,7 @@ import json
 import math
 import random
 from typing import Any, Generator, cast
+import warnings
 
 from openai.types.chat.chat_completion import Choice
 from PIL import Image
@@ -35,7 +36,7 @@ def _normalize_tools_for_chat_template(tools: Any) -> list[ChatTemplateTool] | N
 def _normalize_tool_call_arguments_for_chat_template(
     tokenizer: PreTrainedTokenizerBase,
     messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | None:
     chat_template = tokenizer.chat_template
     assert isinstance(chat_template, str)
     if "tool_call.arguments|items" not in chat_template:
@@ -56,8 +57,26 @@ def _normalize_tool_call_arguments_for_chat_template(
             assert isinstance(function, dict)
             arguments_json = function["arguments"]
             assert isinstance(arguments_json, str)
-            arguments = json.loads(arguments_json)
-            assert isinstance(arguments, dict)
+            try:
+                arguments = json.loads(arguments_json)
+            except json.JSONDecodeError as exc:
+                # Model can emit malformed JSON (e.g., rollout hit max_tokens
+                # mid-arguments). The chat template requires a mapping, so
+                # there's no safe way to render this trajectory — drop it.
+                warnings.warn(
+                    "Dropping trajectory: tool_call arguments are not valid JSON "
+                    f"({exc}). Raw (truncated to 80 chars): {arguments_json[:80]!r}",
+                    stacklevel=2,
+                )
+                return None
+            if not isinstance(arguments, dict):
+                warnings.warn(
+                    "Dropping trajectory: tool_call arguments JSON must decode to "
+                    f"an object, got {type(arguments).__name__}. Raw (truncated): "
+                    f"{arguments_json[:80]!r}",
+                    stacklevel=2,
+                )
+                return None
             normalized_tool_calls.append(
                 {**tool_call, "function": {**function, "arguments": arguments}}
             )
@@ -262,8 +281,13 @@ def tokenize_trajectory(
     messages_and_choices = history.messages_and_choices[: last_assistant_index + 1]
     messages = cast(list[dict[str, Any]], get_messages(messages_and_choices))
     # Qwen3.5's chat template uses `tool_call.arguments|items`, so it needs a
-    # mapping here instead of the OpenAI JSON string.
-    messages = _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
+    # mapping here instead of the OpenAI JSON string. Returns None when the
+    # model emitted unparseable tool_call arguments — drop the trajectory so
+    # one bad rollout doesn't crash the whole training run.
+    normalized = _normalize_tool_call_arguments_for_chat_template(tokenizer, messages)
+    if normalized is None:
+        return None
+    messages = normalized
     tools = _normalize_tools_for_chat_template(history.tools)
     chat = cast(
         str,

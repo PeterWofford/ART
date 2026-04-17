@@ -239,3 +239,134 @@ def test_tokenize_trajectory_normalizes_mapping_tool_arguments_for_chat_template
     )
 
     assert result is not None
+
+
+def test_tokenize_trajectory_drops_rollouts_with_malformed_tool_call_arguments() -> (
+    None
+):
+    # Models occasionally emit tool-call arguments that are truncated JSON
+    # (e.g., rollout hit max_tokens mid-arguments). The Qwen3.5 chat template
+    # requires a mapping, so ART can't render these trajectories — they must
+    # be dropped gracefully instead of crashing the whole training step.
+    tokenizer = _Qwen3_5FakeTokenizer()
+    choice = Choice.model_validate(
+        {
+            "finish_reason": "length",
+            "index": 0,
+            "logprobs": {
+                "content": [
+                    {
+                        "token": "token_id:65",
+                        "bytes": [65],
+                        "logprob": -0.1,
+                        "top_logprobs": [],
+                    }
+                ],
+                "refusal": None,
+            },
+            "message": {
+                "content": "",
+                "refusal": None,
+                "role": "assistant",
+                "annotations": None,
+                "audio": None,
+                "function_call": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            # Truncated mid-string — unparseable JSON.
+                            "arguments": '{"city": "San Franci',
+                            "name": "lookup_weather",
+                        },
+                        "type": "function",
+                    }
+                ],
+            },
+        }
+    )
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Weather?"},
+            choice,
+        ],
+    )
+    history = History(messages_and_choices=messages)
+    trajectory = Trajectory(messages_and_choices=messages, reward=1.0)
+
+    with pytest.warns(UserWarning, match="Dropping trajectory"):
+        result = tokenize_trajectory(
+            tokenizer=tokenizer,  # type: ignore[arg-type]
+            image_processor=None,
+            history=history,
+            advantage=1.0,
+            allow_training_without_logprobs=False,
+            trajectory=trajectory,
+        )
+
+    assert result is None
+
+
+def test_tokenize_trajectory_drops_rollouts_with_non_object_tool_call_arguments() -> (
+    None
+):
+    # Valid JSON that decodes to something other than an object (list, string,
+    # number) also can't be rendered by a chat template expecting a mapping.
+    tokenizer = _Qwen3_5FakeTokenizer()
+    choice = Choice.model_validate(
+        {
+            "finish_reason": "stop",
+            "index": 0,
+            "logprobs": {
+                "content": [
+                    {
+                        "token": "token_id:65",
+                        "bytes": [65],
+                        "logprob": -0.1,
+                        "top_logprobs": [],
+                    }
+                ],
+                "refusal": None,
+            },
+            "message": {
+                "content": "",
+                "refusal": None,
+                "role": "assistant",
+                "annotations": None,
+                "audio": None,
+                "function_call": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "function": {
+                            "arguments": '["not", "an", "object"]',
+                            "name": "lookup_weather",
+                        },
+                        "type": "function",
+                    }
+                ],
+            },
+        }
+    )
+    messages = cast(
+        MessagesAndChoices,
+        [
+            {"role": "user", "content": "Weather?"},
+            choice,
+        ],
+    )
+    history = History(messages_and_choices=messages)
+    trajectory = Trajectory(messages_and_choices=messages, reward=1.0)
+
+    with pytest.warns(UserWarning, match="must decode to an object"):
+        result = tokenize_trajectory(
+            tokenizer=tokenizer,  # type: ignore[arg-type]
+            image_processor=None,
+            history=history,
+            advantage=1.0,
+            allow_training_without_logprobs=False,
+            trajectory=trajectory,
+        )
+
+    assert result is None
