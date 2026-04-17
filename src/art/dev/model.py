@@ -127,6 +127,12 @@ class InternalModelConfig(TypedDict, total=False):
             - "lora": load LoRA adapters into vLLM directly
             - "merged": keep training LoRA adapters, but push merged weights
               into vLLM for inference
+        chat_template: Optional override for the HF tokenizer chat template
+            used during training-time tokenization. Either a path to a jinja
+            file or the inline template string. Use this when the base
+            tokenizer's template disagrees with the one vLLM is serving for
+            rollouts (e.g., multi-system Qwen3.5), so that rollout and
+            training see the same renderer.
     """
 
     init_args: "InitArgs"
@@ -138,6 +144,7 @@ class InternalModelConfig(TypedDict, total=False):
     trainer_gpu_ids: list[int]
     inference_gpu_ids: list[int]
     rollout_weights_mode: "RolloutWeightsMode"
+    chat_template: str
 
 
 class TinkerArgs(TypedDict, total=False):

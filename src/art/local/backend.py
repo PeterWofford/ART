@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import re
 import shutil
 import socket
@@ -470,6 +471,23 @@ class LocalBackend(Backend):
                 )
         return self._services[model.name]
 
+    def _load_training_tokenizer(
+        self, model: AnyTrainableModel
+    ) -> PreTrainedTokenizerBase:
+        if model.base_model in self._tokenizers:
+            return self._tokenizers[model.base_model]
+        tokenizer = AutoTokenizer.from_pretrained(model.base_model)
+        internal_config = getattr(model, "_internal_config", None) or {}
+        chat_template = internal_config.get("chat_template")
+        if chat_template:
+            candidate = Path(chat_template)
+            if candidate.exists() and candidate.is_file():
+                tokenizer.chat_template = candidate.read_text()
+            else:
+                tokenizer.chat_template = chat_template
+        self._tokenizers[model.base_model] = tokenizer
+        return tokenizer
+
     def _get_packed_tensors(
         self,
         model: AnyTrainableModel,
@@ -479,10 +497,7 @@ class LocalBackend(Backend):
         scale_rewards: bool,
         plot_tensors: bool,
     ) -> PackedTensors | None:
-        if model.base_model not in self._tokenizers:
-            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
-                model.base_model
-            )
+        self._load_training_tokenizer(model)
         if model.base_model not in self._image_processors:
             try:
                 self._image_processors[model.base_model] = (
@@ -1032,12 +1047,7 @@ class LocalBackend(Backend):
         if verbose:
             print("Starting _train_sft")
 
-        # Get tokenizer
-        if model.base_model not in self._tokenizers:
-            self._tokenizers[model.base_model] = AutoTokenizer.from_pretrained(
-                model.base_model
-            )
-        tokenizer = self._tokenizers[model.base_model]
+        tokenizer = self._load_training_tokenizer(model)
 
         from ..utils.sft import resolve_sft_batch_size
 
