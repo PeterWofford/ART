@@ -24,6 +24,14 @@ def _is_language_transformer_layer_name(module_name: str) -> bool:
     return module_name.startswith(("decoder.layers.", "language_model.decoder.layers."))
 
 
+def _language_layer_prefix(module_name: str, layer_number: int) -> str:
+    while module_name.startswith("module."):
+        module_name = module_name.removeprefix("module.")
+    if module_name.startswith("decoder.layers."):
+        return f"decoder.layers.{layer_number - 1}"
+    return f"language_model.decoder.layers.{layer_number - 1}"
+
+
 def _adapter_alpha_dim(lora: LoRA) -> tuple[int, int]:
     dim = int(lora.A_T.shape[-1])
     alpha = float(lora.scale) * dim
@@ -182,7 +190,7 @@ def build_adapter_weights_by_base(
             if not _is_language_transformer_layer_name(module_name):
                 continue
 
-            layer_prefix = f"language_model.decoder.layers.{module.layer_number - 1}"
+            layer_prefix = _language_layer_prefix(module_name, module.layer_number)
             self_attention = module.self_attention
 
             linear_proj = getattr(self_attention, "linear_proj", None)
