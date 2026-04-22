@@ -37,36 +37,36 @@ Requires:
 """
 
 import asyncio
+from collections import Counter
 import json
 import os
+from pathlib import Path
 import random
 import re
 import statistics
 import time
-from collections import Counter
-from pathlib import Path
 from typing import Any, Callable
 
-
-import art
-import httpx
-from art.local import LocalBackend
-from art.metrics import track_api_cost
-from art.rewards import ruler_score_group
 from dotenv import load_dotenv
+import httpx
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletion
 from openai.types.chat.chat_completion import Choice
 from tqdm.asyncio import tqdm
+
+import art
+from art.local import LocalBackend
+from art.metrics import track_api_cost
+from art.rewards import ruler_score_group
 
 load_dotenv()
 
 os.environ.setdefault("WANDB_ENTITY", "coreweave1")
 
 
-
 # Register gpt-5.4 pricing with litellm (not yet in its database)
 import litellm
+
 litellm.model_cost["openai/gpt-5.4"] = {
     "input_cost_per_token": 2.50 / 1_000_000,
     "cache_read_input_token_cost": 0.25 / 1_000_000,
@@ -126,11 +126,14 @@ N_HOLDOUT_ROWS = int(os.environ.get("N_HOLDOUT_ROWS", "300"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "128"))
 ROLLOUT_TEMPERATURE = float(os.environ.get("ROLLOUT_TEMPERATURE", "1.0"))
 SAVE_CHECKPOINT = os.environ.get("SAVE_CHECKPOINT", "true").strip().lower() in {
-    "1", "true", "yes", "on",
+    "1",
+    "true",
+    "yes",
+    "on",
 }
-GPT41_MODEL = "gpt-4.1"            # baseline for holdout win-rate
+GPT41_MODEL = "gpt-4.1"  # baseline for holdout win-rate
 RULER_JUDGE_MODEL = "openai/gpt-5.4"
-RULER_EVAL_CONCURRENCY = 50        # max simultaneous RULER calls during eval
+RULER_EVAL_CONCURRENCY = 50  # max simultaneous RULER calls during eval
 
 # Drop training groups where all RULER scores are nearly equal (no learning signal)
 MIN_REWARD_STD = float(os.environ.get("MIN_REWARD_STD", "0.1"))
@@ -191,6 +194,7 @@ ALIGNED_TIE_EPSILON = float(os.environ.get("ALIGNED_TIE_EPSILON", "0.03"))
 
 # -- Helpers --------------------------------------------------------------------
 
+
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     with open(path) as f:
@@ -220,8 +224,13 @@ def build_runtime_config() -> dict[str, Any]:
         "max_tokens": MAX_TOKENS,
         "rollout_temperature": ROLLOUT_TEMPERATURE,
         "save_checkpoint": SAVE_CHECKPOINT,
-        "upload_checkpoints_to_wandb": _get_env_bool("UPLOAD_CHECKPOINTS_TO_WANDB", False),
-        "upload_checkpoints_every_steps": int(os.environ.get("UPLOAD_CHECKPOINTS_EVERY_STEPS", "0")) or None,
+        "upload_checkpoints_to_wandb": _get_env_bool(
+            "UPLOAD_CHECKPOINTS_TO_WANDB", False
+        ),
+        "upload_checkpoints_every_steps": int(
+            os.environ.get("UPLOAD_CHECKPOINTS_EVERY_STEPS", "0")
+        )
+        or None,
         "ruler_judge_model": RULER_JUDGE_MODEL,
         "min_reward_std": MIN_REWARD_STD,
         "aligned_tie_epsilon": ALIGNED_TIE_EPSILON,
@@ -235,7 +244,9 @@ def build_runtime_config() -> dict[str, Any]:
         "max_seq_length": int(os.environ.get("MAX_SEQ_LENGTH", "8192")),
         "load_in_4bit": _get_env_bool("LOAD_IN_4BIT", False),
         "load_in_16bit": _get_env_bool("LOAD_IN_16BIT", True),
-        "gpu_memory_utilization": float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.8")),
+        "gpu_memory_utilization": float(
+            os.environ.get("GPU_MEMORY_UTILIZATION", "0.8")
+        ),
         "enforce_eager": _get_env_bool("ENFORCE_EAGER", True),
         "max_model_len": int(os.environ.get("MAX_MODEL_LEN", "8192")),
         "max_num_seqs": int(os.environ.get("MAX_NUM_SEQS", "8")),
@@ -253,7 +264,6 @@ def split_context_and_golden(
     if messages and messages[-1].get("role") == "assistant":
         return messages[:-1], messages[-1]
     return messages, None
-
 
 
 def choice_to_tool_name_and_args(choice: Choice) -> tuple[str, Any] | None:
@@ -287,8 +297,6 @@ def tool_calls_match(choice: Choice, golden_msg: dict) -> bool:
     if model_tc is None or golden_tc is None:
         return False
     return model_tc == golden_tc
-
-
 
 
 def flatten_message_content(content: Any) -> str:
@@ -334,72 +342,93 @@ def classify_eval_row(messages: list[dict], tools: list[dict]) -> dict[str, Any]
     full_user_text = " ".join(user_texts)
     tool_names = {tool.get("function", {}).get("name", "") for tool in tools}
 
-    keypad_entry = any(phrase in last_user_text for phrase in [
-        "using your keypad",
-        "using the keypad",
-        "enter your account number",
-        "enter your social security number",
-        "enter your ssn",
-        "enter your date of birth",
-        "key in your",
-        "please enter your",
-    ])
+    keypad_entry = any(
+        phrase in last_user_text
+        for phrase in [
+            "using your keypad",
+            "using the keypad",
+            "enter your account number",
+            "enter your social security number",
+            "enter your ssn",
+            "enter your date of birth",
+            "key in your",
+            "please enter your",
+        ]
+    )
     explicit_menu = (
         bool(re.search(r"\bpress\s+\d+\b", last_user_text))
         or "you can say" in last_user_text
         or bool(re.search(r"\b(?:say|press)\s+[a-z0-9]", last_user_text))
     )
-    direct_question = (
-        "?" in last_user_text
-        or any(phrase in last_user_text for phrase in [
+    direct_question = "?" in last_user_text or any(
+        phrase in last_user_text
+        for phrase in [
             "what you're calling about",
             "please tell me what you're calling about",
             "in a few words",
             "how can i help",
             "what can i help you with",
             "what are you calling about",
-        ])
+        ]
     )
-    yes_no_prompt = any(phrase in last_user_text for phrase in [
-        "is that correct",
-        "yes or no",
-        "would you like",
-        "did i get that right",
-        "if yes",
-        "if no",
-    ])
-    likely_stuck_loop = count_pattern_hits(full_user_text, [
-        "i'm sorry",
-        "sorry, i",
-        "didn't get that",
-        "not sure i got that",
-        "let's try again",
-        "one more time",
-        "invalid",
-    ]) >= 2
+    yes_no_prompt = any(
+        phrase in last_user_text
+        for phrase in [
+            "is that correct",
+            "yes or no",
+            "would you like",
+            "did i get that right",
+            "if yes",
+            "if no",
+        ]
+    )
+    likely_stuck_loop = (
+        count_pattern_hits(
+            full_user_text,
+            [
+                "i'm sorry",
+                "sorry, i",
+                "didn't get that",
+                "not sure i got that",
+                "let's try again",
+                "one more time",
+                "invalid",
+            ],
+        )
+        >= 2
+    )
 
-    balance_seen = any(phrase in full_user_text for phrase in [
-        "current balance",
-        "balance is $",
-        "your balance is",
-        "principal balance",
-        "payoff amount",
-        "available credit",
-    ])
-    last_payment_seen = any(phrase in full_user_text for phrase in [
-        "your last payment of",
-        "last payment of $",
-        "was received and credited",
-        "was received on",
-        "no recent payments on file",
-    ])
-    next_payment_seen = any(phrase in full_user_text for phrase in [
-        "next payment",
-        "payment amount and due date",
-        "no payment due",
-        "there's no payment due",
-        "past due amount",
-    ])
+    balance_seen = any(
+        phrase in full_user_text
+        for phrase in [
+            "current balance",
+            "balance is $",
+            "your balance is",
+            "principal balance",
+            "payoff amount",
+            "available credit",
+        ]
+    )
+    last_payment_seen = any(
+        phrase in full_user_text
+        for phrase in [
+            "your last payment of",
+            "last payment of $",
+            "was received and credited",
+            "was received on",
+            "no recent payments on file",
+        ]
+    )
+    next_payment_seen = any(
+        phrase in full_user_text
+        for phrase in [
+            "next payment",
+            "payment amount and due date",
+            "no payment due",
+            "there's no payment due",
+            "past due amount",
+        ]
+    )
     extractable_now = balance_seen and (last_payment_seen or next_payment_seen)
     actionable_now = keypad_entry or explicit_menu or direct_question or yes_no_prompt
 
@@ -439,7 +468,9 @@ def is_say_action(action: str | None) -> bool:
     return bool(action and action.startswith("say_"))
 
 
-def summarize_holdout_failure_modes(holdout_results: list[dict[str, Any]]) -> dict[str, float]:
+def summarize_holdout_failure_modes(
+    holdout_results: list[dict[str, Any]],
+) -> dict[str, float]:
     if not holdout_results:
         return {}
 
@@ -475,31 +506,61 @@ def summarize_holdout_failure_modes(holdout_results: list[dict[str, Any]]) -> di
             )
 
         metrics[f"failure/{actor}/wait_on_actionable_rate"] = safe_rate(
-            sum(1 for r in holdout_results if r["actionable_now"] and r[f"{actor}_action"] == "wait"),
+            sum(
+                1
+                for r in holdout_results
+                if r["actionable_now"] and r[f"{actor}_action"] == "wait"
+            ),
             supports["actionable_rows"],
         )
         metrics[f"failure/{actor}/wait_after_completion_rate"] = safe_rate(
-            sum(1 for r in holdout_results if r["extractable_now"] and r[f"{actor}_action"] == "wait"),
+            sum(
+                1
+                for r in holdout_results
+                if r["extractable_now"] and r[f"{actor}_action"] == "wait"
+            ),
             supports["extractable_rows"],
         )
         metrics[f"failure/{actor}/missed_extract_rate"] = safe_rate(
-            sum(1 for r in holdout_results if r["extractable_now"] and r[f"{actor}_action"] != "hangup_and_extract"),
+            sum(
+                1
+                for r in holdout_results
+                if r["extractable_now"] and r[f"{actor}_action"] != "hangup_and_extract"
+            ),
             supports["extractable_rows"],
         )
         metrics[f"failure/{actor}/premature_extract_rate"] = safe_rate(
-            sum(1 for r in holdout_results if (not r["extractable_now"]) and r[f"{actor}_action"] == "hangup_and_extract"),
+            sum(
+                1
+                for r in holdout_results
+                if (not r["extractable_now"])
+                and r[f"{actor}_action"] == "hangup_and_extract"
+            ),
             len(holdout_results) - supports["extractable_rows"],
         )
         metrics[f"failure/{actor}/speak_on_keypad_rate"] = safe_rate(
-            sum(1 for r in holdout_results if r["keypad_entry"] and is_say_action(r[f"{actor}_action"])),
+            sum(
+                1
+                for r in holdout_results
+                if r["keypad_entry"] and is_say_action(r[f"{actor}_action"])
+            ),
             supports["keypad_rows"],
         )
         metrics[f"failure/{actor}/say_no_misuse_rate"] = safe_rate(
-            sum(1 for r in holdout_results if (not r["yes_no_prompt"]) and r[f"{actor}_action"] == "say_no"),
+            sum(
+                1
+                for r in holdout_results
+                if (not r["yes_no_prompt"]) and r[f"{actor}_action"] == "say_no"
+            ),
             len(holdout_results) - supports["yes_no_rows"],
         )
         metrics[f"failure/{actor}/navigation_failed_too_early_rate"] = safe_rate(
-            sum(1 for r in holdout_results if (not r["likely_stuck_loop"]) and r[f"{actor}_action"] == "navigation_failed"),
+            sum(
+                1
+                for r in holdout_results
+                if (not r["likely_stuck_loop"])
+                and r[f"{actor}_action"] == "navigation_failed"
+            ),
             len(holdout_results) - supports["stuck_loop_rows"],
         )
         metrics[f"failure/{actor}/wait_loss_rate"] = safe_rate(
@@ -514,17 +575,27 @@ def summarize_holdout_failure_modes(holdout_results: list[dict[str, Any]]) -> di
         )
 
     metrics["failure/compare/model_wait_vs_gpt41_action_rate"] = safe_rate(
-        sum(1 for r in holdout_results if r["model_action"] == "wait" and r["gpt41_action"] not in {None, "wait"}),
+        sum(
+            1
+            for r in holdout_results
+            if r["model_action"] == "wait" and r["gpt41_action"] not in {None, "wait"}
+        ),
         len(holdout_results),
     )
     metrics["failure/compare/gpt41_wait_vs_model_action_rate"] = safe_rate(
-        sum(1 for r in holdout_results if r["gpt41_action"] == "wait" and r["model_action"] not in {None, "wait"}),
+        sum(
+            1
+            for r in holdout_results
+            if r["gpt41_action"] == "wait" and r["model_action"] not in {None, "wait"}
+        ),
         len(holdout_results),
     )
     return metrics
 
 
-def summarize_test_failure_modes(test_results: list[dict[str, Any]]) -> dict[str, float]:
+def summarize_test_failure_modes(
+    test_results: list[dict[str, Any]],
+) -> dict[str, float]:
     if not test_results:
         return {}
 
@@ -561,15 +632,27 @@ def summarize_test_failure_modes(test_results: list[dict[str, Any]]) -> dict[str
         len(test_results),
     )
     metrics["test/failure/wait_on_actionable_rate"] = safe_rate(
-        sum(1 for r in test_results if r["actionable_now"] and r["model_action"] == "wait"),
+        sum(
+            1
+            for r in test_results
+            if r["actionable_now"] and r["model_action"] == "wait"
+        ),
         supports["actionable_rows"],
     )
     metrics["test/failure/speak_on_keypad_rate"] = safe_rate(
-        sum(1 for r in test_results if r["keypad_entry"] and is_say_action(r["model_action"])),
+        sum(
+            1
+            for r in test_results
+            if r["keypad_entry"] and is_say_action(r["model_action"])
+        ),
         supports["keypad_rows"],
     )
     metrics["test/failure/say_no_misuse_rate"] = safe_rate(
-        sum(1 for r in test_results if (not r["yes_no_prompt"]) and r["model_action"] == "say_no"),
+        sum(
+            1
+            for r in test_results
+            if (not r["yes_no_prompt"]) and r["model_action"] == "say_no"
+        ),
         len(test_results) - supports["yes_no_rows"],
     )
     metrics["test/failure/missed_extract_rate"] = safe_rate(
@@ -580,7 +663,11 @@ def summarize_test_failure_modes(test_results: list[dict[str, Any]]) -> dict[str
             and r["golden_action"] == "hangup_and_extract"
             and r["model_action"] != "hangup_and_extract"
         ),
-        sum(1 for r in test_results if r["extractable_now"] and r["golden_action"] == "hangup_and_extract"),
+        sum(
+            1
+            for r in test_results
+            if r["extractable_now"] and r["golden_action"] == "hangup_and_extract"
+        ),
     )
     metrics["test/failure/enter_digit_arg_mismatch_rate"] = safe_rate(
         sum(
@@ -622,17 +709,21 @@ def insert_tool_responses(messages: list[dict]) -> list[dict]:
             next_role = messages[i + 1].get("role") if i + 1 < len(messages) else None
             if next_role != "tool":
                 for tc in msg["tool_calls"]:
-                    result.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": "",
-                    })
+                    result.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": "",
+                        }
+                    )
     return result
 
 
 def extract_final_turn(trajectory: art.Trajectory) -> dict:
     """Extract the final assistant turn from a trajectory as a plain dict."""
-    last = trajectory.messages_and_choices[-1] if trajectory.messages_and_choices else None
+    last = (
+        trajectory.messages_and_choices[-1] if trajectory.messages_and_choices else None
+    )
     if last is None:
         return {}
     if hasattr(last, "message"):
@@ -640,11 +731,17 @@ def extract_final_turn(trajectory: art.Trajectory) -> dict:
         tool_calls = []
         if msg.tool_calls:
             for tc in msg.tool_calls:
-                tool_calls.append({"name": tc.function.name, "arguments": tc.function.arguments})
+                tool_calls.append(
+                    {"name": tc.function.name, "arguments": tc.function.arguments}
+                )
         return {"content": msg.content, "tool_calls": tool_calls}
     tool_calls = [
-        {"name": tc.get("function", {}).get("name", tc.get("name", "")),
-         "arguments": tc.get("function", {}).get("arguments", tc.get("arguments", ""))}
+        {
+            "name": tc.get("function", {}).get("name", tc.get("name", "")),
+            "arguments": tc.get("function", {}).get(
+                "arguments", tc.get("arguments", "")
+            ),
+        }
         for tc in (last.get("tool_calls") or [])
     ]
     return {"content": last.get("content", ""), "tool_calls": tool_calls}
@@ -652,7 +749,7 @@ def extract_final_turn(trajectory: art.Trajectory) -> dict:
 
 def get_ruler_reasoning(trajectory: art.Trajectory) -> str | None:
     """Extract RULER explanation from trajectory logs."""
-    for entry in (trajectory.logs or []):
+    for entry in trajectory.logs or []:
         s = entry if isinstance(entry, str) else str(entry)
         if "RULER explanation:" in s:
             return s.split("RULER explanation:", 1)[1].strip()
@@ -664,12 +761,14 @@ def log_trajectory_samples(scored_groups: list[art.TrajectoryGroup], step: int) 
     log_dir = EVAL_LOG_DIR / "trajectories"
     log_dir.mkdir(exist_ok=True, parents=True)
     log_path = log_dir / f"step_{step:04d}.jsonl"
-    print(f"\n  {'─'*56}")
+    print(f"\n  {'─' * 56}")
     print(f"  Trajectory samples (step {step})")
-    print(f"  {'─'*56}")
+    print(f"  {'─' * 56}")
     with open(log_path, "w") as f:
         for group in scored_groups:
-            scenario_id = group.metadata.get("scenario_id", "") if group.metadata else ""
+            scenario_id = (
+                group.metadata.get("scenario_id", "") if group.metadata else ""
+            )
             for i, traj in enumerate(group.trajectories):
                 reasoning = get_ruler_reasoning(traj)
                 final_turn = extract_final_turn(traj)
@@ -684,9 +783,12 @@ def log_trajectory_samples(scored_groups: list[art.TrajectoryGroup], step: int) 
                 f.write(json.dumps(entry) + "\n")
                 tool_str = (
                     ", ".join(tc["name"] for tc in final_turn.get("tool_calls") or [])
-                    or final_turn.get("content") or "(empty)"
+                    or final_turn.get("content")
+                    or "(empty)"
                 )
-                print(f"  [{scenario_id}] traj {i}: reward={traj.reward:.3f}  action={tool_str}")
+                print(
+                    f"  [{scenario_id}] traj {i}: reward={traj.reward:.3f}  action={tool_str}"
+                )
                 if reasoning:
                     print(f"    reasoning: {reasoning}")
     print(f"  Trajectory log -> {log_path}")
@@ -727,7 +829,7 @@ async def generate_response(
             return resp.choices
         except Exception as exc:
             if "Already borrowed" in str(exc) and attempt < 4:
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(2**attempt)
                 continue
             print(f"    Warning: generation failed ({model_name}): {exc}")
             break
@@ -759,6 +861,7 @@ async def generate_gpt41_response(
 
 # -- Validation ----------------------------------------------------------------
 
+
 async def run_eval(
     model: art.TrainableModel,
     backend: LocalBackend,
@@ -776,10 +879,9 @@ async def run_eval(
     Test:    Exact match -- model response vs golden assistant turn in the file.
              Win rate = fraction where tool call (name + args) matches golden.
     """
-    print(f"\n{'─'*60}")
-    print(f"Eval at step {step}  "
-          f"(holdout={len(holdout_rows)}, test={len(test_rows)})")
-    print(f"{'─'*60}")
+    print(f"\n{'─' * 60}")
+    print(f"Eval at step {step}  (holdout={len(holdout_rows)}, test={len(test_rows)})")
+    print(f"{'─' * 60}")
 
     await backend.persist_checkpoint(
         model=model,
@@ -798,29 +900,35 @@ async def run_eval(
         row_features = classify_eval_row(messages, tools)
 
         async with model_semaphore:
-            model_choices = await generate_response(model_client, get_inference_model_name(), messages, tools)
+            model_choices = await generate_response(
+                model_client, get_inference_model_name(), messages, tools
+            )
         model_choice = model_choices[0] if model_choices else None
         try:
             gpt41_resp = await generate_gpt41_response(gpt41_client, messages, tools)
         except Exception as exc:
             print(f"    Warning: GPT-4.1 cost tracking failed: {exc}")
             gpt41_resp = None
-        gpt41_choice = gpt41_resp.choices[0] if gpt41_resp and gpt41_resp.choices else None
+        gpt41_choice = (
+            gpt41_resp.choices[0] if gpt41_resp and gpt41_resp.choices else None
+        )
         if model_choice is None or gpt41_choice is None:
             return None
 
-        group = art.TrajectoryGroup([
-            art.Trajectory(
-                messages_and_choices=list(messages) + [model_choice],
-                tools=tools,
-                reward=0.0,
-            ),
-            art.Trajectory(
-                messages_and_choices=list(messages) + [gpt41_choice],
-                tools=tools,
-                reward=0.0,
-            ),
-        ])
+        group = art.TrajectoryGroup(
+            [
+                art.Trajectory(
+                    messages_and_choices=list(messages) + [model_choice],
+                    tools=tools,
+                    reward=0.0,
+                ),
+                art.Trajectory(
+                    messages_and_choices=list(messages) + [gpt41_choice],
+                    tools=tools,
+                    reward=0.0,
+                ),
+            ]
+        )
 
         async with ruler_semaphore:
             scored = await ruler_score_group(
@@ -859,19 +967,27 @@ async def run_eval(
         row_features = classify_eval_row(context, tools)
 
         async with model_semaphore:
-            model_choices = await generate_response(model_client, get_inference_model_name(), context, tools)
+            model_choices = await generate_response(
+                model_client, get_inference_model_name(), context, tools
+            )
         model_choice = model_choices[0] if model_choices else None
         if model_choice is None:
             return None
 
         gpt41_resp = await generate_gpt41_response(gpt41_client, context, tools)
-        gpt41_choice = gpt41_resp.choices[0] if gpt41_resp and gpt41_resp.choices else None
+        gpt41_choice = (
+            gpt41_resp.choices[0] if gpt41_resp and gpt41_resp.choices else None
+        )
 
         matched = tool_calls_match(model_choice, golden_msg)
         model_tc = choice_to_tool_name_and_args(model_choice)
         golden_tc = message_to_tool_name_and_args(golden_msg)
         gpt41_tc = choice_to_tool_name_and_args(gpt41_choice) if gpt41_choice else None
-        tie = model_tc == gpt41_tc if (model_tc is not None and gpt41_tc is not None) else False
+        tie = (
+            model_tc == gpt41_tc
+            if (model_tc is not None and gpt41_tc is not None)
+            else False
+        )
         return {
             "match": matched,
             "tie": tie,
@@ -883,30 +999,39 @@ async def run_eval(
     with eval_builder.activate_context():
         with eval_builder.measure("time/step_eval_s"):
             holdout_results, test_results = await asyncio.gather(
-                tqdm.gather(*[eval_holdout_row(r) for r in holdout_rows],
-                            desc=f"Eval (holdout) step {step}"),
-                tqdm.gather(*[eval_test_row(r)    for r in test_rows],
-                            desc=f"Eval (test)    step {step}"),
+                tqdm.gather(
+                    *[eval_holdout_row(r) for r in holdout_rows],
+                    desc=f"Eval (holdout) step {step}",
+                ),
+                tqdm.gather(
+                    *[eval_test_row(r) for r in test_rows],
+                    desc=f"Eval (test)    step {step}",
+                ),
             )
 
     holdout_results = [r for r in holdout_results if r is not None]
-    test_results    = [r for r in test_results    if r is not None]
+    test_results = [r for r in test_results if r is not None]
 
     if holdout_results:
-        wins  = sum(1 for r in holdout_results if r["win"])
-        ties  = sum(1 for r in holdout_results if r["tie"])
+        wins = sum(1 for r in holdout_results if r["win"])
+        ties = sum(1 for r in holdout_results if r["tie"])
         h_n = len(holdout_results)
-        h_win_rate  = wins / h_n
-        h_tie_rate  = ties / h_n
+        h_win_rate = wins / h_n
+        h_tie_rate = ties / h_n
         h_win_tie_rate = (wins + ties) / h_n
         holdout_failure_metrics = summarize_holdout_failure_modes(holdout_results)
     else:
-        h_win_rate, h_tie_rate, h_win_tie_rate, h_n = float("nan"), float("nan"), float("nan"), 0
+        h_win_rate, h_tie_rate, h_win_tie_rate, h_n = (
+            float("nan"),
+            float("nan"),
+            float("nan"),
+            0,
+        )
         holdout_failure_metrics = {}
 
     if test_results:
         t_match_rate = sum(r["match"] for r in test_results) / len(test_results)
-        t_tie_rate   = sum(r["tie"]   for r in test_results) / len(test_results)
+        t_tie_rate = sum(r["tie"] for r in test_results) / len(test_results)
         t_n = len(test_results)
         test_failure_metrics = summarize_test_failure_modes(test_results)
     else:
@@ -964,17 +1089,26 @@ async def run_eval(
     EVAL_LOG_DIR.mkdir(exist_ok=True, parents=True)
     log_path = EVAL_LOG_DIR / f"step_{step:04d}.json"
     with open(log_path, "w") as f:
-        json.dump({
-            "step": step,
-            "holdout": {"win_rate": h_win_rate, "tie_rate": h_tie_rate, "win_tie_rate": h_win_tie_rate, "n": h_n},
-            "test": {"match_rate": t_match_rate, "n": t_n},
-            "holdout_diagnostics": holdout_failure_metrics,
-            "test_diagnostics": test_failure_metrics,
-        }, f)
+        json.dump(
+            {
+                "step": step,
+                "holdout": {
+                    "win_rate": h_win_rate,
+                    "tie_rate": h_tie_rate,
+                    "win_tie_rate": h_win_tie_rate,
+                    "n": h_n,
+                },
+                "test": {"match_rate": t_match_rate, "n": t_n},
+                "holdout_diagnostics": holdout_failure_metrics,
+                "test_diagnostics": test_failure_metrics,
+            },
+            f,
+        )
     print(f"  Logged -> {log_path}")
 
 
 # -- Training loop -------------------------------------------------------------
+
 
 async def train(model: art.TrainableModel) -> None:
     runtime_config = build_runtime_config()
@@ -1003,7 +1137,9 @@ async def train(model: art.TrainableModel) -> None:
                 from_model=FORK_FROM_MODEL,
                 from_project=FORK_FROM_PROJECT or PROJECT_NAME,
                 from_wandb_artifact=FORK_FROM_ARTIFACT,
-                not_after_step=int(FORK_NOT_AFTER_STEP) if FORK_NOT_AFTER_STEP else None,
+                not_after_step=int(FORK_NOT_AFTER_STEP)
+                if FORK_NOT_AFTER_STEP
+                else None,
                 verbose=True,
             )
 
@@ -1033,9 +1169,13 @@ async def train(model: art.TrainableModel) -> None:
             if choices:
                 token_logprobs = []
                 if choices[0].logprobs and choices[0].logprobs.content:
-                    token_logprobs = [t.model_dump() for t in choices[0].logprobs.content]
+                    token_logprobs = [
+                        t.model_dump() for t in choices[0].logprobs.content
+                    ]
                 if token_logprobs:
-                    raw_bytes = b"".join(bytes(t["bytes"]) for t in token_logprobs if t.get("bytes"))
+                    raw_bytes = b"".join(
+                        bytes(t["bytes"]) for t in token_logprobs if t.get("bytes")
+                    )
                     if raw_bytes:
                         print("\nRaw decoded output (from bytes):")
                         print(raw_bytes.decode("utf-8", errors="replace"))
@@ -1073,10 +1213,14 @@ async def train(model: art.TrainableModel) -> None:
         # -- Load and sample test data ------------------------------------------
         print(f"Loading test data from {TEST_PATH} ...")
         all_test = load_jsonl(TEST_PATH)
-        split_counts = Counter(str(row.get("split", "<missing>")) for row in all_test if "split" in row)
+        split_counts = Counter(
+            str(row.get("split", "<missing>")) for row in all_test if "split" in row
+        )
         if split_counts:
             print(f"  split distribution: {dict(split_counts)}")
-            candidate_test_rows = [row for row in all_test if row.get("split") == "TEST"]
+            candidate_test_rows = [
+                row for row in all_test if row.get("split") == "TEST"
+            ]
             if not candidate_test_rows:
                 raise ValueError(
                     f"Expected at least one split == 'TEST' row in {TEST_PATH}, "
@@ -1105,9 +1249,9 @@ async def train(model: art.TrainableModel) -> None:
         stop_training = False
 
         for epoch in range(NUM_EPOCHS):
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"Epoch {epoch + 1}/{NUM_EPOCHS}  ({len(train_rows)} rows)")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
 
             epoch_rows = train_rows.copy()
             rng_epoch = random.Random(SHUFFLE_SEED + epoch)
@@ -1130,8 +1274,14 @@ async def train(model: art.TrainableModel) -> None:
                 # -- Periodic eval ----------------------------------------------
                 if (step - last_eval_step) >= EVAL_EVERY:
                     await run_eval(
-                        model, backend, model_client, get_inference_model_name, gpt41_client,
-                        holdout_rows, test_rows, step,
+                        model,
+                        backend,
+                        model_client,
+                        get_inference_model_name,
+                        gpt41_client,
+                        holdout_rows,
+                        test_rows,
+                        step,
                     )
                     last_eval_step = step
 
@@ -1152,26 +1302,32 @@ async def train(model: art.TrainableModel) -> None:
                     context, _ = split_context_and_golden(messages)
 
                     choices = await generate_response(
-                        model_client, get_inference_model_name(), context, tools, n=GRPO_GROUP_SIZE
+                        model_client,
+                        get_inference_model_name(),
+                        context,
+                        tools,
+                        n=GRPO_GROUP_SIZE,
                     )
                     if not choices:
                         return None
 
-                    group = art.TrajectoryGroup([
-                        art.Trajectory(
-                            messages_and_choices=context + [choice],
-                            tools=tools,
-                            reward=0.0,
-                        )
-                        for choice in choices
-                    ])
+                    group = art.TrajectoryGroup(
+                        [
+                            art.Trajectory(
+                                messages_and_choices=context + [choice],
+                                tools=tools,
+                                reward=0.0,
+                            )
+                            for choice in choices
+                        ]
+                    )
                     group.metadata["scenario_id"] = scenario_id
                     return group
 
                 async def score_group(
                     group: art.TrajectoryGroup,
                 ) -> art.TrajectoryGroup | None:
-                    non_tool_trajs:list[art.Trajectory] = []
+                    non_tool_trajs: list[art.Trajectory] = []
                     for t in group.trajectories:
                         if not t.messages_and_choices[-1].message.tool_calls:
                             non_tool_trajs.append(t)
@@ -1189,7 +1345,7 @@ async def train(model: art.TrainableModel) -> None:
 
                     if scored is None:
                         return None
-                    
+
                     for t in non_tool_trajs:
                         t.reward = -0.1
                         scored.trajectories.append(t)
@@ -1200,15 +1356,17 @@ async def train(model: art.TrainableModel) -> None:
 
                 with train_builder.activate_context():
                     with train_builder.measure("time/step_actor_s"):
-                        raw_groups = await asyncio.gather(*[
-                            build_group(r, sid)
-                            for r, sid in zip(batch, scenario_ids)
-                        ])
+                        raw_groups = await asyncio.gather(
+                            *[
+                                build_group(r, sid)
+                                for r, sid in zip(batch, scenario_ids)
+                            ]
+                        )
                         raw_groups = [g for g in raw_groups if g is not None]
 
-                        scored_groups = await asyncio.gather(*[
-                            score_group(g) for g in raw_groups
-                        ])
+                        scored_groups = await asyncio.gather(
+                            *[score_group(g) for g in raw_groups]
+                        )
                         scored_groups = [g for g in scored_groups if g is not None]
 
                 train_builder.add_data(
@@ -1254,8 +1412,14 @@ async def train(model: art.TrainableModel) -> None:
         # Final eval
         step = await model.get_step()
         await run_eval(
-            model, backend, model_client, get_inference_model_name, gpt41_client,
-            holdout_rows, test_rows, step,
+            model,
+            backend,
+            model_client,
+            get_inference_model_name,
+            gpt41_client,
+            holdout_rows,
+            test_rows,
+            step,
         )
         print("\nTraining complete.")
     finally:
@@ -1292,7 +1456,9 @@ if __name__ == "__main__":
             load_in_16bit=_get_env_bool("LOAD_IN_16BIT", True),
         ),
         engine_args=art.dev.EngineArgs(
-            gpu_memory_utilization=float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.8")),
+            gpu_memory_utilization=float(
+                os.environ.get("GPU_MEMORY_UTILIZATION", "0.8")
+            ),
             enforce_eager=_get_env_bool("ENFORCE_EAGER", True),
             max_model_len=int(os.environ.get("MAX_MODEL_LEN", "8192")),
             max_num_seqs=int(os.environ.get("MAX_NUM_SEQS", "8")),

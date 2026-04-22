@@ -11,17 +11,23 @@ and resume semantics.
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 import json
 import os
+from pathlib import Path
 import random
 import statistics
-from collections import Counter
-from pathlib import Path
 from typing import Any
 
-import art
+from dotenv import load_dotenv
 import httpx
 import litellm
+from openai import AsyncOpenAI
+from openai.types.chat import ChatCompletion
+from openai.types.chat.chat_completion import Choice
+from tqdm.asyncio import tqdm
+
+import art
 from art.local import LocalBackend
 from art.metrics import track_api_cost
 from art.pipeline_trainer import PipelineTrainer
@@ -32,11 +38,6 @@ from art.pipeline_trainer.ivr_nav_pilot import (
     split_train_holdout_by_session,
 )
 from art.rewards import ruler_score_group
-from dotenv import load_dotenv
-from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletion
-from openai.types.chat.chat_completion import Choice
-from tqdm.asyncio import tqdm
 
 load_dotenv()
 os.environ.setdefault("WANDB_ENTITY", "coreweave1")
@@ -139,7 +140,9 @@ def insert_tool_responses(messages: list[dict[str, Any]]) -> list[dict[str, Any]
     for idx, msg in enumerate(messages):
         result.append(msg)
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            next_role = messages[idx + 1].get("role") if idx + 1 < len(messages) else None
+            next_role = (
+                messages[idx + 1].get("role") if idx + 1 < len(messages) else None
+            )
             if next_role != "tool":
                 for tc in msg["tool_calls"]:
                     result.append(
@@ -195,7 +198,9 @@ def group_reward_std(group: art.TrajectoryGroup) -> float:
 
 
 def extract_final_turn(trajectory: art.Trajectory) -> dict[str, Any]:
-    last = trajectory.messages_and_choices[-1] if trajectory.messages_and_choices else None
+    last = (
+        trajectory.messages_and_choices[-1] if trajectory.messages_and_choices else None
+    )
     if last is None:
         return {}
     if hasattr(last, "message"):
@@ -212,7 +217,9 @@ def extract_final_turn(trajectory: art.Trajectory) -> dict[str, Any]:
         "tool_calls": [
             {
                 "name": tc.get("function", {}).get("name", tc.get("name", "")),
-                "arguments": tc.get("function", {}).get("arguments", tc.get("arguments", "")),
+                "arguments": tc.get("function", {}).get(
+                    "arguments", tc.get("arguments", "")
+                ),
             }
             for tc in (last.get("tool_calls") or [])
         ],
@@ -233,7 +240,9 @@ def log_trajectory_samples(scored_groups: list[art.TrajectoryGroup], step: int) 
     log_path = log_dir / f"step_{step:04d}.jsonl"
     with open(log_path, "w") as f:
         for group in scored_groups:
-            scenario_id = str(group.metadata.get("scenario_id", "")) if group.metadata else ""
+            scenario_id = (
+                str(group.metadata.get("scenario_id", "")) if group.metadata else ""
+            )
             for idx, trajectory in enumerate(group.trajectories):
                 entry = {
                     "step": step,
@@ -317,8 +326,13 @@ def build_runtime_config() -> dict[str, Any]:
         "rollout_temperature": PILOT_CONFIG.rollout_temperature,
         "eval_temperature": PILOT_CONFIG.eval_temperature,
         "save_checkpoint": SAVE_CHECKPOINT,
-        "upload_checkpoints_to_wandb": _get_env_bool("UPLOAD_CHECKPOINTS_TO_WANDB", False),
-        "upload_checkpoints_every_steps": int(os.environ.get("UPLOAD_CHECKPOINTS_EVERY_STEPS", "0")) or None,
+        "upload_checkpoints_to_wandb": _get_env_bool(
+            "UPLOAD_CHECKPOINTS_TO_WANDB", False
+        ),
+        "upload_checkpoints_every_steps": int(
+            os.environ.get("UPLOAD_CHECKPOINTS_EVERY_STEPS", "0")
+        )
+        or None,
         "ruler_judge_model": RULER_JUDGE_MODEL,
         "min_reward_std": MIN_REWARD_STD,
         "gpt41_model": GPT41_MODEL,
@@ -342,9 +356,11 @@ async def run_eval(
     step: int,
     eval_temperature: float,
 ) -> None:
-    print(f"\n{'─'*60}")
-    print(f"Pilot eval at step {step}  (holdout={len(holdout_rows)}, test={len(test_rows)})")
-    print(f"{'─'*60}")
+    print(f"\n{'─' * 60}")
+    print(
+        f"Pilot eval at step {step}  (holdout={len(holdout_rows)}, test={len(test_rows)})"
+    )
+    print(f"{'─' * 60}")
 
     await backend.persist_checkpoint(
         model=model,
@@ -370,7 +386,9 @@ async def run_eval(
             )
         model_choice = model_choices[0] if model_choices else None
         gpt41_resp = await generate_gpt41_response(gpt41_client, messages, tools)
-        gpt41_choice = gpt41_resp.choices[0] if gpt41_resp and gpt41_resp.choices else None
+        gpt41_choice = (
+            gpt41_resp.choices[0] if gpt41_resp and gpt41_resp.choices else None
+        )
         if model_choice is None or gpt41_choice is None:
             return None
 
@@ -453,7 +471,9 @@ async def run_eval(
         h_n = 0
 
     if test_results:
-        t_match_rate = sum(1 for row in test_results if row["match"]) / len(test_results)
+        t_match_rate = sum(1 for row in test_results if row["match"]) / len(
+            test_results
+        )
         t_n = len(test_results)
     else:
         t_match_rate = float("nan")
@@ -532,7 +552,9 @@ async def train(model: art.TrainableModel) -> None:
 
     print(f"Loading test data from {TEST_PATH} ...")
     all_test = load_jsonl(TEST_PATH)
-    split_counts = Counter(str(row.get("split", "<missing>")) for row in all_test if "split" in row)
+    split_counts = Counter(
+        str(row.get("split", "<missing>")) for row in all_test if "split" in row
+    )
     if split_counts:
         print(f"  split distribution: {dict(split_counts)}")
     test_rows = select_test_rows(
@@ -665,7 +687,9 @@ if __name__ == "__main__":
             load_in_16bit=_get_env_bool("LOAD_IN_16BIT", True),
         ),
         engine_args=art.dev.EngineArgs(
-            gpu_memory_utilization=float(os.environ.get("GPU_MEMORY_UTILIZATION", "0.8")),
+            gpu_memory_utilization=float(
+                os.environ.get("GPU_MEMORY_UTILIZATION", "0.8")
+            ),
             enforce_eager=_get_env_bool("ENFORCE_EAGER", True),
             max_model_len=int(os.environ.get("MAX_MODEL_LEN", "8192")),
             max_num_seqs=int(os.environ.get("MAX_NUM_SEQS", "8")),

@@ -4,10 +4,11 @@ import logging
 import os
 from pathlib import Path
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from wandb.sdk.wandb_run import Run
+
     from art.model import TrainableModel
 
 logger = logging.getLogger(__name__)
@@ -40,7 +41,9 @@ def checkpoint_upload_every_steps() -> int:
     if fallback_eval_every is not None and fallback_eval_every.strip():
         parsed = int(fallback_eval_every)
         if parsed <= 0:
-            raise ValueError("EVAL_EVERY must be positive when used as checkpoint upload fallback")
+            raise ValueError(
+                "EVAL_EVERY must be positive when used as checkpoint upload fallback"
+            )
         return parsed
 
     return 20
@@ -53,7 +56,9 @@ def should_upload_checkpoint_step(step: int) -> bool:
     return step % every_steps == 0
 
 
-def _artifact_cache_key(entity: str, project: str, artifact_name: str) -> tuple[str, str, str]:
+def _artifact_cache_key(
+    entity: str, project: str, artifact_name: str
+) -> tuple[str, str, str]:
     return (entity, project, artifact_name)
 
 
@@ -72,7 +77,7 @@ def _get_existing_aliases(entity: str, project: str, artifact_name: str) -> set[
             type_name="lora",
             name=f"{entity}/{project}/{artifact_name}",
         )
-        for version in collection.versions():
+        for version in cast(Any, collection).versions():
             aliases.update(version.aliases)
     except wandb.errors.CommError:
         pass
@@ -81,7 +86,9 @@ def _get_existing_aliases(entity: str, project: str, artifact_name: str) -> set[
     return aliases
 
 
-def _mark_aliases_uploaded(entity: str, project: str, artifact_name: str, aliases: list[str]) -> None:
+def _mark_aliases_uploaded(
+    entity: str, project: str, artifact_name: str, aliases: list[str]
+) -> None:
     cache_key = _artifact_cache_key(entity, project, artifact_name)
     with _ALIAS_LOCK:
         cached = _ALIAS_CACHE.setdefault(cache_key, set())
@@ -147,9 +154,15 @@ def maybe_upload_checkpoint_to_wandb(
     pending_key = (*cache_key, alias)
     with _ALIAS_LOCK:
         cached_aliases = _ALIAS_CACHE.setdefault(cache_key, set())
-        if alias in existing_aliases or alias in cached_aliases or pending_key in _IN_FLIGHT_ALIASES:
+        if (
+            alias in existing_aliases
+            or alias in cached_aliases
+            or pending_key in _IN_FLIGHT_ALIASES
+        ):
             if verbose:
-                print(f"Checkpoint artifact already exists or is in-flight for {artifact_name}:{alias}; skipping upload.")
+                print(
+                    f"Checkpoint artifact already exists or is in-flight for {artifact_name}:{alias}; skipping upload."
+                )
             return False
         _IN_FLIGHT_ALIASES.add(pending_key)
 
@@ -169,7 +182,12 @@ def maybe_upload_checkpoint_to_wandb(
             artifact_handle.wait()
         except ValueError as exc:
             if "Unable to fetch artifact" in str(exc):
-                logger.warning("W&B artifact fetch warning after uploading %s:%s: %s", artifact_name, alias, exc)
+                logger.warning(
+                    "W&B artifact fetch warning after uploading %s:%s: %s",
+                    artifact_name,
+                    alias,
+                    exc,
+                )
             else:
                 raise
         upload_succeeded = True
@@ -180,5 +198,7 @@ def maybe_upload_checkpoint_to_wandb(
     if upload_succeeded:
         _mark_aliases_uploaded(entity, model.project, artifact_name, aliases)
         if verbose:
-            print(f"Uploaded checkpoint artifact {entity}/{model.project}/{artifact_name}:{alias}")
+            print(
+                f"Uploaded checkpoint artifact {entity}/{model.project}/{artifact_name}:{alias}"
+            )
     return upload_succeeded

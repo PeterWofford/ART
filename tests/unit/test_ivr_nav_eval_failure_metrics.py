@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import ast
+from pathlib import Path
 import re
 import statistics
-from pathlib import Path
 from typing import Any
 
 import pytest
-
 
 ART_ROOT = Path(__file__).resolve().parents[2]
 TRAIN_RULER_PATH = ART_ROOT / "dev" / "train_ruler.py"
@@ -50,7 +49,9 @@ def metric_helpers() -> dict[str, Any]:
     return _load_metric_helpers()
 
 
-def test_classify_eval_row_detects_actionable_and_extractable_states(metric_helpers: dict[str, Any]) -> None:
+def test_classify_eval_row_detects_actionable_and_extractable_states(
+    metric_helpers: dict[str, Any],
+) -> None:
     classify_eval_row = metric_helpers["classify_eval_row"]
 
     keypad_row = classify_eval_row(
@@ -76,7 +77,7 @@ def test_classify_eval_row_detects_actionable_and_extractable_states(metric_help
                 "role": "user",
                 "content": (
                     'Message from IVR stream: "your last payment of $33.61 was received '
-                    'on december 12, 2025. there\'s no payment due at this time."'
+                    "on december 12, 2025. there's no payment due at this time.\""
                 ),
             },
         ],
@@ -182,16 +183,24 @@ def test_summarize_holdout_failure_modes_tracks_model_and_gpt41_patterns(
     assert metrics["failure/model/premature_extract_rate"] == pytest.approx(0.2)
     assert metrics["failure/model/speak_on_keypad_rate"] == pytest.approx(1.0)
     assert metrics["failure/model/say_no_misuse_rate"] == pytest.approx(1 / 6)
-    assert metrics["failure/model/navigation_failed_too_early_rate"] == pytest.approx(0.0)
+    assert metrics["failure/model/navigation_failed_too_early_rate"] == pytest.approx(
+        0.0
+    )
     assert metrics["failure/model/wait_loss_rate"] == pytest.approx(1.0)
 
     assert metrics["failure/gpt41/wait_on_actionable_rate"] == pytest.approx(0.5)
     assert metrics["failure/gpt41/missed_extract_rate"] == pytest.approx(0.0)
     assert metrics["failure/gpt41/wait_loss_rate"] == pytest.approx(0.25)
 
-    assert metrics["failure/compare/model_wait_vs_gpt41_action_rate"] == pytest.approx(2 / 6)
-    assert metrics["failure/compare/gpt41_wait_vs_model_action_rate"] == pytest.approx(4 / 6)
-    assert metrics["compare/score_delta_mean"] == pytest.approx(statistics.mean(r["score_delta"] for r in holdout_results))
+    assert metrics["failure/compare/model_wait_vs_gpt41_action_rate"] == pytest.approx(
+        2 / 6
+    )
+    assert metrics["failure/compare/gpt41_wait_vs_model_action_rate"] == pytest.approx(
+        4 / 6
+    )
+    assert metrics["compare/score_delta_mean"] == pytest.approx(
+        statistics.mean(float(r["score_delta"]) for r in holdout_results)
+    )
 
 
 def test_summarize_test_failure_modes_breaks_down_wrong_tool_vs_wrong_args(

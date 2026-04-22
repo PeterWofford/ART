@@ -3,11 +3,11 @@
 import argparse
 import json
 import os
+from pathlib import Path
 import shlex
 import subprocess
 import sys
 import textwrap
-from pathlib import Path
 
 from dotenv import load_dotenv
 import sky
@@ -190,13 +190,14 @@ if args.upload_checkpoints_to_wandb or args.upload_checkpoints_every_steps is no
 
 def render_env_block(env: dict[str, str]) -> str:
     return "".join(
-        f"    {key}={shlex.quote(str(value))} \\\n"
-        for key, value in env.items()
+        f"    {key}={shlex.quote(str(value))} \\\n" for key, value in env.items()
     )
 
 
 runtime_env_block = render_env_block(runtime_env)
-train_entrypoint = "dev/train_ruler_pipeline.py" if args.pipeline_pilot else "dev/train_ruler.py"
+train_entrypoint = (
+    "dev/train_ruler_pipeline.py" if args.pipeline_pilot else "dev/train_ruler.py"
+)
 
 run_script = textwrap.dedent(
     f"""\
@@ -235,11 +236,13 @@ task.set_resources(
         image_id=args.image_id,
     )
 )
-task.set_file_mounts({
-    "~/sky_workdir/.env": "/Users/pwofford/src/method/.env",
-    "/tmp/method-data/method.jsonl": train_file,
-    "/tmp/method-data/nav.jsonl": aux_file,
-})
+task.set_file_mounts(
+    {
+        "~/sky_workdir/.env": "/Users/pwofford/src/method/.env",
+        "/tmp/method-data/method.jsonl": train_file,
+        "/tmp/method-data/nav.jsonl": aux_file,
+    }
+)
 
 effective_config = {
     "cluster_name": cluster_name,
@@ -265,8 +268,10 @@ effective_config = {
     "eval_temperature": args.eval_temperature,
     "min_reward_std": args.min_reward_std,
     "save_checkpoint": args.save_checkpoint,
-    "upload_checkpoints_to_wandb": args.upload_checkpoints_to_wandb or args.upload_checkpoints_every_steps is not None,
-    "upload_checkpoints_every_steps": args.upload_checkpoints_every_steps or (args.eval_every if args.upload_checkpoints_to_wandb else None),
+    "upload_checkpoints_to_wandb": args.upload_checkpoints_to_wandb
+    or args.upload_checkpoints_every_steps is not None,
+    "upload_checkpoints_every_steps": args.upload_checkpoints_every_steps
+    or (args.eval_every if args.upload_checkpoints_to_wandb else None),
     "pipeline_pilot": args.pipeline_pilot,
     "fork_from_artifact": args.fork_from_artifact,
     "fork_from_model": args.fork_from_model,
@@ -323,7 +328,9 @@ if cluster_status:
     existing_status = cluster_status[0]["status"]
     if existing_status == ClusterStatus.UP:
         if args.cancel_existing_jobs:
-            print(f"Cluster {cluster_name} is UP. Canceling active jobs because --cancel-existing-jobs was set...")
+            print(
+                f"Cluster {cluster_name} is UP. Canceling active jobs because --cancel-existing-jobs was set..."
+            )
             sky.stream_and_get(sky.cancel(cluster_name, all=True))
         else:
             raise SystemExit(

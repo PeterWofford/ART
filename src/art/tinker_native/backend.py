@@ -4,10 +4,10 @@ import asyncio
 from dataclasses import dataclass
 import json
 import math
-from typing import Any, Awaitable, Iterable, Literal, NamedTuple, TypeVar, cast
 import os
 import re
 import time
+from typing import Any, Awaitable, Iterable, Literal, NamedTuple, TypeVar, cast
 import uuid
 
 from fastapi import FastAPI, HTTPException
@@ -85,6 +85,7 @@ def _canonicalize_upstream_metric_key(metric: str) -> str:
 
 class DistillationWorkItem(NamedTuple):
     """Work item for computing teacher logprobs in prompt distillation."""
+
     group_idx: int
     traj_idx: int
     prompt_tokens: list[int]
@@ -99,6 +100,7 @@ class DistillationWorkItem(NamedTuple):
 
 class PiDistillWorkItem(NamedTuple):
     """Work item for π-Distill: one per history in a teacher-sampled trajectory."""
+
     group_idx: int
     traj_reward: float
     teacher_prompt_tokens: list[int]
@@ -448,7 +450,9 @@ class TinkerNativeBackend(Backend):
         metrics["train_tokens"] = float(train_tokens)
         pricing = get_model_pricing(model.base_model)
         if pricing is not None:
-            metrics["costs/train/tinker_train"] = compute_train_cost(train_tokens, pricing)
+            metrics["costs/train/tinker_train"] = compute_train_cost(
+                train_tokens, pricing
+            )
 
         if adam_params is None:
             adam_params = tinker.AdamParams(
@@ -629,7 +633,9 @@ class TinkerNativeBackend(Backend):
         metrics["data/step_trainer_tokens"] = float(train_tokens)
         pricing = get_model_pricing(model.base_model)
         if pricing is not None:
-            metrics["costs/train/tinker_train"] = compute_train_cost(train_tokens, pricing)
+            metrics["costs/train/tinker_train"] = compute_train_cost(
+                train_tokens, pricing
+            )
         trainer_started = time.monotonic()
 
         if adam_params is None:
@@ -757,7 +763,9 @@ class TinkerNativeBackend(Backend):
                     completion_tokens, teacher_logprobs = extract_logprobs_from_choice(
                         choice, state.tokenizer
                     )
-                    if not completion_tokens or len(completion_tokens) != len(teacher_logprobs):
+                    if not completion_tokens or len(completion_tokens) != len(
+                        teacher_logprobs
+                    ):
                         continue
 
                     prompt_messages = cast(
@@ -775,32 +783,42 @@ class TinkerNativeBackend(Backend):
                                 student_messages.pop(i)
                                 break
                     else:
-                        teacher_messages = self._modify_system_prompt(prompt_messages, teacher_sys)
-                        student_messages = self._modify_system_prompt(prompt_messages, student_sys)
+                        teacher_messages = self._modify_system_prompt(
+                            prompt_messages, teacher_sys
+                        )
+                        student_messages = self._modify_system_prompt(
+                            prompt_messages, student_sys
+                        )
 
                     teacher_renderer_msgs = convert_openai_messages_to_renderer_format(
                         messages=teacher_messages,
                         tools=cast(list[dict[str, Any]] | None, history.tools),
                         renderer=state.renderer,
                     )
-                    teacher_prompt_obj = state.renderer.build_generation_prompt(teacher_renderer_msgs)
+                    teacher_prompt_obj = state.renderer.build_generation_prompt(
+                        teacher_renderer_msgs
+                    )
 
                     student_renderer_msgs = convert_openai_messages_to_renderer_format(
                         messages=student_messages,
                         tools=cast(list[dict[str, Any]] | None, history.tools),
                         renderer=state.renderer,
                     )
-                    student_prompt_obj = state.renderer.build_generation_prompt(student_renderer_msgs)
+                    student_prompt_obj = state.renderer.build_generation_prompt(
+                        student_renderer_msgs
+                    )
 
-                    work_items.append(PiDistillWorkItem(
-                        group_idx=group_idx,
-                        traj_reward=trajectory.reward,
-                        teacher_prompt_tokens=list(teacher_prompt_obj.to_ints()),
-                        student_prompt_tokens=list(student_prompt_obj.to_ints()),
-                        completion_tokens=completion_tokens,
-                        teacher_logprobs=teacher_logprobs,
-                        student_prompt=student_prompt_obj,
-                    ))
+                    work_items.append(
+                        PiDistillWorkItem(
+                            group_idx=group_idx,
+                            traj_reward=trajectory.reward,
+                            teacher_prompt_tokens=list(teacher_prompt_obj.to_ints()),
+                            student_prompt_tokens=list(student_prompt_obj.to_ints()),
+                            completion_tokens=completion_tokens,
+                            teacher_logprobs=teacher_logprobs,
+                            student_prompt=student_prompt_obj,
+                        )
+                    )
 
         if not work_items:
             return []
@@ -872,7 +890,9 @@ class TinkerNativeBackend(Backend):
     async def _compute_student_logprobs_batch(
         self,
         sampler_client: tinker.SamplingClient,
-        items: list[tuple[Any, list[int]]],  # [(student_prompt, completion_tokens), ...]
+        items: list[
+            tuple[Any, list[int]]
+        ],  # [(student_prompt, completion_tokens), ...]
     ) -> list[list[float] | None]:
         """Batch-compute completion logprobs under student prompts.
 
@@ -893,7 +913,9 @@ class TinkerNativeBackend(Backend):
         ) -> list[float] | None:
             try:
                 all_logprobs = await asyncio.to_thread(future.result)
-                completion_logprobs = all_logprobs[prompt_len : prompt_len + completion_len]
+                completion_logprobs = all_logprobs[
+                    prompt_len : prompt_len + completion_len
+                ]
                 if any(lp is None for lp in completion_logprobs):
                     return None
                 return cast(list[float], list(completion_logprobs))
@@ -901,10 +923,12 @@ class TinkerNativeBackend(Backend):
                 print(f"Error computing student logprobs: {e}")
                 return None
 
-        results = await asyncio.gather(*[
-            get_result(futures[i], prompt_lens[i], len(items[i][1]))
-            for i in range(len(items))
-        ])
+        results = await asyncio.gather(
+            *[
+                get_result(futures[i], prompt_lens[i], len(items[i][1]))
+                for i in range(len(items))
+            ]
+        )
         return list(results)
 
     async def _trajectory_groups_to_datums_with_teacher_logprobs(
@@ -924,6 +948,8 @@ class TinkerNativeBackend(Backend):
         Note: Each trajectory is processed independently. Groups are only used to
         associate teacher prompts with trajectories.
         """
+        import torch
+
         from .data import (
             compute_advantages,
             convert_openai_messages_to_renderer_format,
@@ -931,7 +957,6 @@ class TinkerNativeBackend(Backend):
             find_last_choice,
             iter_trajectory_histories,
         )
-        import torch
 
         # Get the current sampler client (teacher)
         teacher_client = state.sampler_clients[state.current_step]
@@ -939,7 +964,9 @@ class TinkerNativeBackend(Backend):
         # First pass: collect all work items
         work_items: list[DistillationWorkItem] = []
 
-        for group_idx, (group, teacher_system_prompt) in enumerate(zip(trajectory_groups, teacher_system_prompts)):
+        for group_idx, (group, teacher_system_prompt) in enumerate(
+            zip(trajectory_groups, teacher_system_prompts)
+        ):
             if not group.trajectories:
                 continue
 
@@ -955,7 +982,9 @@ class TinkerNativeBackend(Backend):
                     completion_tokens, student_logprobs = extract_logprobs_from_choice(
                         choice, state.tokenizer
                     )
-                    if not completion_tokens or len(completion_tokens) != len(student_logprobs):
+                    if not completion_tokens or len(completion_tokens) != len(
+                        student_logprobs
+                    ):
                         continue
 
                     # Build student prompt (original)
@@ -963,10 +992,12 @@ class TinkerNativeBackend(Backend):
                         list[dict[str, Any]],
                         get_messages(history.messages_and_choices[:choice_index]),
                     )
-                    student_renderer_messages = convert_openai_messages_to_renderer_format(
-                        messages=prompt_messages,
-                        tools=cast(list[dict[str, Any]] | None, history.tools),
-                        renderer=state.renderer,
+                    student_renderer_messages = (
+                        convert_openai_messages_to_renderer_format(
+                            messages=prompt_messages,
+                            tools=cast(list[dict[str, Any]] | None, history.tools),
+                            renderer=state.renderer,
+                        )
                     )
                     student_prompt = state.renderer.build_generation_prompt(
                         student_renderer_messages
@@ -977,36 +1008,45 @@ class TinkerNativeBackend(Backend):
                     teacher_messages = self._insert_pi_before_last(
                         prompt_messages, teacher_system_prompt
                     )
-                    teacher_renderer_messages = convert_openai_messages_to_renderer_format(
-                        messages=teacher_messages,
-                        tools=cast(list[dict[str, Any]] | None, history.tools),
-                        renderer=state.renderer,
+                    teacher_renderer_messages = (
+                        convert_openai_messages_to_renderer_format(
+                            messages=teacher_messages,
+                            tools=cast(list[dict[str, Any]] | None, history.tools),
+                            renderer=state.renderer,
+                        )
                     )
                     teacher_prompt = state.renderer.build_generation_prompt(
                         teacher_renderer_messages
                     )
 
-                    work_items.append(DistillationWorkItem(
-                        group_idx=group_idx,
-                        traj_idx=traj_idx,
-                        prompt_tokens=prompt_tokens,
-                        completion_tokens=completion_tokens,
-                        student_logprobs=student_logprobs,
-                        student_prompt=student_prompt,
-                        teacher_prompt=teacher_prompt,
-                        prompt_messages=prompt_messages,
-                        teacher_system_prompt=teacher_system_prompt,
-                        reward=trajectory.reward,
-                    ))
+                    work_items.append(
+                        DistillationWorkItem(
+                            group_idx=group_idx,
+                            traj_idx=traj_idx,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            student_logprobs=student_logprobs,
+                            student_prompt=student_prompt,
+                            teacher_prompt=teacher_prompt,
+                            prompt_messages=prompt_messages,
+                            teacher_system_prompt=teacher_system_prompt,
+                            reward=trajectory.reward,
+                        )
+                    )
 
         # Second pass: compute all top-k distributions in batch
         if not work_items:
             return []
 
-        print(f"Computing top-k distributions for {len(work_items)} trajectories in batch...")
+        print(
+            f"Computing top-k distributions for {len(work_items)} trajectories in batch..."
+        )
         distribution_results = await self._compute_topk_distributions_batch(
             teacher_client,
-            [(item.student_prompt, item.teacher_prompt, item.completion_tokens) for item in work_items],
+            [
+                (item.student_prompt, item.teacher_prompt, item.completion_tokens)
+                for item in work_items
+            ],
         )
 
         # Third pass: build datums with full distributions for distillation loss
@@ -1018,12 +1058,18 @@ class TinkerNativeBackend(Backend):
             if dist_result is None:
                 continue
 
-            student_topk, teacher_topk, student_tail_mass, teacher_tail_mass = dist_result
+            student_topk, teacher_topk, student_tail_mass, teacher_tail_mass = (
+                dist_result
+            )
 
             # Compute KL for logging only
             kl_per_token = []
-            for s_topk, t_topk, s_tail, t_tail in zip(student_topk, teacher_topk, student_tail_mass, teacher_tail_mass):
-                kl = self._compute_topk_kl_single_with_tail(s_topk, t_topk, s_tail, t_tail)
+            for s_topk, t_topk, s_tail, t_tail in zip(
+                student_topk, teacher_topk, student_tail_mass, teacher_tail_mass
+            ):
+                kl = self._compute_topk_kl_single_with_tail(
+                    s_topk, t_topk, s_tail, t_tail
+                )
                 kl_per_token.append(kl)
             all_kl_values.extend(kl_per_token)
 
@@ -1035,13 +1081,19 @@ class TinkerNativeBackend(Backend):
                 # Decode and show completion text
                 completion_text = state.tokenizer.decode(item.completion_tokens)
                 print(f"Completion text: {repr(completion_text)}")
-                print(f"Completion tokens ({len(item.completion_tokens)}): {item.completion_tokens[:10]}...")
+                print(
+                    f"Completion tokens ({len(item.completion_tokens)}): {item.completion_tokens[:10]}..."
+                )
 
                 # Show student prompt (original)
                 student_msg_content = item.prompt_messages[0].get("content", "")
                 student_system = next(
-                    (m.get("content", "") for m in item.prompt_messages if m.get("role") == "system"),
-                    "(no system prompt)"
+                    (
+                        m.get("content", "")
+                        for m in item.prompt_messages
+                        if m.get("role") == "system"
+                    ),
+                    "(no system prompt)",
                 )
                 print(f"\nStudent system: {student_system}")
                 print(f"Student user msg: {student_msg_content}...")
@@ -1053,11 +1105,13 @@ class TinkerNativeBackend(Backend):
                 print(f"\n[Trajectory Context Debug]")
                 print(f"Number of messages in prompt: {len(item.prompt_messages)}")
                 for idx, msg in enumerate(item.prompt_messages):
-                    role = msg.get('role', '?')
-                    content_preview = str(msg.get('content', ''))[:100]
+                    role = msg.get("role", "?")
+                    content_preview = str(msg.get("content", ""))[:100]
                     print(f"  Message {idx} ({role}): {content_preview}...")
                 print(f"Completion tokens length: {len(item.completion_tokens)}")
-                print(f"Completion text: {repr(state.tokenizer.decode(item.completion_tokens)[:200])}...")
+                print(
+                    f"Completion text: {repr(state.tokenizer.decode(item.completion_tokens)[:200])}..."
+                )
 
                 # Show sample distributions and KL
                 print("\nSample distributions:")
@@ -1097,17 +1151,22 @@ class TinkerNativeBackend(Backend):
         # Summary statistics
         if all_kl_values:
             import numpy as np
+
             kl_array = np.array(all_kl_values)
 
             print(f"\n[Distillation Statistics]")
             print(f"Total tokens: {len(all_kl_values)}")
-            print(f"Top-k KL(student||teacher) - mean: {kl_array.mean():.4f}, std: {kl_array.std():.4f}, min: {kl_array.min():.4f}, max: {kl_array.max():.4f}")
+            print(
+                f"Top-k KL(student||teacher) - mean: {kl_array.mean():.4f}, std: {kl_array.std():.4f}, min: {kl_array.min():.4f}, max: {kl_array.max():.4f}"
+            )
             print("=" * 80)
 
         # GRPO datums: z-scored reward advantage on student's actual completions
         if grpo_weight > 0.0:
             from collections import defaultdict
+
             from .data import build_datum
+
             group_items_map: dict[int, list[DistillationWorkItem]] = defaultdict(list)
             for item in work_items:
                 group_items_map[item.group_idx].append(item)
@@ -1156,13 +1215,22 @@ class TinkerNativeBackend(Backend):
         result.insert(insert_at, {"role": "system", "content": pi_content})
         return result
 
-
     async def _compute_topk_distributions_batch(
         self,
         sampler_client: tinker.SamplingClient,
-        items: list[tuple[Any, Any, list[int]]],  # [(student_prompt, teacher_prompt, completion_tokens), ...]
+        items: list[
+            tuple[Any, Any, list[int]]
+        ],  # [(student_prompt, teacher_prompt, completion_tokens), ...]
         k: int = 20,
-    ) -> list[tuple[list[list[tuple[int, float]]], list[list[tuple[int, float]]], list[float], list[float]] | None]:
+    ) -> list[
+        tuple[
+            list[list[tuple[int, float]]],
+            list[list[tuple[int, float]]],
+            list[float],
+            list[float],
+        ]
+        | None
+    ]:
         """Compute top-k distributions for student and teacher for multiple items in parallel.
 
         Returns:
@@ -1214,7 +1282,15 @@ class TinkerNativeBackend(Backend):
             )
 
         # Await all results in parallel
-        async def get_distributions_result(student_future, teacher_future, student_prompt_len, teacher_prompt_len, completion_len, completion_tokens, tokenizer):
+        async def get_distributions_result(
+            student_future,
+            teacher_future,
+            student_prompt_len,
+            teacher_prompt_len,
+            completion_len,
+            completion_tokens,
+            tokenizer,
+        ):
             try:
                 student_resp = await asyncio.to_thread(student_future.result)
                 teacher_resp = await asyncio.to_thread(teacher_future.result)
@@ -1225,11 +1301,16 @@ class TinkerNativeBackend(Backend):
                 teacher_start = teacher_prompt_len
                 teacher_end = teacher_start + completion_len
 
-                student_topk = student_resp.topk_prompt_logprobs[student_start:student_end]
-                teacher_topk = teacher_resp.topk_prompt_logprobs[teacher_start:teacher_end]
+                student_topk = student_resp.topk_prompt_logprobs[
+                    student_start:student_end
+                ]
+                teacher_topk = teacher_resp.topk_prompt_logprobs[
+                    teacher_start:teacher_end
+                ]
 
                 # Compute tail masses for each position
                 import math
+
                 student_tail_mass = []
                 teacher_tail_mass = []
 
@@ -1243,28 +1324,36 @@ class TinkerNativeBackend(Backend):
                     topk_prob_sum = sum(math.exp(lp) for _, lp in t_topk)
                     teacher_tail_mass.append(max(1e-10, 1.0 - topk_prob_sum))
 
-                return (student_topk, teacher_topk, student_tail_mass, teacher_tail_mass)
+                return (
+                    student_topk,
+                    teacher_topk,
+                    student_tail_mass,
+                    teacher_tail_mass,
+                )
             except Exception as e:
                 print(f"Error computing top-k distributions: {e}")
                 import traceback
+
                 traceback.print_exc()
                 return None
 
         # Get tokenizer from sampler_client
         tokenizer = sampler_client.get_tokenizer()
 
-        results = await asyncio.gather(*[
-            get_distributions_result(
-                futures_student[i],
-                futures_teacher[i],
-                student_prompt_lens[i],
-                teacher_prompt_lens[i],
-                len(items[i][2]),
-                items[i][2],  # completion_tokens
-                tokenizer
-            )
-            for i in range(len(items))
-        ])
+        results = await asyncio.gather(
+            *[
+                get_distributions_result(
+                    futures_student[i],
+                    futures_teacher[i],
+                    student_prompt_lens[i],
+                    teacher_prompt_lens[i],
+                    len(items[i][2]),
+                    items[i][2],  # completion_tokens
+                    tokenizer,
+                )
+                for i in range(len(items))
+            ]
+        )
 
         return results
 
@@ -1303,7 +1392,9 @@ class TinkerNativeBackend(Backend):
 
         # Add tail contribution
         if student_tail_mass > 1e-10:
-            kl += student_tail_mass * math.log(student_tail_mass / max(1e-10, teacher_tail_mass))
+            kl += student_tail_mass * math.log(
+                student_tail_mass / max(1e-10, teacher_tail_mass)
+            )
 
         return kl
 
@@ -1337,7 +1428,9 @@ class TinkerNativeBackend(Backend):
         # all_logprobs[3] = logprob of c1 given [p1, p2, p3]
         # all_logprobs[4] = logprob of c2 given [p1, p2, p3, c1]
         completion_start_idx = len(prompt_tokens)
-        completion_logprobs = all_logprobs[completion_start_idx:completion_start_idx + len(completion_tokens)]
+        completion_logprobs = all_logprobs[
+            completion_start_idx : completion_start_idx + len(completion_tokens)
+        ]
 
         # Check for None values (failed to compute)
         if any(lp is None for lp in completion_logprobs):
@@ -1370,13 +1463,16 @@ class TinkerNativeBackend(Backend):
         Iterates through student's top-k (mean-seeking KL) and finds corresponding teacher probs.
         Uses standard importance_sampling loss with per-token advantages.
         """
-        import torch
         import math
+
+        import torch
 
         if not prompt_tokens or not completion_tokens:
             return []
 
-        k = min(1, len(student_topk[0]) if student_topk else 20)  # Limit k to avoid too many datums
+        k = min(
+            1, len(student_topk[0]) if student_topk else 20
+        )  # Limit k to avoid too many datums
 
         # Build input tokens
         ob_len = max(len(prompt_tokens) - 1, 0)
@@ -1436,13 +1532,19 @@ class TinkerNativeBackend(Backend):
                         if teacher_logp is None:
                             # Token not in teacher's top-k, estimate from tail
                             # Distribute tail mass uniformly among missing tokens
-                            teacher_logp = math.log(max(1e-10, teacher_tail_mass[completion_pos] / max(1, k)))
+                            teacher_logp = math.log(
+                                max(
+                                    1e-10, teacher_tail_mass[completion_pos] / max(1, k)
+                                )
+                            )
 
                         # PROBABILITY-WEIGHTED advantage for top-k KL approximation
                         # advantage = p_student * (log p_teacher - log p_student) * reward_scale
                         # This ensures the sum over k datums approximates KL divergence
                         # reward_scale weights trajectories by normalized reward when use_rewards=True
-                        advantage = student_prob * (teacher_logp - student_logp) * reward_scale
+                        advantage = (
+                            student_prob * (teacher_logp - student_logp) * reward_scale
+                        )
 
                         target_tokens_list.append(int(student_tok_id))
                         student_logprobs_list.append(float(student_logp))
@@ -1462,12 +1564,18 @@ class TinkerNativeBackend(Backend):
             # Debug logging for first datum
             if rank == 0 and trajectory_id == 0:
                 print(f"\n[SDPO Datum Creation Debug]")
-                print(f"seq_len: {seq_len}, k: {k}, ob_len: {ob_len}, completion_len: {completion_len}")
+                print(
+                    f"seq_len: {seq_len}, k: {k}, ob_len: {ob_len}, completion_len: {completion_len}"
+                )
                 # Only show positions that exist
                 n_show = min(3, completion_len)
                 if n_show > 0:
-                    print(f"Sample advantages (first {n_show} completion positions): {advantages_list[ob_len:ob_len+n_show]}")
-                    print(f"Sample student probs (first {n_show} completion positions): {[math.exp(student_logprobs_list[i]) for i in range(ob_len, ob_len+n_show)]}")
+                    print(
+                        f"Sample advantages (first {n_show} completion positions): {advantages_list[ob_len : ob_len + n_show]}"
+                    )
+                    print(
+                        f"Sample student probs (first {n_show} completion positions): {[math.exp(student_logprobs_list[i]) for i in range(ob_len, ob_len + n_show)]}"
+                    )
 
             datum = tinker.Datum(
                 model_input=tinker.ModelInput.from_ints(tokens=input_tokens),
@@ -1525,7 +1633,9 @@ class TinkerNativeBackend(Backend):
         return tinker.Datum(
             model_input=tinker.ModelInput.from_ints(tokens=input_tokens),
             loss_fn_inputs={
-                "target_tokens": tinker.TensorData.from_torch(torch.tensor(target_tokens)),
+                "target_tokens": tinker.TensorData.from_torch(
+                    torch.tensor(target_tokens)
+                ),
                 "logprobs": tinker.TensorData.from_torch(
                     torch.tensor(padded_logprobs, dtype=torch.float32)
                 ),

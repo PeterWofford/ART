@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-import sys
 from pathlib import Path
+import sys
 from typing import Any
 
-import pytest
 from openai.types.chat.chat_completion import Choice
+import pytest
 
 pytest.importorskip("torch")
 
 import art
 from art import TrainableModel, Trajectory, TrajectoryGroup
 from art.local import LocalBackend
-
 
 ART_ROOT = Path(__file__).resolve().parents[2]
 for path in (ART_ROOT, ART_ROOT / "src"):
@@ -208,4 +207,6 @@ def test_both_ivr_paths_hit_same_continue_final_message_failure(
             allow_training_without_logprobs=False,
             scale_rewards=True,
             plot_tensors=False,
+            packed_sequence_length=None,
+            logprob_calculation_chunk_size=2,
         )

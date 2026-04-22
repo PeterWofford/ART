@@ -16,7 +16,7 @@ import json
 import os
 import re
 
-import safetensors.torch
+import safetensors.torch  # ty: ignore[unresolved-import]
 import torch
 
 

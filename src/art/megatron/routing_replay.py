@@ -13,7 +13,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.moe.moe_utils import permute, sort_chunks_by_idxs
 from pydantic import BaseModel, ConfigDict, model_validator
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file, save_file  # ty: ignore[unresolved-import]
 import torch
 
 ROUTER_NAME_TOKEN = ".mlp.router"
