@@ -1471,7 +1471,7 @@ class TinkerNativeBackend(Backend):
             return []
 
         k = min(
-            1, len(student_topk[0]) if student_topk else 20
+            20, len(student_topk[0]) if student_topk else 20
         )  # Limit k to avoid too many datums
 
         # Build input tokens
