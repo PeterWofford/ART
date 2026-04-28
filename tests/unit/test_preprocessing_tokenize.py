@@ -7,8 +7,12 @@ import pytest
 from transformers.tokenization_utils_base import BatchEncoding
 
 import art
-from art.preprocessing.tokenize import tokenize_sft_batch, tokenize_trajectory
-from art.trajectories import History, Trajectory
+from art.preprocessing.tokenize import (
+    tokenize_sft_batch,
+    tokenize_trajectory,
+    tokenize_trajectory_groups,
+)
+from art.trajectories import History, Trajectory, TrajectoryGroup
 from art.types import MessagesAndChoices
 
 pytest.importorskip("torch")
@@ -122,6 +126,88 @@ def test_tokenize_trajectory_accepts_batchencoding_chat_template_output() -> Non
         if mask
     ]
     assert assistant_ids == tokenizer.encode("OK", add_special_tokens=False)
+
+
+def _make_choice(content: str, *, index: int = 0) -> Choice:
+    token_id = ord(content)
+    return Choice.model_validate(
+        {
+            "finish_reason": "stop",
+            "index": index,
+            "logprobs": {
+                "content": [
+                    {
+                        "token": f"token_id:{token_id}",
+                        "bytes": [token_id],
+                        "logprob": -0.1,
+                        "top_logprobs": [],
+                    }
+                ],
+                "refusal": None,
+            },
+            "message": {
+                "content": content,
+                "refusal": None,
+                "role": "assistant",
+                "annotations": None,
+                "audio": None,
+                "function_call": None,
+                "tool_calls": None,
+            },
+        }
+    )
+
+
+def test_tokenize_trajectory_groups_can_disable_shared_prefix_packing() -> None:
+    tokenizer = _FakeTokenizer()
+    group = TrajectoryGroup(
+        [
+            Trajectory(
+                messages_and_choices=cast(
+                    MessagesAndChoices,
+                    [
+                        {"role": "user", "content": "Hello"},
+                        _make_choice("A", index=0),
+                    ],
+                ),
+                reward=1.0,
+            ),
+            Trajectory(
+                messages_and_choices=cast(
+                    MessagesAndChoices,
+                    [
+                        {"role": "user", "content": "Hello"},
+                        _make_choice("B", index=1),
+                    ],
+                ),
+                reward=0.0,
+            ),
+        ]
+    )
+
+    default_results = list(
+        tokenize_trajectory_groups(
+            tokenizer=tokenizer,  # type: ignore[arg-type]
+            trajectory_groups=[group],
+            allow_training_without_logprobs=False,
+            scale_rewards=True,
+            shuffle_group_trajectories=False,
+        )
+    )
+    disabled_results = list(
+        tokenize_trajectory_groups(
+            tokenizer=tokenizer,  # type: ignore[arg-type]
+            trajectory_groups=[group],
+            allow_training_without_logprobs=False,
+            scale_rewards=True,
+            shuffle_group_trajectories=False,
+            use_shared_prefix_packing=False,
+        )
+    )
+
+    assert len(default_results) == len(disabled_results) == 2
+    assert all(result.prompt_length > 0 for result in default_results)
+    assert all(result.prompt_length == 0 for result in disabled_results)
 
 
 def test_tokenize_sft_batch_accepts_batchencoding_chat_template_output(

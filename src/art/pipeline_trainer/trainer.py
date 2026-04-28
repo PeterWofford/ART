@@ -79,6 +79,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         normalize_advantages: bool = True,
         adam_params: object | None = None,
         packed_sequence_length: int | None = None,
+        use_shared_prefix_packing: bool = True,
         max_steps: int | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
@@ -131,6 +132,7 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self.normalize_advantages = normalize_advantages
         self.adam_params = adam_params
         self.packed_sequence_length = packed_sequence_length
+        self.use_shared_prefix_packing = use_shared_prefix_packing
         self.max_steps = max_steps
         self._status_log_interval_seconds = log_interval_seconds
         self.eval_every_n_steps = eval_every_n_steps
@@ -464,6 +466,8 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 }
                 if self.packed_sequence_length is not None:
                     train_kwargs["packed_sequence_length"] = self.packed_sequence_length
+                if not self.use_shared_prefix_packing:
+                    train_kwargs["use_shared_prefix_packing"] = False
                 result = await self.backend.train(
                     self.model,
                     batch,

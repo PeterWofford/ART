@@ -121,6 +121,33 @@ async def test_pipeline_trainer_forwards_packed_sequence_length_when_set(
 
 
 @pytest.mark.asyncio
+async def test_pipeline_trainer_forwards_shared_prefix_packing_when_disabled(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-shared-prefix-packing",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    backend = MagicMock()
+    backend.train = AsyncMock(return_value=SimpleNamespace(step=1, metrics={}))
+
+    trainer = _make_trainer(
+        model=model,
+        backend=backend,
+        use_shared_prefix_packing=False,
+    )
+    trainer._output_queue = asyncio.Queue()
+    await trainer._output_queue.put(_make_group([0.0, 1.0]))
+    await trainer._output_queue.put(None)
+
+    await trainer._training_stage()
+
+    assert backend.train.await_args.kwargs["use_shared_prefix_packing"] is False
+
+
+@pytest.mark.asyncio
 async def test_pipeline_trainer_uses_same_train_kwargs_for_local_backend(
     tmp_path: Path,
 ) -> None:
@@ -278,6 +305,7 @@ def test_local_backend_get_packed_tensors_warns_and_drops_overlong_results(
             plot_tensors=False,
             packed_sequence_length=4,
             logprob_calculation_chunk_size=2,
+            use_shared_prefix_packing=False,
         )
 
     assert packed_tensors is not None

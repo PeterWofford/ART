@@ -500,6 +500,7 @@ class LocalBackend(Backend):
         plot_tensors: bool,
         packed_sequence_length: int | None,
         logprob_calculation_chunk_size: int,
+        use_shared_prefix_packing: bool = True,
     ) -> PackedTensors | None:
         self._load_training_tokenizer(model)
         if model.base_model not in self._image_processors:
@@ -517,6 +518,7 @@ class LocalBackend(Backend):
                 allow_training_without_logprobs,
                 scale_rewards,
                 image_processor=self._image_processors[model.base_model],
+                use_shared_prefix_packing=use_shared_prefix_packing,
             )
         )
         if not tokenized_results:
@@ -779,6 +781,7 @@ class LocalBackend(Backend):
         scale_learning_rate_by_reward_std_dev: bool = False,
         logprob_calculation_chunk_size: int = 1024,
         packed_sequence_length: int | None = None,
+        use_shared_prefix_packing: bool = True,
         num_trajectories_learning_rate_multiplier_power: float = 0.0,
         # Checkpoint behavior
         save_checkpoint: bool = True,
@@ -838,6 +841,9 @@ class LocalBackend(Backend):
             packed_sequence_length: Packed sequence length to use for training.
                 When unset, Unsloth keeps the current max-length-rounded-to-2048
                 behavior. Required for Megatron.
+            use_shared_prefix_packing: Whether to pack GRPO groups by dropping a
+                shared prompt prefix. Disable for model/backend combinations that
+                cannot respect arbitrary packed-sequence attention masks.
             num_trajectories_learning_rate_multiplier_power: Power for learning
                 rate multiplier based on number of trajectories.
             save_checkpoint: Whether to save a checkpoint after training.
@@ -902,6 +908,7 @@ class LocalBackend(Backend):
             scale_learning_rate_by_reward_std_dev=scale_learning_rate_by_reward_std_dev,
             logprob_calculation_chunk_size=logprob_calculation_chunk_size,
             packed_sequence_length=packed_sequence_length,
+            use_shared_prefix_packing=use_shared_prefix_packing,
             num_trajectories_learning_rate_multiplier_power=num_trajectories_learning_rate_multiplier_power,
             kl_ref_adapter_path=resolved_kl_ref_adapter_path,
         )
@@ -985,6 +992,7 @@ class LocalBackend(Backend):
             logprob_calculation_chunk_size=dev_config.get(
                 "logprob_calculation_chunk_size", 1024
             ),
+            use_shared_prefix_packing=dev_config.get("use_shared_prefix_packing", True),
         )
         if packed_tensors is None:
             print(

@@ -176,6 +176,7 @@ def tokenize_trajectory_groups(
     shuffle_group_trajectories: bool = True,
     drop_zero_advantage_trajectories: bool = True,
     image_processor: BaseImageProcessor | None = None,
+    use_shared_prefix_packing: bool = True,
 ) -> Generator["TokenizedResult", None, None]:
     for group in trajectory_groups:
         if not group:
@@ -219,29 +220,32 @@ def tokenize_trajectory_groups(
             results.extend(trajectory_results)
         # Choose a random prompt id
         prompt_id = random.randint(-(2**63), 2**63 - 1)
-        # Find the longest shared prefix
-        # TODO: Potentially support multiple prompts per group
-        # Initial thought is to sort the results by token_ids and then
-        # successively group prompts with the same prefix.
-        prompt_length = len(
-            list(
-                takewhile(
-                    lambda x: len(set(x)) == 1,
-                    zip(*(r.token_ids for r in results)),
+        if use_shared_prefix_packing:
+            # Find the longest shared prefix.
+            # TODO: Potentially support multiple prompts per group
+            # Initial thought is to sort the results by token_ids and then
+            # successively group prompts with the same prefix.
+            prompt_length = len(
+                list(
+                    takewhile(
+                        lambda x: len(set(x)) == 1,
+                        zip(*(r.token_ids for r in results)),
+                    )
                 )
             )
-        )
-        first_non_nan_index = min(
-            (
-                next(
-                    (i for i, lp in enumerate(r.logprobs) if not math.isnan(lp)),
-                    len(r.logprobs),
-                )
-                for r in results
-            ),
-            default=0,
-        )
-        prompt_length = max(min(prompt_length, first_non_nan_index) - 1, 0)
+            first_non_nan_index = min(
+                (
+                    next(
+                        (i for i, lp in enumerate(r.logprobs) if not math.isnan(lp)),
+                        len(r.logprobs),
+                    )
+                    for r in results
+                ),
+                default=0,
+            )
+            prompt_length = max(min(prompt_length, first_non_nan_index) - 1, 0)
+        else:
+            prompt_length = 0
         # Set the prompt id and length
         for result in results:
             result.prompt_id = prompt_id
