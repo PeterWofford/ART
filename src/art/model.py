@@ -292,11 +292,13 @@ class Model(
                 raise ValueError(
                     "In order to create an OpenAI client you must provide an `inference_api_key` and `inference_base_url`."
                 )
+        request_timeout = float(os.environ.get("ART_OPENAI_REQUEST_TIMEOUT", "1200"))
+        connect_timeout = float(os.environ.get("ART_OPENAI_CONNECT_TIMEOUT", "30"))
         raw_client = AsyncOpenAI(
             base_url=self.inference_base_url,
             api_key=self.inference_api_key,
             http_client=DefaultAsyncHttpxClient(
-                timeout=httpx.Timeout(timeout=1200, connect=5.0),
+                timeout=httpx.Timeout(timeout=request_timeout, connect=connect_timeout),
                 limits=httpx.Limits(
                     max_connections=100_000, max_keepalive_connections=100_000
                 ),

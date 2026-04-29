@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import os
 import signal
 import time
@@ -83,6 +84,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         max_steps: int | None = None,
         # Discard handling
         discard_queue_multiplier: int = 100,
+        # Rollout failure handling
+        errored_rollout_window_size: int | None = None,
+        max_errored_rollout_rate: float | None = None,
         # Status output
         log_interval_seconds: float = 60.0,
         status_ewa_alpha: float = 0.2,
@@ -114,6 +118,13 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             raise ValueError("log_interval_seconds must be > 0")
         if discard_queue_multiplier <= 0:
             raise ValueError("discard_queue_multiplier must be > 0")
+        if errored_rollout_window_size is not None and errored_rollout_window_size <= 0:
+            raise ValueError("errored_rollout_window_size must be > 0")
+        if (
+            max_errored_rollout_rate is not None
+            and not 0 <= max_errored_rollout_rate <= 1
+        ):
+            raise ValueError("max_errored_rollout_rate must be in [0, 1]")
         self.model = model
         self.backend = backend
         self.rollout_fn = rollout_fn
@@ -143,6 +154,14 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
         self._discard_queue: list[TrajectoryGroup] = []
         self._discard_queue_limit = discard_queue_multiplier * min_batch_size
         self._collapse_triggered = False
+        self.max_errored_rollout_rate = max_errored_rollout_rate
+        self._errored_rollout_window = (
+            deque(maxlen=errored_rollout_window_size)
+            if errored_rollout_window_size is not None
+            and max_errored_rollout_rate is not None
+            else None
+        )
+        self._errored_rollout_guard_triggered = False
 
         self.state = PipelineState()
         self._scenario_lock = asyncio.Lock()
@@ -401,6 +420,9 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
                 print(f"Worker {worker_id}: rollout failed: {exc}")
             finally:
                 self._status.note_rollout_finished(errored=errored)
+                if self._record_rollout_outcome(errored=errored):
+                    async with self.state.policy_updated:
+                        self.state.policy_updated.notify_all()
 
     async def _rollout_stage(self) -> None:
         async with asyncio.TaskGroup() as tg:
@@ -741,6 +763,46 @@ class PipelineTrainer(Generic[ScenarioT, ConfigT]):
             self._trigger_collapse()
             return True
         return False
+
+    def _record_rollout_outcome(self, *, errored: bool) -> bool:
+        if (
+            self._errored_rollout_window is None
+            or self.max_errored_rollout_rate is None
+        ):
+            return False
+        self._errored_rollout_window.append(1 if errored else 0)
+        window_size = self._errored_rollout_window.maxlen
+        assert window_size is not None
+        if len(self._errored_rollout_window) < window_size:
+            return False
+        errored_rate = sum(self._errored_rollout_window) / len(
+            self._errored_rollout_window
+        )
+        if errored_rate <= self.max_errored_rollout_rate:
+            return False
+        self._trigger_errored_rollout_abort(errored_rate=errored_rate)
+        return True
+
+    def _trigger_errored_rollout_abort(self, *, errored_rate: float) -> None:
+        if self._errored_rollout_guard_triggered:
+            return
+        self._errored_rollout_guard_triggered = True
+        self.state.done = True
+        assert self._errored_rollout_window is not None
+        print(
+            "\n"
+            "========================================\n"
+            "ROLLOUT ERROR RATE TOO HIGH - Training stopped\n"
+            "========================================\n"
+            "\n"
+            f"Errored rollout rate over the last {len(self._errored_rollout_window)} "
+            f"attempts was {errored_rate:.1%}, above the configured threshold of "
+            f"{self.max_errored_rollout_rate:.1%}.\n"
+            "\n"
+            "This usually means the inference server is overloaded, timing out, or "
+            "returning connection errors. Stop early instead of exhausting the "
+            "dataset on failed rollouts.\n"
+        )
 
     def _trigger_collapse(self) -> None:
         if self._collapse_triggered:

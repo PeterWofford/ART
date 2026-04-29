@@ -673,6 +673,10 @@ class LocalBackend(Backend):
         )
         consecutive_failures = 0
         max_consecutive_failures = 3
+        monitor_timeout = float(os.environ.get("ART_SERVER_MONITOR_TIMEOUT", "30"))
+        metrics_timeout = float(
+            os.environ.get("ART_SERVER_MONITOR_METRICS_TIMEOUT", str(monitor_timeout))
+        )
         async with aiohttp.ClientSession() as session:
             while True:
                 # Wait 30 seconds before checking again
@@ -685,7 +689,7 @@ class LocalBackend(Backend):
                     # Check the metrics with a timeout
                     async with session.get(
                         f"{base_url.split('/v1')[0]}/metrics",
-                        timeout=aiohttp.ClientTimeout(total=10),
+                        timeout=aiohttp.ClientTimeout(total=metrics_timeout),
                     ) as response:
                         metrics = await response.text()
                     # Parse Prometheus metrics for running requests
@@ -704,9 +708,7 @@ class LocalBackend(Backend):
                                 model=self._model_inference_name(model),
                                 prompt="Hi",
                                 max_tokens=1,
-                                timeout=float(
-                                    os.environ.get("ART_SERVER_MONITOR_TIMEOUT", 5.0)
-                                ),
+                                timeout=monitor_timeout,
                             )
                         except Exception as e:
                             # If the server is sleeping, a failed health check is okay

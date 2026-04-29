@@ -55,6 +55,56 @@ def _make_trainer(
     )
 
 
+def test_pipeline_trainer_rollout_error_rate_guard_triggers(tmp_path: Path) -> None:
+    model = TrainableModel(
+        name="pipeline-rollout-error-rate-guard",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+    trainer = _make_trainer(
+        model=model,
+        backend=MagicMock(),
+        errored_rollout_window_size=4,
+        max_errored_rollout_rate=0.5,
+    )
+
+    assert trainer._record_rollout_outcome(errored=True) is False
+    assert trainer._record_rollout_outcome(errored=False) is False
+    assert trainer._record_rollout_outcome(errored=True) is False
+    assert trainer.state.done is False
+
+    assert trainer._record_rollout_outcome(errored=True) is True
+    assert trainer.state.done is True
+
+
+def test_pipeline_trainer_rollout_error_rate_guard_validates_args(
+    tmp_path: Path,
+) -> None:
+    model = TrainableModel(
+        name="pipeline-rollout-error-rate-guard-validation",
+        project="pipeline-tests",
+        base_model="test-model",
+        base_path=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="errored_rollout_window_size"):
+        _make_trainer(
+            model=model,
+            backend=MagicMock(),
+            errored_rollout_window_size=0,
+            max_errored_rollout_rate=0.5,
+        )
+
+    with pytest.raises(ValueError, match="max_errored_rollout_rate"):
+        _make_trainer(
+            model=model,
+            backend=MagicMock(),
+            errored_rollout_window_size=4,
+            max_errored_rollout_rate=1.1,
+        )
+
+
 @pytest.mark.asyncio
 async def test_pipeline_trainer_preserves_backend_train_kwargs(tmp_path: Path) -> None:
     model = TrainableModel(
